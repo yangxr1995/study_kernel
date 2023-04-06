@@ -430,3 +430,266 @@ kmem_cache_free
 ### 1.3.5 kmalloc
 kmalloc是基于伙伴系统和slab实现的，当申请的内存大则从伙伴系统，小则走slab。
 
+# 2. 虚拟地址 
+## 2.1 虚拟地址和MMU
+![](./pic/14.jpg)
+当cpu开启MMU后，虚拟地址被转换成物理地址，发给SDRAM
+
+为什么一定要虚拟地址：
+Linux环境太复杂，连接器无法在链接节点知道程序的加载地址，所以假定程序都从0地址开始。那么不同进程的地址就重叠了，所以需要运行将链接的地址映射到不同的物理地址。
+
+### 2.1.1 MMU的工作原理
+![](./pic/15.jpg)
+MMU的映射是以页为单位
+页表：虚拟地址和物理地址的映射关系表，保存在内存中。
+Table Walk Unit：读取页表的硬件，当转换虚拟地址时，他会读取对应的页表
+TLBs：页表缓存，由于读取内存太非时间，当转换一个地址时会将附件地址的页表也加载在MMU的TLBs
+
+有个寄存器保存了页表的地址。
+当输入虚拟地址和ASSID给MMU，ASSID用于解决不同进程相同虚拟地址的情况，
+MMU首先在缓存中查找释放有对应虚拟地址号和ASSID相同的条目，如果有则直接返回物理地址。
+如果没有在TLB中找对应的物理地址基地址，若找到返回物理地址，
+如果没有则根据寄存器加载内存中的页表，并缓存相邻页表。并返回物理地址
+![](./pic/24.jpg)
+
+
+## 2.3 页表
+### 2.3.1 一级页表
+![](./pic/16.jpg)
+虚拟地址分为两段:
+[31:12] 20位 虚拟页表号: 所以能表示2\^20 = 1M个页表，每个页表对应4KB大小的物理页，所以能映射4GB的物理地址。
+[11:0]  12位 页内偏移。
+首先根据 虚拟地址第一段 虚拟页表号作为索引，寄存器TIBRx存储了页表的首地址，有索引和首地址就得到物理页号，从而找到了物理页，再加上虚拟地址第二段页内偏移做物理页页内偏移。就得到物理地址。
+
+
+一级页表有个致命问题：
+页表太大，如上为 1M个页表项，一个页表项如果为4B，则为4MB，每个进程都有自己的页表，1K个进程则需要4GB的物理内存存储页表。
+所以实际环境不存在一级页表.
+
+### 2.3.2 二级页表
+![](./pic/17.jpg)
+二级页表的虚拟地址分为三段：
+一级页表号[20-31]: 12位，4K个一级页表项
+二级页表号[12-19]: 8位，256个二级页表项
+页内偏移[0-12]：12位，最大偏移4K，也就是一个物理页的大小。
+
+4K \* 256 \* 4K = 4GB ，所以二级页表也能表示4GB虚拟地址，映射4GB物理地址。
+由于二级页表只有一级表需要预先分配，二级表用时才分配，所以一个进程的页表占用内存为 16KB 多点。
+而且二级页表中二级表可以分散到物理内存，所以不需要占用连续的物理内存。
+
+![](./pic/18.jpg)
+
+### 2.3.3 段表
+![](./pic/19.jpg)
+段表类似于一级页表，但是每项映射1MB空间。
+使用段表时，虚拟地址分为两段：
+[31:20] 索引段表项，段表项记录物理段地址
+[19:0]  段内偏移
+
+段表格式
+![](./pic/20.jpg)
+
+### 2.3.4 ARM下页表段表
+![](./pic/21.jpg)
+![](./pic/22.jpg)
+
+
+### 2.3.5 页表相关代码分析
+#### 2.3.5.1 linux和虚拟地址
+查看linux的链接脚本
+
+arch/arm/boot/vmlinux.lds
+```lds
+{
+  /DISCARD/ : {
+    *(.discard) *(.discard.*) *(.modinfo) *(.gnu.version*)
+    *(.ARM.exidx*)
+    *(.ARM.extab*)
+    *(.note.*)
+    *(.rel.*)
+    *(.data)
+  }
+  . = 0;
+  ...
+```
+
+arch/arm/boot/vmlinux.lds
+```lds
+OUTPUT_ARCH(arm)
+ENTRY(stext)
+jiffies = jiffies_64;
+SECTIONS
+{
+ /DISCARD/ : {
+  *(.ARM.exidx.exit.text) *(.ARM.extab.exit.text) *(.ARM.exidx.text.exit) *(.ARM.extab.text.exit) *(.exitcall.exit) *(.discard) *(.discard.*) *(.modinfo) *(.gnu.version*)
+ }
+ . = ((0x80000000)) + 0x00008000;
+```
+
+可见对于 zImage 使用地址无关码运行。
+vmlinux 使用虚拟地址运行。
+
+所以linux的地址无关码部分必须构建页表，并开启MMU。
+
+再看物理地址
+arch/arm/boot/dts/vexpress-v2p-ca9.dts
+```dts
+	memory@60000000 {
+		device_type = "memory";
+		reg = <0x60000000 0x40000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* Chipselect 3 is physically at 0x4c000000 */
+		vram: vram@4c000000 {
+			/* 8 MB of designated video RAM */
+			compatible = "shared-dma-pool";
+			reg = <0x4c000000 0x00800000>;
+			no-map;
+		};
+	};
+```
+可见，物理地址从 0x60000000 - 0xa0000000,  共 1GB
+
+#### 2.3.5.2 段映射
+为了让kernel可运行，再head.S进行段映射。
+段映射原理如下
+![](./pic/23.jpg)
+
+```asm
+__turn_mmu_on_loc:
+	.long	.                  @ __turn_mmu_on_loc的虚拟地址
+	.long	__turn_mmu_on      @ __turn_mmu_on虚拟地址
+	.long	__turn_mmu_on_end  @ __turn_mmu_end虚拟地址
+
+	...
+
+	bl	__create_page_tables   @ 建立段表
+/*
+ * Setup the initial page tables.  We only setup the barest
+ * amount which are required to get the kernel running, which
+ * generally means mapping in the kernel code.
+ *
+ * r8 = phys_offset, r9 = cpuid, r10 = procinfo
+ *
+ * Returns:
+ *  r0, r3, r5-r7 corrupted
+ *  r4 = physical page table address
+ */
+
+__create_page_tables:
+	pgtbl	r4, r8				@ page table address
+
+	/*
+	 * Clear the swapper page table
+	 * 清零页表
+	 */
+	mov	r0, r4               @ r0 指向页表开始
+	mov	r3, #0
+	add	r6, r0, #PG_DIR_SIZE @ r6 指向页表结尾
+1:	str	r3, [r0], #4         @ 写4字节数据到r0指向的内存，r0 += 4
+	str	r3, [r0], #4
+	str	r3, [r0], #4
+	str	r3, [r0], #4
+	teq	r0, r6
+	bne	1b
+
+	/*
+	 * r7存放mmu flags
+	 */
+	ldr	r7, [r10, #PROCINFO_MM_MMUFLAGS] @ mm_mmuflags
+
+	/*
+	 * Create identity mapping to cater for __enable_mmu.
+	 * This identity mapping will be removed by paging_init().
+	 * 建立对等映射，准备开启MMU
+	 * 开启MMU后，使用虚拟地址，意味着必须要提供有效的页表
+	 * 所以在开启MMU前需要设置页表，开启MMU的代码的物理地址等于
+	 * 虚拟地址，也就是对等映射
+	 */
+	adr	r0, __turn_mmu_on_loc @ r0存放__turn_mmu_on_loc的物理地址
+
+	ldmia	r0, {r3, r5, r6} @ 从r0指向的内存依次写入寄存器r3,r5,r6
+                             @ r3 : __turn_mmu_on_loc的虚拟地址
+                             @ r5 : __turn_mmu_on虚拟地址
+                             @ r6 : __turn_mmu_on_end 虚拟地址
+
+	sub	r0, r0, r3          @ r0 = r0 - r3
+                            @ virt->phys offset
+                            @ r0 存放 __turn_mmu_loc物理地址减去 __turn_mmu_loc 虚拟地址 得到的偏移值
+
+	add	r5, r5, r0          @ phys __turn_mmu_on
+	add	r6, r6, r0          @ phys __turn_mmu_on_end
+
+	mov	r5, r5, lsr #SECTION_SHIFT  @ r5=r5>>20
+                                    @ 得到物理基地址
+                                    @ 对等映射：将物理地址当成虚拟地址
+                                    @ 虚拟地址>>20 得到 页表索引号
+
+	mov	r6, r6, lsr #SECTION_SHIFT  @ r6=r6>>20
+                                    @ 得到物理基地址
+                                    @ 对等映射：将物理地址当成虚拟地址
+                                    @ 虚拟地址>>20 得到 页表索引号
+
+1:	orr	r3, r7, r5, lsl #SECTION_SHIFT  @ flags + kernel base
+                                        @ r3 = r7 | r5<<20
+                                        @ 将物理基地址做高位，位或上mmu flags 得到填充页表的值
+
+	str	r3, [r4, r5, lsl #PMD_ORDER]    @ identity mapping
+                                        @ 将r3页表项值填充到页表
+                                        @ 页表的地址计算：
+                                        @     r4 + r5<<2
+                                        @     页表基地址 + 页索引号 * 4   得到页表项地址
+                                        @     之所以乘以4，是因为一个页表项占4字节
+
+	cmp	r5, r6              @ 比较当前页表号和结束页表号
+	addlo	r5, r5, #1      @ next section
+                            @ 当r5 < r6 时，r5 = r5+1 , 也就是r5为下一个页表号
+
+	blo	1b                  @ 当r5 < r6 时，循环
+
+	/*
+	 * Map our RAM from the start to the end of the kernel .bss section.
+	 * 映射kernel镜像
+	 */
+	add	r0, r4, #PAGE_OFFSET >> (SECTION_SHIFT - PMD_ORDER) @ r0为kernel的起始页的地址
+                                                            @ 因为第一个页号被对等映射占据，
+                                                            @ 所以kernel的从第二个页开始
+                                                            @ r0 = 页表基地址 + 第二个页的偏移地址
+
+	ldr	r6, =(_end - 1)     @ kernel的虚拟地址的结束地址
+
+	orr	r3, r8, r7          @ r8:kernel镜像物理起始地址的基地址
+                            @ r3 = phys_offset | mmu flags
+
+	add	r6, r4, r6, lsr #(SECTION_SHIFT - PMD_ORDER)  @ 得到镜像虚拟结束地址对应的页的地址
+                                                      @ 将 r6 >> (20 - 2) 可以理解为
+                                                      @ (r6 >> 20) * 4
+                                                      @ 首先将虚拟地址右移20位，得到页号
+                                                      @ 再将页号乘以 4 得到偏移地址
+                                                      @ 将页表基地址加上偏移地址得到结束页的地址
+
+1:	str	r3, [r0], #1 << PMD_ORDER             @ 将物理基地址和mmu flags写道对应页表项       
+                                              @ 将 *r0 = r3 ,写4B
+                                              @ r0 += 4
+
+	add	r3, r3, #1 << SECTION_SHIFT           @ 增加物理基地址 
+	                                          @ 1 << 20 位保证只对物理基地址增加，不修改mmc flags
+
+	cmp	r0, r6       @ 比较当前页表项地址和镜像的结束页表项地址 
+	bls	1b           @ 如果 r0 < r6 循环
+```
+
+## 2.4 虚拟空间管理
+![](./pic/25.jpg)
+用户空间和内核空间的比例是可调整的，menuconfig 时设置 PAGE_OFFSET
+可以是 3:1 , 2:2 , 1:3 ...
+增加内核空间，就能尽可能让内核使用线性映射，而非vmalloc，vmalloc的效率低。
+
+
+![](./pic/26.jpg)
+kernel对虚拟空间的管理不是全部都按照线性映射，而是分区管理，各个区的管理方式不同。
