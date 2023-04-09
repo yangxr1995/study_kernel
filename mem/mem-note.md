@@ -693,3 +693,356 @@ __create_page_tables:
 
 ![](./pic/26.jpg)
 kernel对虚拟空间的管理不是全部都按照线性映射，而是分区管理，各个区的管理方式不同。
+
+### 2.4.1 对线性映射区的管理
+* 线性映射区的划分
+![](./pic/27.jpg)
+PAGE_OFFSET : 用于划分用户空间和内核空间，0+PAGE_OFFSET 得到内核空间的起始地址
+PHYS_OFFSET : 内存在物理地址的偏移，0 + PHYS_OFFSET 得到物理内存的起始地址
+
+把线性映射区映射的物理内存称为低端内存，剩余的物理内存称为高端内存。
+
+内核有如下方法用于线性映射区物理地址和虚拟地址之间的转换
+```c
+static inline phys_addr_t __virt_to_phys_nodebug(unsigned long x)
+{
+	return (phys_addr_t)x - PAGE_OFFSET + PHYS_OFFSET;
+}
+
+static inline unsigned long __phys_to_virt(phys_addr_t x)
+{
+	return x - PHYS_OFFSET + PAGE_OFFSET;
+}
+```
+
+* 线性映射区与高端内存的大小
+由于线性映射区，虚拟地址和物理地址的转换只存在一个偏移值，特别高效，
+所以应该尽可能将内核的虚拟空间作为线性映射区，kmalloc申请的虚拟空间都是线性映射区的，
+
+随着物理内存增大，线性映射区增大，但线性映射区有个上限，因为虚拟空间有限，需要留vmalloc和特殊映射区，
+最少需要给 vmalloc 和 特殊映射区留 240MB。
+所以当PAGE_OFFSET划分位：
+3GB/1GB: [3G, 3G + 760MB] 为线性映射
+2GB/2GB: [2G, 2G + 1760MB] 为线性映射
+对于64位操作系统，虚拟空间足够大，所有物理内存都划分位线性映射，不存在高端内存。
+
+内核确定高端内存和低端内存
+```c
+phys_addr_t arm_lowmem_limit __initdata = 0;
+
+void __init adjust_lowmem_bounds(void)
+	vmalloc_limit = (u64)(uintptr_t)vmalloc_min - PAGE_OFFSET + PHYS_OFFSET; // vmalloc_min : vmalloc和线性映射的最小边界
+	                                                                         // 将其映射到物理地址
+	for_each_mem_range(i, &block_start, &block_end) { // 遍历物理内存块
+		if (block_start < vmalloc_limit) {
+			if (block_end > lowmem_limit) 
+				lowmem_limit = min_t(u64, vmalloc_limit, block_end);
+							 
+	arm_lowmem_limit = lowmem_limit;
+	high_memory = __va(arm_lowmem_limit - 1) + 1;
+```
+
+### 2.4.2 二级页表的创建
+#### 注意细节
+![](./pic/28.jpg)
+1. 由于linux需要的有些属性 arm不支持，比如脏页，所以实际有两个页表，ARM的二级页表项，Linux的二级页表项。
+   由于给二级页表项分配物理空间时，一次分配一个物理页，即4KB，所以2KB用于arm，2KB用于linux。
+   并且都存放两个一级页表对应的二级页表项。
+
+####
+```c
+setup_arch
+   adjust_lowmem_bounds // 确定低端内存 arm_lowmem_limit 指向低端内存的结束
+   paging_init
+      prepare_page_table // 将页表置零
+	                     // 清零空间包括：
+	                     // 1. 0 - PAGE_OFFSET (用户空间)
+						 // 2. __pfn_to_phys(arm_lowmem_limit)(线性映射结束) - VMALLOC_START 
+						 //    在线性映射到VMALLOC_START之间有8MB的隔离虚拟空间，需要清零
+      map_lowmem    // 映射所有的低端内存
+```
+#### map_lowmem
+```c
+static void __init map_lowmem(void)
+{
+	// 获得kernel镜像的物理内存
+	// KERNEL_START - __init_end 主要包括代码段，不包括.data段
+	phys_addr_t kernel_x_start = round_down(__pa(KERNEL_START), SECTION_SIZE);
+	phys_addr_t kernel_x_end = round_up(__pa(__init_end), SECTION_SIZE);
+	phys_addr_t start, end;
+	u64 i;
+
+	// 遍历memblock.memory
+	/* Map all the lowmem memory banks. */
+	for_each_mem_range(i, &start, &end) {
+		struct map_desc map;
+
+		// 只映射所有的低端内存
+		if (end > arm_lowmem_limit)
+			end = arm_lowmem_limit;
+		if (start >= end)
+			break;
+
+		if (end < kernel_x_start) {
+			// 如果此内存块属于内核镜像
+			map.pfn = __phys_to_pfn(start); // 物理页帧号
+			map.virtual = __phys_to_virt(start); // 使用线性映射的方式计算得到虚拟地址
+			map.length = end - start; // 内存大小
+			map.type = MT_MEMORY_RWX; // 权限为 RWX，注意有可执行
+
+			create_mapping(&map);
+		} else if (start >= kernel_x_end) {
+			// 如果不属于内核镜像部分的物理内存，则只有读写权限
+			map.pfn = __phys_to_pfn(start);
+			map.virtual = __phys_to_virt(start);
+			map.length = end - start;
+			map.type = MT_MEMORY_RW;
+
+			create_mapping(&map);
+		} else {
+			// 如果有部分属于内核镜像的物理内存，则分开映射，将属于的部分
+			// 使用读写执行权限，其他为读写权限
+			/* This better cover the entire kernel */
+			if (start < kernel_x_start) {
+				map.pfn = __phys_to_pfn(start);
+				map.virtual = __phys_to_virt(start);
+				map.length = kernel_x_start - start;
+				map.type = MT_MEMORY_RW;
+
+				create_mapping(&map);
+			}
+
+			map.pfn = __phys_to_pfn(kernel_x_start);
+			map.virtual = __phys_to_virt(kernel_x_start);
+			map.length = kernel_x_end - kernel_x_start;
+			map.type = MT_MEMORY_RWX;
+
+			create_mapping(&map);
+
+			if (kernel_x_end < end) {
+				map.pfn = __phys_to_pfn(kernel_x_end);
+				map.virtual = __phys_to_virt(kernel_x_end);
+				map.length = end - kernel_x_end;
+				map.type = MT_MEMORY_RW;
+
+				create_mapping(&map);
+			}
+		}
+	}
+}
+```
+
+#### create_mapping
+```c
+static void __init create_mapping(struct map_desc *md)
+{
+	if (md->virtual != vectors_base() && md->virtual < TASK_SIZE) {
+		pr_warn("BUG: not creating mapping for 0x%08llx at 0x%08lx in user region\n",
+			(long long)__pfn_to_phys((u64)md->pfn), md->virtual);
+		return;
+	}
+
+	if (md->type == MT_DEVICE &&
+	    md->virtual >= PAGE_OFFSET && md->virtual < FIXADDR_START &&
+	    (md->virtual < VMALLOC_START || md->virtual >= VMALLOC_END)) {
+		pr_warn("BUG: mapping for 0x%08llx at 0x%08lx out of vmalloc space\n",
+			(long long)__pfn_to_phys((u64)md->pfn), md->virtual);
+	}
+
+	__create_mapping(&init_mm, md, early_alloc, false);
+}
+
+static void __init __create_mapping(struct mm_struct *mm, struct map_desc *md,
+				    void *(*alloc)(unsigned long sz),
+				    bool ng)
+{
+	unsigned long addr, length, end;
+	phys_addr_t phys;
+	const struct mem_type *type;
+	pgd_t *pgd;
+
+	// mem_types预定义了不同读写执行权限时，页表的flags位的值
+	// 获得flags的值
+	type = &mem_types[md->type];
+
+#ifndef CONFIG_ARM_LPAE
+	/*
+	 * Catch 36-bit addresses
+	 */
+	if (md->pfn >= 0x100000) {
+		create_36bit_mapping(mm, md, type, ng);
+		return;
+	}
+#endif
+	// 只取[31:12]共20位用于求一级页表的下标
+	addr = md->virtual & PAGE_MASK; 
+	// 根据物理页帧号计算物理地址
+	phys = __pfn_to_phys(md->pfn);
+	length = PAGE_ALIGN(md->length + (md->virtual & ~PAGE_MASK));
+
+	if (type->prot_l1 == 0 && ((addr | phys | length) & ~SECTION_MASK)) {
+		pr_warn("BUG: map for 0x%08llx at 0x%08lx can not be mapped using pages, ignoring.\n",
+			(long long)__pfn_to_phys(md->pfn), addr);
+		return;
+	}
+
+	// 计算对于的页帧
+	// mm->pgd + addr >> 21
+	// mm->pgd 是一个 u32 的数组
+	pgd = pgd_offset(mm, addr);
+	// 此页对应的虚拟地址的结束地址
+	end = addr + length;
+	do {
+		// 一轮映射2MB的虚拟地址
+		// next = addr + 2MB
+		unsigned long next = pgd_addr_end(addr, end);
+
+		// pgd一级页表项，将为其分配4KB的二级页表，映射2MB的虚拟空间
+		// addr 虚拟空间的起始地址
+		// next 虚拟空间的结束地址
+		// phys 映射对应的物理空间的起始地址
+		// type 权限
+		// alloc 用于分配二级页表
+		// ng  false
+		alloc_init_p4d(pgd, addr, next, phys, type, alloc, ng);
+
+		phys += next - addr;
+		addr = next;
+	} while (pgd++, addr != end);
+}
+```
+#### alloc\_init\_p4d alloc\_init\_pud alloc\_init\_pmd
+p4d pud pmd 都是一样的，直接分析最后的 alloc\_init\_pmd
+
+```c
+static void __init alloc_init_pmd(pud_t *pud, unsigned long addr,
+				      unsigned long end, phys_addr_t phys,
+				      const struct mem_type *type,
+				      void *(*alloc)(unsigned long sz), bool ng)
+{
+	pmd_t *pmd = pmd_offset(pud, addr); // pmd = pud = p4d = pgd;
+	                                    // pmd就指向一级页表项
+	unsigned long next;
+
+	do {
+		/*
+		 * With LPAE, we must loop over to map
+		 * all the pmds for the given range.
+		 */
+		next = pmd_addr_end(addr, end); 
+
+        // 映射物理地址 addr - next
+		/*
+		 * Try a section mapping - addr, next and phys must all be
+		 * aligned to a section boundary.
+		 */
+		if (type->prot_sect &&
+				((addr | next | phys) & ~SECTION_MASK) == 0) {
+			__map_init_section(pmd, addr, next, phys, type, ng); // 段映射方式
+		} else {
+			alloc_init_pte(pmd, addr, next,
+				       __phys_to_pfn(phys), type, alloc, ng); // 页映射方式
+		}
+
+		phys += next - addr;
+
+	} while (pmd++, addr = next, addr != end);
+}
+```
+
+#### 分配二级页表，建立二级页表和一级页表的关系
+```c
+static void __init alloc_init_pte(pmd_t *pmd, unsigned long addr,
+				  unsigned long end, unsigned long pfn,
+				  const struct mem_type *type,
+				  void *(*alloc)(unsigned long sz),
+				  bool ng)
+{
+	// 给二级页表分配空间，并设置一级页表项指向二级页表
+	pte_t *pte = arm_pte_alloc(pmd, addr, type->prot_l1, alloc);
+	do {
+		// 建立虚拟地址和物理地址的映射，写到二级页表
+		// pte : 二级页表
+		// pfn_pte(pfn, __pgprot(type->prot_pte) : 待映射的物理空间的起始地址
+		// 0
+		set_pte_ext(pte, pfn_pte(pfn, __pgprot(type->prot_pte)),
+			    ng ? PTE_EXT_NG : 0);
+		pfn++;
+	} while (pte++, addr += PAGE_SIZE, addr != end); // 一共映射2MB的空间
+	                                                 // 一次循环映射4KB，需要循环512次
+}
+```
+
+分配二级页表
+```c
+static pte_t * __init arm_pte_alloc(pmd_t *pmd, unsigned long addr,
+				unsigned long prot,
+				void *(*alloc)(unsigned long sz))
+{
+	if (pmd_none(*pmd)) {
+		// 分配512 * 4B + 512 * 4B = 4KB 的物理空间用作二级页表
+		pte_t *pte = alloc(PTE_HWTABLE_OFF + PTE_HWTABLE_SIZE);
+		// 设置一级页表项指向 ARM二级页表的物理起始地址
+		__pmd_populate(pmd, __pa(pte), prot);
+	}
+	BUG_ON(pmd_bad(*pmd));
+	return pte_offset_kernel(pmd, addr);
+}
+```
+#### 设置二级页表
+
+#define set_pte_ext(ptep,pte,ext) cpu_set_pte_ext(ptep,pte,ext)
+
+#define cpu_set_pte_ext			__glue(CPU_NAME,_set_pte_ext)
+```asm
+// r0 : 二级页表项
+// r1 : 物理地址
+/*
+ *	cpu_v7_set_pte_ext(ptep, pte)
+ *
+ *	Set a level 2 translation table entry.
+ *
+ *	- ptep  - pointer to level 2 translation table entry
+ *		  (hardware version is stored at +2048 bytes)
+ *	- pte   - PTE value to store
+ *	- ext	- value for extended PTE bits
+ */
+ENTRY(cpu_v7_set_pte_ext)
+	str	r1, [r0]			@ linux version
+	                        // 设置linux二级页表项
+
+    // 设置flags
+	// 删除arm页表项不支持的flags如 L_PTE_DIRTY，脏页
+	// 增加arm页表项支持的flags
+	bic	r3, r1, #0x000003f0
+	bic	r3, r3, #PTE_TYPE_MASK
+	orr	r3, r3, r2
+	orr	r3, r3, #PTE_EXT_AP0 | 2
+
+	tst	r1, #1 << 4
+	orrne	r3, r3, #PTE_EXT_TEX(1)
+
+	eor	r1, r1, #L_PTE_DIRTY
+	tst	r1, #L_PTE_RDONLY | L_PTE_DIRTY 
+	orrne	r3, r3, #PTE_EXT_APX
+
+	tst	r1, #L_PTE_USER
+	orrne	r3, r3, #PTE_EXT_AP1
+
+	tst	r1, #L_PTE_XN
+	orrne	r3, r3, #PTE_EXT_XN
+
+	tst	r1, #L_PTE_YOUNG
+	tstne	r1, #L_PTE_VALID
+	eorne	r1, r1, #L_PTE_NONE
+	tstne	r1, #L_PTE_NONE
+	moveq	r3, #0
+
+ ARM(	str	r3, [r0, #2048]! )  // 设置arm二级页表项
+ THUMB(	add	r0, r0, #2048 )
+ THUMB(	str	r3, [r0] )          
+	ALT_SMP(W(nop))
+	ALT_UP (mcr	p15, 0, r0, c7, c10, 1)		@ flush_pte
+	bx	lr
+ENDPROC(cpu_v7_set_pte_ext)
+```
