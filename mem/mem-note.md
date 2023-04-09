@@ -722,8 +722,8 @@ static inline unsigned long __phys_to_virt(phys_addr_t x)
 随着物理内存增大，线性映射区增大，但线性映射区有个上限，因为虚拟空间有限，需要留vmalloc和特殊映射区，
 最少需要给 vmalloc 和 特殊映射区留 240MB。
 所以当PAGE_OFFSET划分位：
-3GB/1GB: [3G, 3G + 760MB] 为线性映射
-2GB/2GB: [2G, 2G + 1760MB] 为线性映射
+3GB/1GB: [3G, 3G + 764MB] 为线性映射
+2GB/2GB: [2G, 2G + 1764MB] 为线性映射
 对于64位操作系统，虚拟空间足够大，所有物理内存都划分位线性映射，不存在高端内存。
 
 内核确定高端内存和低端内存
@@ -1046,3 +1046,165 @@ ENTRY(cpu_v7_set_pte_ext)
 	bx	lr
 ENDPROC(cpu_v7_set_pte_ext)
 ```
+
+
+### 2.3.6 vmalloc区
+#### 为什么需要vmalloc区
+前面创建了线性映射区，那么映射的物理空间一定是连续分配的，而连续的物理空间大小有限（由伙伴系统导致最大4MB），
+但是连续的虚拟内存并不需要连续的物理空间，只要映射不是线性的，那么就出现了vmalloc区，
+vmalloc区可以分配大的虚拟空间，且映射的物理空间不需要连续。
+
+#### vmalloc区的大小
+由两方面决定：
+* PAGE_SHIFT : 决定虚拟空间内核区的大小
+* 物理内存的大小 : 物理内存越大，线性映射区越大，但需要保证最少给vmalloc区留 240MB
+
+#### 如何从vmalloc区分配虚拟内存
+```c
+void *vmalloc(unsigned long size);
+void vfree(const void *addr);
+unsigned long vmalloc_to_pfn(const void *vmalloc_addr);
+struct page *vmalloc_to_page(const void *vmalloc_addr);
+```
+
+#### vmalloc实现分析
+从 VMALLOC_START 到 VMALLOC_END 查找一片虚拟空间
+从伙伴系统申请多个物理页帧page
+把每个申请的物理页帧映射到虚拟空间
+
+```c
+struct vm_struct {
+	struct vm_struct	*next;
+	void			*addr;         // 虚拟空间的起始地址
+	unsigned long		size;      // 虚拟空间大小
+	unsigned long		flags;
+	struct page		**pages;       // 物理页数组
+	unsigned int		nr_pages;  // 物理页数量
+	phys_addr_t		phys_addr;
+	const void		*caller;
+};
+
+struct vmap_area {
+	unsigned long va_start;  // 虚拟空间的起始地址
+	unsigned long va_end;    // 虚拟空间的结束地址
+
+	struct rb_node rb_node;         /* address sorted rbtree */ // 用于查找
+	struct list_head list;          /* address sorted list */   // 用于遍历
+
+	/*
+	 * The following three variables can be packed, because
+	 * a vmap_area object is always one of the three states:
+	 *    1) in "free" tree (root is vmap_area_root)
+	 *    2) in "busy" tree (root is free_vmap_area_root)
+	 *    3) in purge list  (head is vmap_purge_list)
+	 */
+	union {
+		unsigned long subtree_max_size; /* in "free" tree */
+		struct vm_struct *vm;           /* in "busy" tree */ // this
+		struct llist_node purge_list;   /* in purge list */
+	};
+};
+
+
+
+```
+
+```c
+vmalloc(unsigned long size)
+	__vmalloc_node_range(size, align, VMALLOC_START, VMALLOC_END,
+				gfp_mask, PAGE_KERNEL, 0, node, caller);
+	struct vm_struct *area;
+	size = PAGE_ALIGN(size);
+	area = __get_vm_area_node(real_size, align, VM_ALLOC | VM_UNINITIALIZED |
+				vm_flags, start, end, node, gfp_mask, caller);    // 分配虚拟空间
+		area = kzalloc_node(sizeof(*area), gfp_mask & GFP_RECLAIM_MASK, node);
+		va = alloc_vmap_area(size, align, start, end, node, gfp_mask);	// 从VMALLOC_START - VMALLOC_END
+																		// 分配size大小的虚拟空间
+
+	    setup_vmalloc_vm(area, va, flags, caller); // 将 area 和 vm_struct关联
+			vm->flags = flags;
+			vm->addr = (void *)va->va_start;
+			vm->size = va->va_end - va->va_start;
+			vm->caller = caller;
+			va->vm = vm;
+
+
+	addr = __vmalloc_area_node(area, gfp_mask, prot, node); // 分配物理page
+		// 分配元素为page指针的数组
+		// 如果数组大小大于一个页，则递归调用 vmallo_node分配空间
+		// 否则使用kmalloc分配
+		unsigned int array_size = nr_pages * sizeof(struct page *), i;
+		if (array_size > PAGE_SIZE) {
+			pages = __vmalloc_node(array_size, 1, nested_gfp, node,
+						area->caller);
+		} else {
+			pages = kmalloc_node(array_size, nested_gfp, node);
+		}
+		area->pages = pages;
+		area->nr_pages = nr_pages;
+
+		// 从伙伴系统分配page
+		for (i = 0; i < area->nr_pages; i++) {
+			struct page *page;
+	
+			if (node == NUMA_NO_NODE)
+				page = alloc_page(gfp_mask);
+			else
+				page = alloc_pages_node(node, gfp_mask, 0);
+	
+			area->pages[i] = page;
+		}
+	
+	// 建立虚拟地址和物理地址的映射
+	map_kernel_range((unsigned long)area->addr, get_vm_area_size(area), prot, pages);
+		map_kernel_range_noflush(start /*虚拟空间地址*/, size /*虚拟空间大小*/, prot, pages /*物理页*/);
+			unsigned long end = addr + size; // end为虚拟空间的结束地址
+			pgd = pgd_offset_k(addr); // 根据虚拟地址得到一级页表项
+			do {
+				next = pgd_addr_end(addr, end);	// next为addr + 2MB 
+												// 一个一级页表项对应2MB的虚拟空间
+				vmap_p4d_range(pgd, addr, next, prot, pages, &nr, &mask);
+					vmap_pte_range(pmd, addr, next, prot, pages, nr, mask)
+						pte = pte_alloc_kernel_track(pmd, addr, mask);	// 分配一个page做二级页表
+																		// 设置一级页表项pmd指向二级页表
+																		// 返回二级页表项数组pte
+						do {
+							struct page *page = pages[*nr]; // *nr从0开始
+					
+							set_pte_at(&init_mm, addr, pte, mk_pte(page, prot)); // 设置二级页表
+								cpu_set_pte_ext(ptep,__pte(pte_val(pte)|(ext)))  // 详细参见前面汇编分析
+							(*nr)++;
+						} while (pte++, addr += PAGE_SIZE, addr != end);
+
+
+			} while (pgd++ /*下一个一级页表项*/, addr = next /*下一次需要映射的虚拟地址*/, addr != end);
+
+		flush_cache_vmap(start, start + size);
+	
+	return addr; // 返回虚拟空间地址
+```
+
+#### ioremap
+ioremap也是从vmalloc区分配虚拟空间，不同的是物理空间已经确定，所以直接建立映射
+```c
+ioremap(phys_addr_t paddr, unsigned long size)
+	phys_addr_t end;
+	end = paddr + size - 1;
+
+	return ioremap_prot(paddr, size, PAGE_KERNEL_NO_CACHE);
+		area = get_vm_area(size, VM_IOREMAP); // 从vmalloc区分配虚拟空间
+		area->phys_addr = paddr;
+		vaddr = (unsigned long)area->addr;
+		ioremap_page_range(vaddr /*虚拟地址*/, vaddr + size/*虚拟结束*/, paddr/*物理地址*/, prot);
+			pgd = pgd_offset_k(addr); // 根据虚拟地址得到一级页表项
+			do {
+				next = pgd_addr_end(addr, end); // next = addr + 2MB
+												// 下一个一级页表项
+				ioremap_p4d_range(pgd, addr, next, phys_addr, prot, &mask); // 同上
+			} while (pgd++, phys_addr += (next - addr), addr = next, addr != end);
+		
+			flush_cache_vmap(start, end);
+
+		return (void __iomem *)(off + (char __iomem *)vaddr);
+```
+
