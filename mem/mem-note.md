@@ -1048,7 +1048,7 @@ ENDPROC(cpu_v7_set_pte_ext)
 ```
 
 
-### 2.3.6 vmalloc区
+### 2.4.3 vmalloc区
 #### 为什么需要vmalloc区
 前面创建了线性映射区，那么映射的物理空间一定是连续分配的，而连续的物理空间大小有限（由伙伴系统导致最大4MB），
 但是连续的虚拟内存并不需要连续的物理空间，只要映射不是线性的，那么就出现了vmalloc区，
@@ -1211,7 +1211,7 @@ ioremap(phys_addr_t paddr, unsigned long size)
 		return (void __iomem *)(off + (char __iomem *)vaddr);
 ```
 
-### 2.3.7 高端内存
+### 2.4.4 高端内存
 当物理内存足够大，线性映射剩余的内存被称为高端内存。
 
 #### 高端内存的初始化
@@ -1231,20 +1231,20 @@ vmalloc优先到高端内存的伙伴系统分配内存，申请失败再到低�
 是否会导致冲突？
 不会，因为对物理内存的管理由伙伴系统负责，地址映射不会影响伙伴系统。
 
-### 2.3.8 pkmap
+### 2.4.5 pkmap
 当开启了高端内存后，虚拟空间会分配2MB的pkmap，通过pkmap映射物理页的特点是：
 如果该物理页在低端内存，则直接返回他的线性映射地址。
 如果该物理页在高端内存，则在pkmap进行映射，并返回地址。
 
 
-### 2.3.9 fixmap
+### 2.4.6 fixmap
 特点，在编译时就确定了fixmap区虚拟地址和某些物理地址的映射关系，并且之后永远保持不变。
 为什么需要fixmap?
 因为在MMU开启后，只建立了内核镜像的映射，保证内核代码正常运行，
 但是伙伴系统，二级页表，等没有完成初始化，如果需要访问硬件寄存器则不方便建立映射，
 所以使用fixmap完成二级页表的创建，包括设备树，一些外设...
 
-### 2.3.10 modules
+### 2.4.7 modules
 安装模块时，从modules区分配虚拟内存建立映射，如果modules区分配虚拟内存失败（modules区很小16MB），
 则从vmalloc区分配。
 modules属于用户空间，
@@ -1265,5 +1265,91 @@ SYSCALL_DEFINE3(init_module, void __user *, umod,
 					return __vmalloc_node_range(size, 1,  VMALLOC_START, VMALLOC_END,
 								GFP_KERNEL, PAGE_KERNEL_EXEC, 0, NUMA_NO_NODE,
 								__builtin_return_address(0));
+```
+
+### 2.5 用户空间的虚拟内存
+每个进程都有自己的页表，共享一个内核页表
+用户空间的虚拟内存也别分为多个区
+![](./pic/29.jpg)
+```c
+struct task_struct {
+	struct mm_struct		*mm; // 用户空间的虚拟内存
+	...
+};
+
+struct mm_struct {
+	..
+	struct vm_area_struct *mmap; // 用户空间虚拟内存区链表
+	pgd_t * pgd;    // 用户进程页表的基地址
+	..
+};
+
+struct vm_area_struct {
+	unsigned long vm_start;		/* Our start address within vm_mm. */
+	unsigned long vm_end;		/* The first byte after our end address
+
+	// 进程每个虚拟内存区链接在一起
+	struct vm_area_struct *vm_next, *vm_prev;
+};
+```
+![](./pic/30.jpg)
+
+#### 2.5.1 用户空间页表的创建
+创建本进程的mm_struct
+拷贝内核页表项
+创建父进程页表项
+```c
+SYSCALL_DEFINE0(fork)
+	return kernel_clone(&args);
+		copy_process(NULL, trace, NUMA_NO_NODE, args);
+			copy_mm(clone_flags, p);
+				dup_mm(tsk /*子进程*/, current->mm/*父进程的mm*/);
+					mm = allocate_mm(); // 分配mm_struct
+					memcpy(mm, oldmm, sizeof(*mm)); // 拷贝虚拟地址分布等信息
+					mm_init(mm, tsk, mm->user_ns); 
+						mm_init_owner(mm, p); // 设置子进程和mm的关联
+						mm_alloc_pgd(mm);  // 拷贝内核页表项
+							mm->pgd = pgd_alloc(mm);
+								new_pgd = __pgd_alloc(); // 分配16KB的一级页表
+								init_pgd = pgd_offset_k(0);  // 获得内核一级页表
+								memcpy(new_pgd + USER_PTRS_PER_PGD, init_pgd + USER_PTRS_PER_PGD, //拷贝一级页表
+										   (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));   //一级页表项指向
+										                                                          //同样的二级页表
+																								  //项，所以不需拷
+																								  //贝二级页表项
+
+					dup_mmap(mm, oldmm); // 拷贝父进程mm
+						mm->total_vm = oldmm->total_vm;
+						mm->data_vm = oldmm->data_vm;
+						mm->exec_vm = oldmm->exec_vm;
+						mm->stack_vm = oldmm->stack_vm;
+						pprev = &mm->mmap;
+						for (mpnt = oldmm->mmap; mpnt; mpnt = mpnt->vm_next) { // 依次拷贝父进程各个VMA
+							tmp = vm_area_dup(mpnt); // 创建VMA
+								struct vm_area_struct *new = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
+								INIT_LIST_HEAD(&new->anon_vma_chain);
+								new->vm_next = new->vm_prev = NULL;
+							*pprev = tmp;         // 将拷贝的区加入mm->mmap链表
+							pprev = &tmp->vm_next;
+							tmp->vm_prev = prev;
+							prev = tmp;
+
+						copy_page_range(tmp, mpnt);
+							copy_p4d_range(dst_vma, src_vma, dst_pgd, src_pgd,
+								copy_pud_range(dst_vma, src_vma, dst_p4d, src_p4d,
+									copy_pmd_range(dst_vma, src_vma, dst_pud, src_pud,
+										copy_pte_range(dst_vma, src_vma, dst_pmd, src_pmd,
+											do {
+												copy_present_pte(dst_vma, src_vma, dst_pte, src_pte,
+															   addr, rss, &prealloc);
+													if (is_cow_mapping(vm_flags) && pte_write(pte)) { // 对父子页表项
+														ptep_set_wrprotect(src_mm, addr, src_pte);    // 都设置写保护
+														pte = pte_wrprotect(pte);                     // 实现写时拷贝
+													}
+													set_pte_at(dst_vma->vm_mm, addr, dst_pte, pte);   // 将进程的pte
+													                                                  // 复制给子进程
+																									  // 的pte
+
+											} while (dst_pte++, src_pte++, addr += PAGE_SIZE, addr != end);
 ```
 
