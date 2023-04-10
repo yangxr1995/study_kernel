@@ -1130,10 +1130,14 @@ vmalloc(unsigned long size)
 
 
 	addr = __vmalloc_area_node(area, gfp_mask, prot, node); // 分配物理page
+		unsigned int array_size = nr_pages * sizeof(struct page *), i;
+
+		if (!(gfp_mask & (GFP_DMA | GFP_DMA32))) // 如果没有用DMA
+			gfp_mask |= __GFP_HIGHMEM;			 // 优先从高端内存分配page
+
 		// 分配元素为page指针的数组
 		// 如果数组大小大于一个页，则递归调用 vmallo_node分配空间
 		// 否则使用kmalloc分配
-		unsigned int array_size = nr_pages * sizeof(struct page *), i;
 		if (array_size > PAGE_SIZE) {
 			pages = __vmalloc_node(array_size, 1, nested_gfp, node,
 						area->caller);
@@ -1146,7 +1150,6 @@ vmalloc(unsigned long size)
 		// 从伙伴系统分配page
 		for (i = 0; i < area->nr_pages; i++) {
 			struct page *page;
-	
 			if (node == NUMA_NO_NODE)
 				page = alloc_page(gfp_mask);
 			else
@@ -1206,5 +1209,61 @@ ioremap(phys_addr_t paddr, unsigned long size)
 			flush_cache_vmap(start, end);
 
 		return (void __iomem *)(off + (char __iomem *)vaddr);
+```
+
+### 2.3.7 高端内存
+当物理内存足够大，线性映射剩余的内存被称为高端内存。
+
+#### 高端内存的初始化
+```c
+void __init bootmem_init(void)
+	find_limits(&min_low_pfn, &max_low_pfn, &max_pfn); // min_low_pfn : 起始物理页帧（除去保留部分）
+	                                                   // max_low_pfn : 低端内存和高端内存的分隔页帧
+													   // max_pfn : 结束物理页帧（除去保留部分）
+	
+	zone_sizes_init(min_low_pfn, max_low_pfn, max_pfn); // 将高端内存加入自己的伙伴系统
+```
+#### vmalloc和高端内存
+vmalloc优先到高端内存的伙伴系统分配内存，申请失败再到低端内存
+
+#### vmalloc区和线性映射区是否会冲突
+如果没有高端内存，vmalloc从低端内存分配，则vmalloc区和线性映射区映射到同个page，
+是否会导致冲突？
+不会，因为对物理内存的管理由伙伴系统负责，地址映射不会影响伙伴系统。
+
+### 2.3.8 pkmap
+当开启了高端内存后，虚拟空间会分配2MB的pkmap，通过pkmap映射物理页的特点是：
+如果该物理页在低端内存，则直接返回他的线性映射地址。
+如果该物理页在高端内存，则在pkmap进行映射，并返回地址。
+
+
+### 2.3.9 fixmap
+特点，在编译时就确定了fixmap区虚拟地址和某些物理地址的映射关系，并且之后永远保持不变。
+为什么需要fixmap?
+因为在MMU开启后，只建立了内核镜像的映射，保证内核代码正常运行，
+但是伙伴系统，二级页表，等没有完成初始化，如果需要访问硬件寄存器则不方便建立映射，
+所以使用fixmap完成二级页表的创建，包括设备树，一些外设...
+
+### 2.3.10 modules
+安装模块时，从modules区分配虚拟内存建立映射，如果modules区分配虚拟内存失败（modules区很小16MB），
+则从vmalloc区分配。
+modules属于用户空间，
+
+```c
+
+SYSCALL_DEFINE3(init_module, void __user *, umod,
+		unsigned long, len, const char __user *, uargs)
+	return load_module(&info, uargs, 0);
+		mod = layout_and_allocate(info, flags);
+			err = move_module(info->mod, info);
+				ptr = module_alloc(mod->core_layout.size);
+					p = __vmalloc_node_range(size, 1, MODULES_VADDR, MODULES_END, // 优先从modules区申请
+								gfp_mask, PAGE_KERNEL_EXEC, 0, NUMA_NO_NODE,
+								__builtin_return_address(0));
+					if (!IS_ENABLED(CONFIG_ARM_MODULE_PLTS) || p) // 如果申请失败，并配置了 CONFIG_ARM_MODULE_PLTS
+						return p;                                 // 则再从vmalloc申请
+					return __vmalloc_node_range(size, 1,  VMALLOC_START, VMALLOC_END,
+								GFP_KERNEL, PAGE_KERNEL_EXEC, 0, NUMA_NO_NODE,
+								__builtin_return_address(0));
 ```
 
