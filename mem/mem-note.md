@@ -970,6 +970,8 @@ static void __init alloc_init_pte(pmd_t *pmd, unsigned long addr,
 		pfn++;
 	} while (pte++, addr += PAGE_SIZE, addr != end); // 一共映射2MB的空间
 	                                                 // 一次循环映射4KB，需要循环512次
+													 // 需要注意的是：pte 一次增加8字节，
+													 // 
 }
 ```
 
@@ -984,6 +986,19 @@ static pte_t * __init arm_pte_alloc(pmd_t *pmd, unsigned long addr,
 		pte_t *pte = alloc(PTE_HWTABLE_OFF + PTE_HWTABLE_SIZE);
 		// 设置一级页表项指向 ARM二级页表的物理起始地址
 		__pmd_populate(pmd, __pa(pte), prot);
+			// 下面一共消耗4KB的空间
+			//
+			// pte + PTE_HWTABLE_OFF 保证指向的是 arm的二级页表，而非linux的二级页表
+			// PTE_HWTABLE_OFF : 512 * 4B = 2KB, 两个linux二级页表项（一个256 * 4B = 1KB）
+			pmdval_t pmdval = (pte + PTE_HWTABLE_OFF) | prot;
+			// 一次分配了两个二级页表，一个页表项占据1KB，两个占据2KB
+			// 分配Linux页表 2KB
+			pmdp[0] = __pmd(pmdval);
+		#ifndef CONFIG_ARM_LPAE
+			// 分配ARM页表 2KB
+			pmdp[1] = __pmd(pmdval + 256 * sizeof(pte_t));
+		#endif
+			flush_pmd_entry(pmdp);
 	}
 	BUG_ON(pmd_bad(*pmd));
 	return pte_offset_kernel(pmd, addr);
@@ -996,7 +1011,7 @@ static pte_t * __init arm_pte_alloc(pmd_t *pmd, unsigned long addr,
 #define cpu_set_pte_ext			__glue(CPU_NAME,_set_pte_ext)
 ```asm
 // r0 : 二级页表项
-// r1 : 物理地址
+// r1 : 物理基地址+flags
 /*
  *	cpu_v7_set_pte_ext(ptep, pte)
  *
@@ -1290,6 +1305,8 @@ struct vm_area_struct {
 
 	// 进程每个虚拟内存区链接在一起
 	struct vm_area_struct *vm_next, *vm_prev;
+
+	struct mm_struct *vm_mm;	/* The address space we belong to. */
 };
 ```
 ![](./pic/30.jpg)
@@ -1353,3 +1370,185 @@ SYSCALL_DEFINE0(fork)
 											} while (dst_pte++, src_pte++, addr += PAGE_SIZE, addr != end);
 ```
 
+### 2.5.2 缺页异常 —— 写时复制
+所谓缺页异常就是，没有却物理页，此时虚拟空间可能已分配，也可能未分配.
+
+由于用户空间页表创建时，是复制父进程的页表，所以映射到同一个物理内存页，并设置了写保护，
+当一个进程写这个内存页时，就会触发缺页异常，与信号类似，回调注册的缺页异常处理函数。
+
+对于写时复制，虚拟空间已经分配，物理页没有分配.
+
+注册缺页异常处理函数
+```c
+static int __init exceptions_init(void)
+		hook_fault_code(4, do_translation_fault, SIGSEGV, SEGV_MAPERR,
+				"I-cache maintenance fault");
+			fsr_info[nr].fn   = fn;
+			fsr_info[nr].sig  = sig;
+			fsr_info[nr].code = code;
+			fsr_info[nr].name = name;
+```
+
+发生缺页异常
+```c
+中断处理
+	do_DataAbort(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+		inf->fn(addr, fsr & ~FSR_LNX_PF, regs);
+
+		do_translation_fault(unsigned long addr, unsigned int fsr,
+					 struct pt_regs *regs)
+			if (addr < TASK_SIZE)     // 如果触发缺页异常的虚拟地址属于用户空间
+				return do_page_fault(addr, fsr, regs);
+
+					struct mm_struct *mm;
+					tsk = current;
+					mm  = tsk->mm; // mm_struct 代表进程的虚拟空间和页表
+					fault = __do_page_fault(mm, addr, fsr, flags, tsk, regs);
+
+						struct vm_area_struct *vma;
+						vma = find_vma(mm, addr); // 找到触发缺页地址对应虚拟空间
+							return handle_mm_fault(vma, addr & PAGE_MASK, flags, regs);
+
+								ret = __handle_mm_fault(vma, address, flags);
+									// 分配
+									struct vm_fault vmf = {
+										.vma = vma,
+										.address = address & PAGE_MASK,
+										.flags = flags,
+										.pgoff = linear_page_index(vma, address),
+										.gfp_mask = __get_fault_gfp_mask(vma),
+									};
+									struct mm_struct *mm = vma->vm_mm;
+									pgd = pgd_offset(mm, address);   // 找到address对应的一级页表项
+									p4d = p4d_alloc(mm, pgd, address);  // 给一级页表项分配p4d pud pmd
+									vmf.pud = pud_alloc(mm, p4d, address);
+									vmf.pmd = pmd_alloc(mm, vmf.pud, address);
+
+									return handle_pte_fault(&vmf);
+										pte_t entry;
+										if (!vmf->pte) { // pte项不存在，对于写时复制的情况在下面
+											if (vma_is_anonymous(vmf->vma)) // 是否为匿名页，匿名页解释在下面
+												return do_anonymous_page(vmf); // 匿名映射
+											else
+												return do_fault(vmf); // 文件映射
+										}
+
+										entry = vmf->orig_pte; // 记录原来的页表项值
+
+										if (vmf->flags & FAULT_FLAG_WRITE) { // 写时复制
+											if (!pte_write(entry))  // 如果pte写保护
+
+												return do_wp_page(vmf);  // 分配page，建立映射，复制page，返回
+													struct vm_area_struct *vma = vmf->vma;
+													vmf->page = vm_normal_page(vma, vmf->address, vmf->orig_pte); // 得到父子进程
+													                                                              // 共同关联的page
+													return wp_page_copy(vmf);
+														new_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, // 分配新page
+																vmf->address);
+														cow_user_page(new_page, old_page, vmf);
+															copy_user_highpage(dst, src, addr, vma);  // 复制page
+														// 根据新的page生成页表项的值 entry
+														entry = mk_pte(new_page, vma->vm_page_prot);
+														entry = pte_sw_mkyoung(entry);
+														entry = maybe_mkwrite(pte_mkdirty(entry), vma); // 修改为可读写权限
+
+														page_add_new_anon_rmap(new_page, vma, vmf->address, false); // 设为匿名映射
+
+														set_pte_at_notify(mm, vmf->address, vmf->pte, entry); // 设置新的映射关系
+															void set_pte_at(struct mm_struct *mm, unsigned long addr,
+																			  pte_t *ptep, pte_t pteval)
+																set_pte_ext(ptep, pteval, ext);
+																	cpu_set_pte_ext(ptep,pte,ext)
+
+
+```
+
+#### 匿名页
+在Linux中，匿名页（anonymous page）是一种没有文件映射关联的内存页，通常用于进程堆栈和堆内存的分配。匿名页是指操作系统不知道这些页将要用于什么目的，因此它们不会被写入任何文件。相反，它们只是在物理内存上分配了一些空间，并由操作系统管理它们。
+
+当进程需要更多的内存时，它可以通过向操作系统请求匿名页来动态增加堆栈或堆的大小。这些匿名页可以由进程自由使用，但它们不会被永久保存到磁盘上。
+
+匿名页是一种内存分配的方式，它允许进程在运行时动态地分配内存，从而提高了内存的利用率和灵活性。同时，由于它们不会被保存到磁盘上，匿名页也可以帮助保护进程的安全性。
+
+
+### 2.5.3 用户进程更新内核区页表
+在Linux系统中，0号进程（也就是内核线程swapper）的页表只映射了内核空间，没有映射用户空间。这是因为0号进程是内核的一部分，其主要任务是管理系统的各种资源和处理各种中断和异常。因此，0号进程只需要访问内核空间，不需要访问用户空间。
+
+在Linux中，普通进程创建时会创建一个新的虚拟地址空间，这个虚拟地址空间包括用户空间和内核空间。对于内核空间，普通进程并不需要复制内核空间相关的页表，因为内核空间的映射是共享的，所有进程都可以共享这些映射。
+
+当一个普通进程被创建时，其虚拟地址空间的内核空间部分是由操作系统内核预先创建好的，已经包含了内核代码、数据和堆栈等内容。这些内核空间的映射是在内核初始化的时候建立的，是所有进程都共享的。
+
+因此，普通进程在创建时只需要复制用户空间相关的页表，包括一级页表和二级页表。复制的页表是由内核空间中的swapper_pg_dir指向的一级页表，并且这些页表是对于内核空间的映射是共享的。
+
+需要注意的是，当普通进程需要访问内核空间时，它必须通过特殊的系统调用进入内核态，这时会切换到内核的地址空间，并且可以访问内核空间的所有内容。在内核态下，进程使用的页表与用户态下的页表是不同的。在内核态下，进程使用的页表是内核专用的页表，它包含了对整个内核空间和所有进程的内存映射。
+
+
+在Linux 5.0版本中，创建子进程时确实会为子进程的mm_struct复制内核空间的页表信息。
+
+在Linux中，每个进程都有一个mm_struct结构，用于管理进程的内存地址空间。在创建子进程时，父进程会通过copy_mm()函数将自己的mm_struct结构中的信息复制到子进程的mm_struct中，包括一级页表、内存区域、映射关系等。
+
+对于内核空间的映射，由于它是所有进程共享的，因此复制内核空间的页表信息可以提高系统的性能，因为所有进程可以共享这些映射，不需要每个进程都创建一份内核空间的页表。但是，由于内核空间的映射是共享的，需要确保进程不能修改内核空间的映射关系，否则会破坏系统的稳定性。为了保证这一点，Linux内核使用了写保护位（write-protection）来限制进程对内核空间的修改。这样，在普通进程修改自己的页表时，不能修改内核空间的映射，从而保证了系统的稳定性。
+
+需要注意的是，即使子进程复制了父进程的内核空间的页表信息，子进程也只能访问内核空间中已经存在的内容，不能创建新的内核空间的映射。如果子进程需要修改内核空间的映射关系，需要通过内核提供的特殊接口，比如系统调用或者内核模块等。
+
+
+```c
+
+static int __kprobes
+do_translation_fault(unsigned long addr, unsigned int fsr,
+		     struct pt_regs *regs)
+	if (addr < TASK_SIZE)
+		return do_page_fault(addr, fsr, regs);
+	// 如果访问内核空间，走下面
+	index = pgd_index(addr); // 根据虚拟地址找到一级页表项的下标
+
+	pgd = cpu_get_pgd() + index; // 获得当前进程的一级页表项
+	pgd_k = init_mm.pgd + index; // 获得0号进程的一级页表项
+
+	
+	p4d = p4d_offset(pgd, addr);
+	p4d_k = p4d_offset(pgd_k, addr);
+
+	if (p4d_none(*p4d_k))
+		goto bad_area;
+	if (!p4d_present(*p4d))
+		set_p4d(p4d, *p4d_k);
+
+	pud = pud_offset(p4d, addr);
+	pud_k = pud_offset(p4d_k, addr);
+
+	if (pud_none(*pud_k))
+		goto bad_area;
+	if (!pud_present(*pud))
+		set_pud(pud, *pud_k);
+
+	pmd = pmd_offset(pud, addr);
+	pmd_k = pmd_offset(pud_k, addr);
+
+
+	index = 0;
+
+	if (pmd_none(pmd_k[index]))  //如果0号进程没有创建对应页表的映射，则错误
+		goto bad_area;
+
+	copy_pmd(pmd, pmd_k); // 拷贝0号进程的一级页表项给当前进程
+		#define copy_pmd(pmdpd,pmdps)		\ // 拷贝两个一个arm页表项一个linux页表项
+			do {				\
+				pmdpd[0] = pmdps[0];	\   // 设置Linux一级页表项
+				pmdpd[1] = pmdps[1];	\   // 设置arm一级页表项
+				flush_pmd_entry(pmdpd);	\   // 刷新TLB
+			} while (0)
+
+
+	return 0;
+
+bad_area:
+	do_bad_area(addr, fsr, regs); // 报错
+		if (user_mode(regs))
+			__do_user_fault(addr, fsr, SIGSEGV, SEGV_MAPERR, regs);
+		else
+			__do_kernel_fault(mm, addr, fsr, regs);
+				die("Oops", regs, fsr);
+
+	return 0;
+```
