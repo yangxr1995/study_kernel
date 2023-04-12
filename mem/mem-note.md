@@ -1054,6 +1054,14 @@ ENTRY(cpu_v7_set_pte_ext)
 	moveq	r3, #0
 
  ARM(	str	r3, [r0, #2048]! )  // 设置arm二级页表项
+ 								// 2048 是 Linux 页表项数组和ARM页表项数组的偏差
+								// 因为 Linux和ARM页表项数组都占据 2048字节
+								// Linux[0] : 1KB 
+								// Linux[1] : 1KB
+								// ARM[0]   : 1KB
+								// ARM[1]   : 1KB
+								// 刚好把4KB的一个Page用完
+
  THUMB(	add	r0, r0, #2048 )
  THUMB(	str	r3, [r0] )          
 	ALT_SMP(W(nop))
@@ -1099,6 +1107,7 @@ struct vm_struct {
 	const void		*caller;
 };
 
+// 描述一块虚拟空间
 struct vmap_area {
 	unsigned long va_start;  // 虚拟空间的起始地址
 	unsigned long va_end;    // 虚拟空间的结束地址
@@ -1119,9 +1128,6 @@ struct vmap_area {
 		struct llist_node purge_list;   /* in purge list */
 	};
 };
-
-
-
 ```
 
 ```c
@@ -1551,4 +1557,210 @@ bad_area:
 				die("Oops", regs, fsr);
 
 	return 0;
+```
+
+## 2.5.4 mmap
+mmap常用于三种情况：
+1. 需要大块内存，如malloc分配大块内存时，会调用mmap
+2. 文件，设备映射，通过mmap将文件页缓存或驱动缓存映射到用户空间，用户进程可以高效的操作这些内存数据
+3. 用户进程使用mmap，通过匿名页实现父子进程间数据交换。
+
+### 驱动mmap的实现
+```c
+#define MAX_SIZE 4096
+#define PAGE_ORDER 0
+
+static int hello_open(struct inode *inode, struct file *file)
+{
+    page = alloc_pages(GFP_KERNEL, PAGE_ORDER);
+    if (!page) {
+        printk("alloc_page failed\n");
+        return -ENOMEM;
+    }
+    hello_buf = (char *)page_to_virt(page);
+    printk("data_buf phys_addr: %x, virt_addr: %px\n",
+            page_to_phys(page), hello_buf);
+
+   return 0;
+}
+
+static int hello_release(struct inode *inode, struct file *file)
+{
+    __free_pages(page, PAGE_ORDER);
+
+    return 0;
+}
+
+static int hello_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    struct mm_struct *mm;
+    unsigned long size;
+    unsigned long pfn;
+    int ret;
+
+    mm = current->mm;   
+    pfn = page_to_pfn(page); 
+
+    size = vma->vm_end - vma->vm_start;
+    if (size > MAX_SIZE) {
+        printk("map size too large, max size is 0x%x\n", MAX_SIZE);
+        return -EINVAL;
+    }
+
+    ret = remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot);
+    if (ret) {
+        printk("remap_pfn_range failed\n");
+        return -EAGAIN;
+    }
+    
+    return ret;
+}
+```
+
+### remap_pfn_range
+```c
+
+#define PGDIR_SHIFT		21  // 将虚拟地址的[31:21] 共11bit为一级页表的下标
+                            // 知道一个pte对应1MB空间，就是 [19:0], 共20位
+                            // 所以一个一级页表项对应两个二级页表
+							// 用[20]位做区别
+
+#define PGDIR_SIZE		(1UL << PGDIR_SHIFT) // 1 << 21 ，对 [31:21]部分进行操作
+
+// 返回下一个一级页表地址
+#define pgd_addr_end(addr, end)						\
+({	unsigned long __boundary = ((addr) + PGDIR_SIZE) & PGDIR_MASK;	\
+	(__boundary - 1 < (end) - 1)? __boundary: (end);		\
+})
+
+typedef u32 pmdval_t;
+typedef struct { pmdval_t pgd[2]; } pgd_t; // 一个pgd对应8字节
+
+/*
+ * vma : 要映射到的虚拟空间区域
+ * addr : 要映射到的虚拟地址
+ * pfn : 参与映射的物理页号
+ * size : 映射的内存大小
+ * prot : 页保护权限
+ */
+int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
+		    unsigned long pfn, unsigned long size, pgprot_t prot)
+
+	unsigned long end = addr + PAGE_ALIGN(size); // 虚拟地址，映射边界
+	struct mm_struct *mm = vma->vm_mm; // mm中有进程的一级页表的地址
+
+	vma->vm_flags |= VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
+	pfn -= addr >> PAGE_SHIFT; // 和 remap_p4d_range 有关
+	pgd = pgd_offset(mm, addr); // 相关一级页表项的地址
+	do {
+		next = pgd_addr_end(addr, end); // 保存下一级页表项对应的虚拟地址,将用于映射
+		remap_p4d_range(mm, pgd, addr, next,   
+				pfn + (addr >> PAGE_SHIFT), prot); 
+			remap_p4d_range
+				remap_pud_range
+					remap_pmd_range
+							/*
+							 * mm : 进程的虚拟地址空间
+							 * pmd : 上级页表项的指针
+							 * addr : 参与映射的虚拟地址
+							 * end :
+							 */
+							remap_pte_range(struct mm_struct *mm, pmd_t *pmd,
+										unsigned long addr, unsigned long end,
+										unsigned long pfn, pgprot_t prot)
+
+								mapped_pte = pte = pte_alloc_map_lock(mm, pmd, addr, &ptl); // 分配pte
+									pte = alloc_page(gfp);      // 分配一个页
+									pmd_populate(mm, pmd, new); // 设置pmd对应物理空间，指向pte
+										__pmd_populate(pmdp, __pa(ptep), _PAGE_KERNEL_TABLE); // 所有的低端内存都映射
+											#define __pa(x)			__virt_to_phys((unsigned long)(x)) // 到线性映射区
+											                                                           // 所以可以快速
+																									   // 得到物理地址
+
+								do {
+									// 设置pte页表，包括 ARM , Linux 两个pte页表
+									// 一个
+									set_pte_at(mm, addr, pte, pte_mkspecial(pfn_pte(pfn, prot)));
+
+											// pfn得到物理基地址 或上 保护权限 得到 pteval
+											pte_mkspecial(pte_t pte)
+												return pte;
+											#define pfn_pte(pfn,prot)	__pte(__pfn_to_phys(pfn) | pgprot_val(prot))
+
+
+										set_pte_at(struct mm_struct *mm, unsigned long addr,
+														  pte_t *ptep, pte_t pteval)
+											set_pte_ext(ptep, pteval, ext); // 依次设置 一个 Linux pte ，一个arm pte
+											                                // 一个pte对应4KB的虚拟空间
+
+									pfn++;
+								} while (pte++, addr += PAGE_SIZE, addr != end); // 一次设置4KB
+								                                                 // 一共需要设置2MB
+																				 // 循环512次
+
+
+	} while (pgd++, addr = next, addr != end); // pgd++ ，一次增加8字节，得到下一个一级页表项的地址
+```
+
+### 文件映射
+![](./pic/31.jpg)
+打开文件后，读取文件后，使用页缓存加载文件内容。
+由于一个page只有4KB，而文件通常大于4KB，所以使用多个page，并使用address_space将碎片的page实现连续数据的读写。
+
+使用mmap可以将page映射到用户空间，实现高效的操作文件内容。
+
+
+mmap系统调用的特点：
+mmap只建立虚拟地址和文件地址偏移的关联, 设置好回调函数，返回虚拟地址给用户进程.
+，不关联page，为了节省物理内存，当进程读写相关虚拟空间时，会发生缺页异常，再分配page
+
+```c
+SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
+		unsigned long, prot, unsigned long, flags,
+		unsigned long, fd, unsigned long, pgoff)
+	ksys_mmap_pgoff(addr, len, prot, flags, fd, pgoff);
+		if (!(flags & MAP_ANONYMOUS))  { // 不是匿名映射
+			file = fget(fd);
+		}
+		retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
+			ret = do_mmap(file, addr, len, prot, flag, pgoff, &populate, &uf);
+				struct mm_struct *mm = current->mm;
+				addr = get_unmapped_area(file, addr, len, pgoff, flags); // 得到可用的虚拟地址
+				addr = mmap_region(file, addr, len, vm_flags, pgoff, uf);
+					vma = vm_area_alloc(mm);
+					vma->vm_start = addr;
+					vma->vm_end = addr + len;
+					vma->vm_flags = vm_flags;
+					vma->vm_page_prot = vm_get_page_prot(vm_flags);
+					vma->vm_pgoff = pgoff;  // 设置文件偏移
+					vma->vm_file = get_file(file);
+					call_mmap(file, vma);
+						return file->f_op->mmap(file, vma); //
+							generic_file_mmap(struct file * file, struct vm_area_struct * vma)
+							struct address_space *mapping = file->f_mapping;  // 绑定 address_space
+							vma->vm_ops = &generic_file_vm_ops;  // 绑定缺页异常的回调
+
+const struct vm_operations_struct generic_file_vm_ops = {
+	.fault		= filemap_fault,
+	.map_pages	= filemap_map_pages,
+	.page_mkwrite	= filemap_page_mkwrite,
+};
+
+
+					addr = vma->vm_start;
+
+					// 把vma加入mm
+					// 把mapping->i_mmap 加入 vma
+					vma_link(mm, vma, prev, rb_link, rb_parent);
+						__vma_link(mm, vma, prev, rb_link, rb_parent);
+							__vma_link_list(mm, vma, prev);
+							__vma_link_rb(mm, vma, rb_link, rb_parent);
+						__vma_link_file(vma);
+							file = vma->vm_file;
+							struct address_space *mapping = file->f_mapping;
+							vma_interval_tree_insert(vma, &mapping->i_mmap);
+
+
+					return addr;
+
 ```
