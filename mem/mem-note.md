@@ -1737,7 +1737,6 @@ SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
 					call_mmap(file, vma);
 						return file->f_op->mmap(file, vma); //
 							generic_file_mmap(struct file * file, struct vm_area_struct * vma)
-							struct address_space *mapping = file->f_mapping;  // 绑定 address_space
 							vma->vm_ops = &generic_file_vm_ops;  // 绑定缺页异常的回调
 
 const struct vm_operations_struct generic_file_vm_ops = {
@@ -1763,4 +1762,165 @@ const struct vm_operations_struct generic_file_vm_ops = {
 
 					return addr;
 
+```
+
+### 文件缺页异常
+mmap创建了个vma，记录了映射的虚拟地址，文件的address_space，文件偏移，并绑定了缺页异常处理的回调。
+当发生缺页异常后：
+```c
+static int __kprobes
+do_translation_fault(unsigned long addr, unsigned int fsr,
+		     struct pt_regs *regs)
+	if (addr < TASK_SIZE)
+		return do_page_fault(addr, fsr, regs); // 缺页异常对应的虚拟地址发生在用户空间
+
+			tsk = current;
+			mm  = tsk->mm;
+
+			fault = __do_page_fault(mm, addr, fsr, flags, tsk, regs);
+				vma = find_vma(mm, addr); // 根据虚拟地址找到对应的虚拟空间区域描述
+				                          // mmap注册了vma
+
+			return handle_mm_fault(vma, addr & PAGE_MASK, flags, regs);
+				ret = __handle_mm_fault(vma, address, flags);
+					struct vm_fault vmf = {
+						.vma = vma,
+						.address = address & PAGE_MASK,
+						.flags = flags,
+
+						.pgoff = linear_page_index(vma, address),
+							pgoff = (address - vma->vm_start) >> PAGE_SHIFT;// vma->start 是虚拟空间的起始地址
+							                                                // 虚拟空间可能有多个页大小，
+																			//(address - vma->vm_start )>>PAGE_SHIFT
+																			// 
+							pgoff += vma->vm_pgoff;                         
+							return pgoff;
+
+						.gfp_mask = __get_fault_gfp_mask(vma),
+					};
+
+					// Linux支持5级映射，但ARM只用了2级映射，这里分配5级映射的表，但实际没有效果
+					pgd = pgd_offset(mm, address);            // 注意只分配一个pgd的下级表
+					p4d = p4d_alloc(mm, pgd, address);        // 因为缺页异常也就缺一个页
+					vmf.pud = pud_alloc(mm, p4d, address);
+					vmf.pud = pud_alloc(mm, p4d, address);
+					vmf.pmd = pmd_alloc(mm, vmf.pud, address); // pmd指向一个page
+						pmd_t *new = pmd_alloc_one(mm, address); // 这个page之后用于存放pte[]
+						pud_populate(mm, pud, new);              
+
+					return handle_pte_fault(&vmf);
+						pte_t entry;
+						vmf->pte = pte_offset_map(vmf->pmd, vmf->address); // 根据虚拟地址,得到pte页表项的指针
+						vmf->orig_pte = *vmf->pte; 
+						if (pte_none(vmf->orig_pte))  // mmap 没有设置页表, 所以*orig_pte == NULL
+							vmf->pte = NULL;
+
+					if (!vmf->pte) 
+						if (vma_is_anonymous(vmf->vma))
+							return do_anonymous_page(vmf);
+						else
+							return do_fault(vmf);  // 文件缺页异常
+								do_read_fault(vmf);
+									__do_fault(vmf);
+										vma->vm_ops->fault(vmf); // 回调缺页异常
+
+											vm_fault_t filemap_fault(struct vm_fault *vmf) // 找对应物理页
+												pgoff_t offset = vmf->pgoff;           // 根据文件偏移
+												page = find_get_page(mapping, offset); // 找到对应物理页
+												if (likely(page) && !(vmf->flags & FAULT_FLAG_TRIED)) {
+
+												} else if (!page) {
+													page = pagecache_get_page(mapping, offset,	// 如果没有
+																  FGP_CREAT|FGP_FOR_MMAP,     	// 则分配page
+																  vmf->gfp_mask);				// 加载文件
+												vmf->page = page;
+
+									finish_fault(vmf);
+										page = vmf->page;
+										alloc_set_pte(vmf, page); 
+											pte_alloc_one_map(vmf);
+												vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
+														&vmf->ptl); // pmd 指向一个page
+														            // 根据虚拟地址找到对应pte
+											entry = mk_pte(page, vma->vm_page_prot);
+											set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+```
+
+### 映射类型
+![](./pic/32.jpg)
+文件共享映射 : 当写页缓存会回写到文件
+文件私有映射 : 当写页缓存不会回写到文件, 如加载程序，.text段就为私有映射
+匿名共享映射 : 用于IPC的页缓存
+匿名私有映射 : 用于分配进程自己使用的大片内存，如malloc的实现
+
+### brk
+![](./pic/34.jpg)
+```c
+SYSCALL_DEFINE1(brk, unsigned long, brk)
+	unsigned long newbrk, oldbrk, origbrk;
+	origbrk = mm->brk;
+	min_brk = mm->start_brk;
+
+	if (brk < min_brk) // 越界错误
+		goto out;
+
+	newbrk = PAGE_ALIGN(brk);
+	oldbrk = PAGE_ALIGN(mm->brk);
+
+	if (brk <= mm->brk) {  // 缩小brk区域，释放内存
+		mm->brk = brk;
+		ret = __do_munmap(mm, newbrk, oldbrk-newbrk, &uf, true);
+		goto success;
+	}
+
+	// 扩大brk
+
+	
+	next = find_vma(mm, oldbrk); // 如果和已存在的mmap的映射冲突，则退出
+	if (next && newbrk + PAGE_SIZE > vm_start_gap(next)) 
+		goto out;
+
+	// 扩展brk
+	do_brk_flags(oldbrk, newbrk-oldbrk, 0, &uf);
+		mapped_addr = get_unmapped_area(NULL, addr, len, 0, MAP_FIXED);
+
+		munmap_vma_range(mm, addr, len, &prev, &rb_link, &rb_parent, uf);
+
+		vma = vma_merge(mm, prev, addr, addr + len, flags,
+				NULL, NULL, pgoff, NULL, NULL_VM_UFFD_CTX);
+		if (vma)
+			goto out;
+
+		vma = vm_area_alloc(mm);
+		vma_set_anonymous(vma);
+		vma->vm_start = addr;
+		vma->vm_end = addr + len;
+		vma->vm_pgoff = pgoff;
+		vma->vm_flags = flags;
+		vma->vm_page_prot = vm_get_page_prot(flags);
+		vma_link(mm, vma, prev, rb_link, rb_parent);
+
+	out:
+		perf_event_mmap(vma);
+		mm->total_vm += len >> PAGE_SHIFT;
+		mm->data_vm += len >> PAGE_SHIFT;
+		if (flags & VM_LOCKED)
+			mm->locked_vm += (len >> PAGE_SHIFT);
+		vma->vm_flags |= VM_SOFTDIRTY;
+		return 0;
+
+	mm->brk = brk;
+```
+brk并不会分配page，而是设置vma
+在处理缺页异常时，必须有对应的vma，否则会报段错误。
+```c
+__do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned int fsr,
+		unsigned int flags, struct task_struct *tsk,
+		struct pt_regs *regs)
+	vma = find_vma(mm, addr);
+	fault = VM_FAULT_BADMAP;
+	if (unlikely(!vma))
+out:
+	return fault;
+		goto out;
 ```
