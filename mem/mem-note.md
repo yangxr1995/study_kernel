@@ -1924,3 +1924,29 @@ out:
 	return fault;
 		goto out;
 ```
+
+### 反向映射 
+前面都是正向映射：输入虚拟地址，映射大小，分配物理页，建立映射。
+反向映射：输入物理页，找到与其映射的不同进程的VMA
+反向映射用于页面迁移
+
+#### 匿名页的反向映射
+![](./pic/35.jpg)
+实现反向映射的关键是，page有一个mapping，记录了所有映射到此page的vma
+```c
+static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+	pte_alloc(vma->vm_mm, vmf->pmd);	// 申请一个page存放 pte[]
+	page = alloc_zeroed_user_highpage_movable(vma, vmf->address);  // 分配物理页
+	entry = mk_pte(page, vma->vm_page_prot);  // 计算pte填充值
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address, // 找到虚拟地址对应的pte
+	page_add_new_anon_rmap(page, vma, vmf->address, false); // 建立方向映射关系
+		__page_set_anon_rmap(page, vma, address, 1);
+		struct anon_vma *anon_vma = vma->anon_vma;  // vma->anon_vma 是个数组
+		anon_vma = (void *) anon_vma + PAGE_MAPPING_ANON; // 偏移数组
+		page->mapping = (struct address_space *) anon_vma;  // page就反向指向
+		page->index = linear_page_index(vma, address); // 得到page在pte[]的下标
+
+	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry); // 建立映射
+```
+#### 文件页反向映射
+![](./pic/36.jpg)
