@@ -242,212 +242,271 @@ struct zone成员
 ```c
 // zone经常被访问，所以需要以 L1 cache对齐
 struct zone {
-	/* Read-mostly fields */
-
-	/* zone watermarks, access with *_wmark_pages(zone) macros */
 	unsigned long watermark[NR_WMARK]; // 页面分配和回收使用
 
-	/*
-	 * We don't know if the memory that we're going to allocate will be freeable
-	 * or/and it will be released eventually, so to avoid totally wasting several
-	 * GB of ram we must reserve some of the lower zone memory (otherwise we risk
-	 * to run OOM on the lower zones despite there's tons of freeable ram
-	 * on the higher zones). This array is recalculated at runtime if the
-	 * sysctl_lowmem_reserve_ratio sysctl changes.
-	 */
 	long lowmem_reserve[MAX_NR_ZONES];
 
 #ifdef CONFIG_NUMA
 	int node;
 #endif
 
-	/*
-	 * The target ratio of ACTIVE_ANON to INACTIVE_ANON pages on
-	 * this zone's LRU.  Maintained by the pageout code.
-	 */
-	unsigned int inactive_ratio;
-
 	struct pglist_data	*zone_pgdat;         // 指向内存节点
 	struct per_cpu_pageset __percpu *pageset; // 一部分页面构造percpu副本，减少自旋锁使用
-
-	/*
-	 * This is a per-zone reserve of pages that should not be
-	 * considered dirtyable memory.
-	 */
-	unsigned long		dirty_balance_reserve;
-
-#ifndef CONFIG_SPARSEMEM
-	/*
-	 * Flags for a pageblock_nr_pages block. See pageblock-flags.h.
-	 * In SPARSEMEM, this map is stored in struct mem_section
-	 */
-	unsigned long		*pageblock_flags;
-#endif /* CONFIG_SPARSEMEM */
-
-#ifdef CONFIG_NUMA
-	/*
-	 * zone reclaim becomes active if more unmapped pages exist.
-	 */
-	unsigned long		min_unmapped_pages;
-	unsigned long		min_slab_pages;
-#endif /* CONFIG_NUMA */
 
 	/* zone_start_pfn == zone_start_paddr >> PAGE_SHIFT */
 	unsigned long		zone_start_pfn;  // 开始页面页帧号
 
-	/*
-	 * spanned_pages is the total pages spanned by the zone, including
-	 * holes, which is calculated as:
-	 * 	spanned_pages = zone_end_pfn - zone_start_pfn;
-	 *
-	 * present_pages is physical pages existing within the zone, which
-	 * is calculated as:
-	 *	present_pages = spanned_pages - absent_pages(pages in holes);
-	 *
-	 * managed_pages is present pages managed by the buddy system, which
-	 * is calculated as (reserved_pages includes pages allocated by the
-	 * bootmem allocator):
-	 *	managed_pages = present_pages - reserved_pages;
-	 *
-	 * So present_pages may be used by memory hotplug or memory power
-	 * management logic to figure out unmanaged pages by checking
-	 * (present_pages - managed_pages). And managed_pages should be used
-	 * by page allocator and vm scanner to calculate all kinds of watermarks
-	 * and thresholds.
-	 *
-	 * Locking rules:
-	 *
-	 * zone_start_pfn and spanned_pages are protected by span_seqlock.
-	 * It is a seqlock because it has to be read outside of zone->lock,
-	 * and it is done in the main allocator path.  But, it is written
-	 * quite infrequently.
-	 *
-	 * The span_seq lock is declared along with zone->lock because it is
-	 * frequently read in proximity to zone->lock.  It's good to
-	 * give them a chance of being in the same cacheline.
-	 *
-	 * Write access to present_pages at runtime should be protected by
-	 * mem_hotplug_begin/end(). Any reader who can't tolerant drift of
-	 * present_pages should get_online_mems() to get a stable value.
-	 *
-	 * Read access to managed_pages should be safe because it's unsigned
-	 * long. Write access to zone->managed_pages and totalram_pages are
-	 * protected by managed_page_count_lock at runtime. Idealy only
-	 * adjust_managed_page_count() should be used instead of directly
-	 * touching zone->managed_pages and totalram_pages.
-	 */
 	unsigned long		managed_pages;  // zone中被伙伴系统管理的页面数量
 	unsigned long		spanned_pages;  // zone中包含的页面数量
 	unsigned long		present_pages;  // zone中实际管理的页面数量,有些体系结构下和spanned_pages相等
 
 	const char		*name;
 
-	/*
-	 * Number of MIGRATE_RESERVE page block. To maintain for just
-	 * optimization. Protected by zone->lock.
-	 */
-	int			nr_migrate_reserve_block;
-
-#ifdef CONFIG_MEMORY_ISOLATION
-	/*
-	 * Number of isolated pageblock. It is used to solve incorrect
-	 * freepage counting problem due to racy retrieving migratetype
-	 * of pageblock. Protected by zone->lock.
-	 */
-	unsigned long		nr_isolate_pageblock;
-#endif
-
-#ifdef CONFIG_MEMORY_HOTPLUG
-	/* see spanned/present_pages for more description */
-	seqlock_t		span_seqlock;
-#endif
-
-	/*
-	 * wait_table		-- the array holding the hash table
-	 * wait_table_hash_nr_entries	-- the size of the hash table array
-	 * wait_table_bits	-- wait_table_size == (1 << wait_table_bits)
-	 *
-	 * The purpose of all these is to keep track of the people
-	 * waiting for a page to become available and make them
-	 * runnable again when possible. The trouble is that this
-	 * consumes a lot of space, especially when so few things
-	 * wait on pages at a given time. So instead of using
-	 * per-page waitqueues, we use a waitqueue hash table.
-	 *
-	 * The bucket discipline is to sleep on the same queue when
-	 * colliding and wake all in that wait queue when removing.
-	 * When something wakes, it must check to be sure its page is
-	 * truly available, a la thundering herd. The cost of a
-	 * collision is great, but given the expected load of the
-	 * table, they should be so rare as to be outweighed by the
-	 * benefits from the saved space.
-	 *
-	 * __wait_on_page_locked() and unlock_page() in mm/filemap.c, are the
-	 * primary users of these fields, and in mm/page_alloc.c
-	 * free_area_init_core() performs the initialization of them.
-	 */
-	wait_queue_head_t	*wait_table;
-	unsigned long		wait_table_hash_nr_entries;
-	unsigned long		wait_table_bits;
-
-	ZONE_PADDING(_pad1_)
 	/* free areas of different sizes */
 	struct free_area	free_area[MAX_ORDER]; // 空闲区域数组
 
-	/* zone flags, see below */
-	unsigned long		flags;
-
 	/* Write-intensive fields used from the page allocator */
 	spinlock_t		lock;  // 并行访问时用于保护zone的自旋锁
-
-	ZONE_PADDING(_pad2_)
-
-	/* Write-intensive fields used by page reclaim */
 
 	/* Fields commonly accessed by the page reclaim scanner */
 	spinlock_t		lru_lock;  // 对zone中LRU链表并行访问时进行保护的自旋锁
 	struct lruvec		lruvec; // LRU链表集合
 
-	/* Evictions & activations on the inactive file list */
-	atomic_long_t		inactive_age;
-
-	/*
-	 * When free pages are below this point, additional steps are taken
-	 * when reading the number of free pages to avoid per-cpu counter
-	 * drift allowing watermarks to be breached
-	 */
-	unsigned long percpu_drift_mark;
-
-#if defined CONFIG_COMPACTION || defined CONFIG_CMA
-	/* pfn where compaction free scanner should start */
-	unsigned long		compact_cached_free_pfn;
-	/* pfn where async and sync compaction migration scanner should start */
-	unsigned long		compact_cached_migrate_pfn[2];
-#endif
-
-#ifdef CONFIG_COMPACTION
-	/*
-	 * On compaction failure, 1<<compact_defer_shift compactions
-	 * are skipped before trying again. The number attempted since
-	 * last failure is tracked with compact_considered.
-	 */
-	unsigned int		compact_considered;
-	unsigned int		compact_defer_shift;
-	int			compact_order_failed;
-#endif
-
-#if defined CONFIG_COMPACTION || defined CONFIG_CMA
-	/* Set to true when the PG_migrate_skip bits should be cleared */
-	bool			compact_blockskip_flush;
-#endif
-
-	ZONE_PADDING(_pad3_)
 	/* Zone statistics */
 	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS]; // zone计数
 } ____cacheline_internodealigned_in_smp;
-
 ```
 
 通常zone有 ZONE_DMA ZONE_DMA32 ZONE_NORMAL ZONE_HIGHMEM
 但arm只有 ZONE_NORMAL ZONE_HIGHMEM
+
+要让zone来管理page，就要让zone知道自己能管理的page的范围。
+在find_limit()中计算出 min_low_pfn, max_low_pfn, max_pfn.
+min_low_pfn: 物理内存开始地址的页帧号,同时也是normal区域起始页帧号
+max_low_pfn: normal区域的结束页帧号
+max_pfn: 内存块结束地址页帧号
+
+
+从kernel启动看物理空间和虚拟空间
+```shell
+// 物理空间
+// 可以看出有两个zone, Normal zone , high zone
+  Normal zone: 1520 pages used for memmap
+  Normal zone: 0 pages reserved
+  Normal zone: 194560 pages, LIFO batch:31
+  HighMem zone: 67584 pages, LIFO batch:15
+
+// 虚拟空间
+// lowmem 映射 normal zone
+// 0xef800000 - 0xc0000000 / 4096 = 194560 pages
+// 线性映射关系： 
+// 见后面 _virt_to_phys , _phys_to_virt
+// 0xef800000 - PAGE_OFFSET(0xc0000000) + PHY_OFFSET(0x60000000) = 0x8f800000(arm_lowmem_limit)
+Virtual kernel memory layout:
+    vector  : 0xffff0000 - 0xffff1000   (   4 kB)
+    fixmap  : 0xffc00000 - 0xfff00000   (3072 kB)
+    vmalloc : 0xf0000000 - 0xff000000   ( 240 MB)
+    lowmem  : 0xc0000000 - 0xef800000   ( 760 MB)
+    pkmap   : 0xbfe00000 - 0xc0000000   (   2 MB)
+    modules : 0xbf000000 - 0xbfe00000   (  14 MB)
+      .text : 0xc0008000 - 0xc060a270   (6153 kB)
+      .init : 0xc060b000 - 0xc13e8000   (14196 kB)
+      .data : 0xc13e8000 - 0xc140f3c0   ( 157 kB)
+       .bss : 0xc140f3c0 - 0xc1438bf0   ( 167 kB)
+```
+
+zone的初始化函数 : free_area_init_core
+
+另一个和zone相关数据结构：zonelist。
+伙伴系统从zonelist开始分配内存，zonelist有一个zoneref数组，数组元素的成员有一个zone指针。
+zoneref数组的第一个成员指向的zone是页面分配器的第一个候选者，若第一个候选者分配失败之后才考虑其他成员，优先级逐渐降低。
+初始化zonelist的函数 build_zonelists_node
+
+
+```c
+enum zone_type {
+	ZONE_NORMAL,
+	ZONE_HIGHMEM,
+	__MAX_NR_ZONES
+};
+
+static int build_zonelists_node(pg_data_t *pgdat, struct zonelist *zonelist,
+				int nr_zones)
+{
+	struct zone *zone;
+	enum zone_type zone_type = MAX_NR_ZONES;
+
+	do {
+		zone_type--;
+		zone = pgdat->node_zones + zone_type;
+		if (populated_zone(zone)) {
+			zoneref_set_zone(zone,
+				&zonelist->_zonerefs[nr_zones++]);
+			check_highest_zone(zone_type);
+		}
+	} while (zone_type);
+
+	return nr_zones;
+}
+```
+初始化后： 
+```c
+  _zonerefs[0]->zone_index = 1 --> ZONE_HIGHMEM
+  _zonerefs[1]->zone_index = 0 --> ZONE_NORMAL
+```
+所以先从高端内存分配
+
+
+另一个重要的全局变量 mem_map
+它是struct page数组，实现快速把虚拟地址映射到物理地址，线性映射。
+它的初始化 free_area_init_node -> alloc_node_mem_map
+
+所以对于同个page可能同时被多种映射，如果是低端内存就一定被线性映射，mem_map
+也可能有非线性映射 那么从 zone中分配page，再分配个虚拟空间，建立Vmalloc映射
+
+## 虚拟空间划分
+32bit Linux 共有虚拟空间 4GB，用户空间和内核空间可以配置。
+```c
+CONFIG_PAGE_OFFSET
+```
+
+设置会影响 PAGE_OFFSET值，这个值也被用于做线性映射的偏移值。
+```c
+/* PAGE_OFFSET - the virtual address of the start of the kernel image */
+#define PAGE_OFFSET		UL(CONFIG_PAGE_OFFSET)
+```
+
+线性映射的计算
+```c
+/*
+ * PHYS_OFFSET : 物理内存的起始地址
+ */
+static inline phys_addr_t __virt_to_phys(unsigned long x)
+{
+	return (phys_addr_t)x - PAGE_OFFSET + PHYS_OFFSET;
+}
+
+static inline unsigned long __phys_to_virt(phys_addr_t x)
+{
+	return x - PHYS_OFFSET + PAGE_OFFSET;
+}
+```
+
+## 物理内存的初始化
+内核知道物理内存的地址范围和各种zone的布局后，page就要加入伙伴系统。
+每个zone 都有一个free_area，这就是伙伴系统管理的基础。
+所以每个zone都有一个伙伴系统。
+![](./pic/37.jpg)
+free_area数组，大小是MAX_ORDER，每个元素有MIGRATE_TYPES个链表
+
+```c
+struct zone {
+	..
+	struct free_area[MAX_ORDER];
+	..
+};
+
+struct free_area {
+	struct list_head free_list[MIGRATE_TYPES];
+	unsigned long nr_free;
+};
+
+
+enum {
+	MIGRATE_UNMOVABLE,
+	MIGRATE_RECLAIMABLE,
+	MIGRATE_MOVABLE,
+	MIGRATE_PCPTYPES,	/* the number of types on the pcp lists */
+	MIGRATE_RESERVE = MIGRATE_PCPTYPES,
+	MIGRATE_TYPES
+};
+```
+伙伴系统的特点是：
+内存块是2的order幂，把所有空闲的页面分组成11个内存块链表，
+每个链表分布包括 1,2,4,...1024个连续的page。
+1024个page对应4MB大小的连续物理内存
+
+从/porc/pagetypeinfo可以知道page在链表的分布
+![](./pic/38.jpg)
+
+存放在2^10链表中的page又被称为pageblock，他们是大小为 4MB
+
+思考，物理页面是如何添加到伙伴系统？是一页一页添加，还是以2的几次幂添加？
+
+```c
+static unsigned long __init free_low_memory_core_early(void)
+{
+	unsigned long count = 0;
+	phys_addr_t start, end;
+	u64 i;
+
+	memblock_clear_hotplug(0, -1);
+
+	// 遍历memblock.memory 其记录了可用的物理内存块范围
+	// 得到start end
+	for_each_free_mem_range(i, NUMA_NO_NODE, &start, &end, NULL)
+		count += __free_memory_core(start, end);
+
+	return count;
+}
+```
+
+```c
+static unsigned long __init __free_memory_core(phys_addr_t start,
+				 phys_addr_t end)
+{
+	unsigned long start_pfn = PFN_UP(start);
+	unsigned long end_pfn = min_t(unsigned long,
+				      PFN_DOWN(end), max_low_pfn);
+
+	if (start_pfn > end_pfn)
+		return 0;
+
+	__free_pages_memory(start_pfn, end_pfn);
+
+	return end_pfn - start_pfn;
+}
+
+static void __init __free_pages_memory(unsigned long start, unsigned long end)
+{
+	int order;
+
+	while (start < end) {
+		/*
+		 * 找order也就是找对齐值
+		 *
+		 * __ffs(x) : ffs(x) - 1
+		 * ffs(x)   : 计算x中第一个bit为1的位置
+		 *            如ffs(0x63300)，则__ffs(0x63300)为8
+		 *            那么这里order为8
+		 */
+		order = min(MAX_ORDER - 1UL, __ffs(start));
+
+		while (start + (1UL << order) > end)
+			order--;
+
+		__free_pages_bootmem(pfn_to_page(start), order);
+
+		start += (1UL << order);
+	}
+}
+```
+
+将page加到对应的链表
+```c
+void __init __free_pages_bootmem(struct page *page, unsigned int order)
+{
+	unsigned int nr_pages = 1 << order;
+	struct page *p = page;
+	unsigned int loop;
+
+	page_zone(page)->managed_pages += nr_pages;
+	set_page_refcounted(page);
+	__free_pages(page, order);
+}
+```
+
+下面是向系统添加一段内存的情况，页帧号范围：[0x8800e, 0xaecea]
+可以发现，一开始地址只能对齐order较低的情况，后面都以order=10也就是0x400对齐。
+![](./pic/39.jpg)
 
