@@ -397,12 +397,10 @@ static inline unsigned long __phys_to_virt(phys_addr_t x)
 每个zone 都有一个free_area，这就是伙伴系统管理的基础。
 所以每个zone都有一个伙伴系统。
 ![](./pic/37.jpg)
-free_area数组，大小是MAX_ORDER，每个元素有MIGRATE_TYPES个链表
-
 ```c
 struct zone {
 	..
-	struct free_area[MAX_ORDER];
+	struct free_area free_area[MAX_ORDER];
 	..
 };
 
@@ -421,6 +419,8 @@ enum {
 	MIGRATE_TYPES
 };
 ```
+![](./pic/40.jpg)
+
 伙伴系统的特点是：
 内存块是2的order幂，把所有空闲的页面分组成11个内存块链表，
 每个链表分布包括 1,2,4,...1024个连续的page。
@@ -433,7 +433,10 @@ enum {
 
 思考，物理页面是如何添加到伙伴系统？是一页一页添加，还是以2的几次幂添加？
 
+
 ```c
+// start_kernel -> mm_init -> mem_init -> free_all_bootmem -> free_low_memory_core_early
+// 将低端物理内存加入伙伴系统
 static unsigned long __init free_low_memory_core_early(void)
 {
 	unsigned long count = 0;
@@ -455,9 +458,9 @@ static unsigned long __init free_low_memory_core_early(void)
 static unsigned long __init __free_memory_core(phys_addr_t start,
 				 phys_addr_t end)
 {
-	unsigned long start_pfn = PFN_UP(start);
+	unsigned long start_pfn = PFN_UP(start); // 获得startd对应的物理页帧号，注意是上取整，如start位于0 - 1 物理页帧之间，则返回1
 	unsigned long end_pfn = min_t(unsigned long,
-				      PFN_DOWN(end), max_low_pfn);
+				      PFN_DOWN(end), max_low_pfn); // 取end下取整的物理页帧号， max_low_pfn 为lowmem的最大页帧号
 
 	if (start_pfn > end_pfn)
 		return 0;
@@ -467,12 +470,17 @@ static unsigned long __init __free_memory_core(phys_addr_t start,
 	return end_pfn - start_pfn;
 }
 
+/*
+ * 这段代码可以看出page会尽可能加入大的order
+ */
 static void __init __free_pages_memory(unsigned long start, unsigned long end)
 {
 	int order;
 
 	while (start < end) {
 		/*
+		 * 为了尽可能创建大块连续物理内存块，
+		 *
 		 * 找order也就是找对齐值
 		 *
 		 * __ffs(x) : ffs(x) - 1
@@ -482,31 +490,369 @@ static void __init __free_pages_memory(unsigned long start, unsigned long end)
 		 */
 		order = min(MAX_ORDER - 1UL, __ffs(start));
 
-		while (start + (1UL << order) > end)
+		while (start + (1UL << order) > end)  // 1 << order 是free的page数量
 			order--;
 
-		__free_pages_bootmem(pfn_to_page(start), order);
+		__free_pages_bootmem(pfn_to_page(start), order); // 从start开始释放 1 << order个page
 
 		start += (1UL << order);
 	}
 }
-```
 
-将page加到对应的链表
-```c
 void __init __free_pages_bootmem(struct page *page, unsigned int order)
 {
 	unsigned int nr_pages = 1 << order;
 	struct page *p = page;
 	unsigned int loop;
 
-	page_zone(page)->managed_pages += nr_pages;
-	set_page_refcounted(page);
-	__free_pages(page, order);
+	page_zone(page)->managed_pages += nr_pages; // 伙伴系统增加管理页面数量
+	set_page_refcounted(page); // 设置page的引用计数为1
+	__free_pages(page, order); // 添加到伙伴系统, 可以通过 page_zone(page) 获得page所在的zone，所以不需要传递zone参数
 }
 ```
 
 下面是向系统添加一段内存的情况，页帧号范围：[0x8800e, 0xaecea]
 可以发现，一开始地址只能对齐order较低的情况，后面都以order=10也就是0x400对齐。
 ![](./pic/39.jpg)
+
+# 页表的映射过程
+思考：
+	内核空间的页表存放在什么位置?
+
+## ARM32页表映射
+### 虚拟地址结构
+32bit Linux一般采用3层映射模型，PGD(页面目录), PMD(页面中间目录), PTE(页面映射表)
+ARM32 中只用到两层，所以实际代码需要将 PGD 和 PMD 合并。
+另外ARM32也可以用段映射，是一层映射模型。
+对于页面映射，可以选择64KB的页，和4KB的小页。
+默认采用4KB大小的页面。
+
+![](./pic/41.jpg)
+
+采用段映射的虚拟地址结构：
+31-12 : 段地址
+11-0  : 段内偏移
+
+采用页表映射模式的虚拟地址结构
+31-20 : PGD地址
+19-12 : PTE地址(256项)
+11-0  : 页内偏移
+
+当内存映射开启后，CPU放出的地址，只传递给MMU，MMU将认为是虚拟地址，映射成物理地址，发给ddr
+
+实际代码中页表映射模式的虚拟地址结构
+```c
+// PMD 和 PGD 等价
+#define PMD_SHIFT		21
+#define PGDIR_SHIFT		21
+
+#define PMD_SIZE		(1UL << PMD_SHIFT)
+#define PMD_MASK		(~(PMD_SIZE-1))
+#define PGDIR_SIZE		(1UL << PGDIR_SHIFT)
+#define PGDIR_MASK		(~(PGDIR_SIZE-1))
+```
+需要注意ARM支持的页表模式的虚拟地址结构，PGD地址占20bit，但是Linux却使用21bit
+因为一个page为4KB，而一个PGD项对应256个PTE，占用256\*4 = 1024字节，
+又有arm 和 Linux两个PGD，占用512个PTE，占用2048字节，
+所以一个page可以给两个PGD分配，所以linux使用21bit
+
+### create_mapping
+create_mapping 用于给定空间建立映射。
+该函数使用 map_desc 描述内存区间
+```c
+struct map_desc {
+	unsigned long virtual; // 起始虚拟地址
+	unsigned long pfn;     // 起始物理页帧号
+	unsigned long length;  // 空间大小
+	unsigned int type;     // 权限
+};
+```
+
+```c
+static void __init create_mapping(struct map_desc *md)
+{
+	unsigned long addr, length, end;
+	phys_addr_t phys;
+	const struct mem_type *type;
+	pgd_t *pgd;
+
+	addr = md->virtual & PAGE_MASK;
+	phys = __pfn_to_phys(md->pfn);  // 获得物理地址
+	length = PAGE_ALIGN(md->length + (md->virtual & ~PAGE_MASK)); // 映射大小
+
+	pgd = pgd_offset_k(addr); // 获得PGD页表项
+	end = addr + length; // 结束物理地址
+	do {
+		unsigned long next = pgd_addr_end(addr, end); // 下一次映射的起始物理地址
+		                                              // 一次映射 PGDIR_SIZE 大小的空间，也就是 2MB
+
+		alloc_init_pud(pgd, addr, next, phys, type);
+
+		phys += next - addr;
+		addr = next;
+	} while (pgd++, addr != end);
+}
+
+
+#define pgd_offset_k(addr)	pgd_offset(&init_mm, addr)
+#define pgd_offset(mm, addr)	((mm)->pgd + pgd_index(addr)) // 这里看出 init_mm.pgd 记录内核页表地址
+#define pgd_index(addr)		((addr) >> PGDIR_SHIFT)
+
+struct mm_struct init_mm = {
+	...
+	.pgd		= swapper_pg_dir, // 内存页表存放在这里
+	...
+};
+
+#define pgd_addr_end(addr, end)						\
+({	unsigned long __boundary = ((addr) + PGDIR_SIZE) & PGDIR_MASK;	\
+	(__boundary - 1 < (end) - 1)? __boundary: (end);		\
+})
+
+typedef struct { pmdval_t pgd[2]; } pgd_t; // pgd++ 移动两个PGD页表项
+typedef u32 pmdval_t;
+
+//-------------------------------------------------------------------------------
+
+static void __init alloc_init_pud(pgd_t *pgd, unsigned long addr,
+				  unsigned long end, phys_addr_t phys,
+				  const struct mem_type *type)
+{
+	pud_t *pud = pud_offset(pgd, addr); // pgd项和pud项等价
+	unsigned long next;
+
+	do {
+		next = pud_addr_end(addr, end);
+		alloc_init_pmd(pud, addr, next, phys, type);
+		phys += next - addr;
+	} while (pud++, addr = next, addr != end); // 由于next等于end所以只循环一次
+}
+
+static inline pud_t * pud_offset(pgd_t * pgd, unsigned long address)
+{
+	return (pud_t *)pgd;
+}
+
+#define pud_addr_end(addr, end)			(end)
+
+//-------------------------------------------------------------------------------
+
+static void __init alloc_init_pmd(pud_t *pud, unsigned long addr,
+				      unsigned long end, phys_addr_t phys,
+				      const struct mem_type *type)
+{
+	pmd_t *pmd = pmd_offset(pud, addr); // pmd 和 pud等价
+	unsigned long next;
+
+	do {
+		next = pmd_addr_end(addr, end); // next 等于 end
+
+		if (type->prot_sect &&
+				((addr | next | phys) & ~SECTION_MASK) == 0) {
+			__map_init_section(pmd, addr, next, phys, type); // ?
+		} else {
+			alloc_init_pte(pmd, addr, next,
+						__phys_to_pfn(phys), type);
+		}
+
+		phys += next - addr;
+
+	} while (pmd++, addr = next, addr != end); // 由于 next 等于 end 所以只循环一次
+}
+
+static inline pmd_t *pmd_offset(pud_t *pud, unsigned long addr)
+{
+	return (pmd_t *)pud;
+}
+
+#define pmd_addr_end(addr,end) (end)
+
+#define	__phys_to_pfn(paddr)	((unsigned long)((paddr) >> PAGE_SHIFT))
+#define	__pfn_to_phys(pfn)	((phys_addr_t)(pfn) << PAGE_SHIFT)
+
+
+//-------------------------------------------------------------------------------
+
+static void __init alloc_init_pte(pmd_t *pmd, unsigned long addr,
+				  unsigned long end, unsigned long pfn,
+				  const struct mem_type *type)
+{
+	pte_t *pte = early_pte_alloc(pmd, addr, type->prot_l1); // 分配page用作pte表，返回pte表的基地址
+	do {
+		set_pte_ext(pte, pfn_pte(pfn, __pgprot(type->prot_pte)), 0); // 设置PTE页表项,包括Linux 和 arm
+		pfn++;
+	} while (pte++, addr += PAGE_SIZE, addr != end); // 从最前面可知 end 和addr差了 2MB，而这里一次映射4KB，所以需要循环 512次
+}
+
+#define pfn_pte(pfn,prot)	__pte(__pfn_to_phys(pfn) | pgprot_val(prot)) // 获得pte项填充内容
+#define set_pte_ext(ptep,pte,ext) cpu_set_pte_ext(ptep,pte,ext)
+
+static pte_t * __init early_pte_alloc(pmd_t *pmd, unsigned long addr, unsigned long prot)
+{
+	if (pmd_none(*pmd)) {
+		pte_t *pte = early_alloc(PTE_HWTABLE_OFF + PTE_HWTABLE_SIZE); // 1024 * sizeof(pte) = 4KB ，刚好是一个page大小
+		                                                              // 知道一个PGD项对应256项PTE，
+																	  // 所以这里实际映射两个 PGD项，也就是512个PTE
+																	  // 又有Linux 和 arm 两种PTE，各2个，共4个，所以为1024个pte
+		__pmd_populate(pmd, __pa(pte), prot); // 填充PGD项，使其指向PTE表
+	}
+	BUG_ON(pmd_bad(*pmd));
+	return pte_offset_kernel(pmd, addr);
+}
+
+typedef struct { pteval_t pte; } pte_t;
+typedef u32 pteval_t;
+
+#define PTRS_PER_PTE		512
+#define PTRS_PER_PMD		1
+#define PTRS_PER_PGD		2048
+
+#define PTE_HWTABLE_PTRS	(PTRS_PER_PTE)
+#define PTE_HWTABLE_OFF		(PTE_HWTABLE_PTRS * sizeof(pte_t)) // 512
+#define PTE_HWTABLE_SIZE	(PTRS_PER_PTE * sizeof(u32)) // 512
+
+#define pmd_none(pmd)		(!pmd_val(pmd))
+#define pmd_val(x)      ((x).pmd)
+
+static void __init *early_alloc(unsigned long sz)
+{
+	return early_alloc_aligned(sz, sz);
+}
+static void __init *early_alloc_aligned(unsigned long sz, unsigned long align)
+{
+	void *ptr = __va(memblock_alloc(sz, align));
+	memset(ptr, 0, sz);
+	return ptr;
+}
+
+#define __pa(x)			__virt_to_phys((unsigned long)(x))
+
+static inline phys_addr_t __virt_to_phys(unsigned long x)
+{
+	return (phys_addr_t)x - PAGE_OFFSET + PHYS_OFFSET;
+}
+
+static inline unsigned long __phys_to_virt(phys_addr_t x)
+{
+	return x - PHYS_OFFSET + PAGE_OFFSET;
+}
+
+#define pte_offset_kernel(pmd,addr)	(pmd_page_vaddr(*(pmd)) + pte_index(addr)) // pte表基地址加偏移，得到pte项的地址
+
+static inline pte_t *pmd_page_vaddr(pmd_t pmd)
+{
+	return __va(pmd_val(pmd) & PHYS_MASK & (s32)PAGE_MASK); // 取高[31-12]位，这是pte表的地址
+}
+
+#define pmd_val(x)      ((x).pmd)
+
+#define pte_index(addr)		(((addr) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1)) // addr计算出页表项的下标，再乘以4字节
+
+static inline void __pmd_populate(pmd_t *pmdp, phys_addr_t pte,
+				  pmdval_t prot)
+{
+	pmdval_t pmdval = (pte + PTE_HWTABLE_OFF) | prot; // 注意pte地址本身是4KB对齐的，所以低12位没有用，可以设置其他内容
+	pmdp[0] = __pmd(pmdval); // 填充Linux PGD项
+	pmdp[1] = __pmd(pmdval + 256 * sizeof(pte_t)); // 填充ARM PGD项
+	flush_pmd_entry(pmdp);
+}
+```
+
+# 内存的布局图
+思考：
+	32bit Linux中 ，内核空间线性映射的虚拟地址和物理地址是如何转换？
+	32bit Linux中，高端内存起始地址如何计算出来的？
+	画出arm32 Linux内核布局图
+
+用户空间和内核空间的比例通常是3:1，内核空间只有1GB，其中部分用于直接映射物理内存，称为线性映射区，
+在32bit arm Linux物理地址[0:760MB]被映射到虚拟地址[3GB:3GB+760MB]，
+虚拟地址和物理地址的差值为PAGE_OFFSET，即3GB。
+
+线性映射区，虚拟地址和物理地址的转换
+```c
+#define __pa(x)			__virt_to_phys((unsigned long)(x))
+#define __va(x)			((void *)__phys_to_virt((phys_addr_t)(x)))
+
+static inline phys_addr_t __virt_to_phys(unsigned long x)
+{
+	return (phys_addr_t)x - PAGE_OFFSET + PHYS_OFFSET;
+}
+
+static inline unsigned long __phys_to_virt(phys_addr_t x)
+{
+	return x - PHYS_OFFSET + PAGE_OFFSET;
+}
+```
+PHYS_OFFSET : 内存物理地址的起始地址
+
+
+那么高端内存的起始地址是如何确定的呢？
+
+```c
+static void * __initdata vmalloc_min =
+	(void *)(VMALLOC_END - (240 << 20) - VMALLOC_OFFSET); // 结果为760MB
+
+void __init sanity_check_meminfo(void)
+{
+	phys_addr_t memblock_limit = 0;
+	int highmem = 0;
+	phys_addr_t vmalloc_limit = __pa(vmalloc_min - 1) + 1;
+	struct memblock_region *reg;
+
+	for_each_memblock(memory, reg) {
+		phys_addr_t block_start = reg->base;
+		phys_addr_t block_end = reg->base + reg->size;
+		phys_addr_t size_limit = reg->size;
+
+		if (reg->base >= vmalloc_limit)
+			highmem = 1;
+		else
+			size_limit = vmalloc_limit - reg->base;
+
+
+		if (!highmem) {
+			if (block_end > arm_lowmem_limit) {
+				if (reg->size > size_limit)
+					arm_lowmem_limit = vmalloc_limit; // 低端物理内存最多到 vmalloc_limit
+				else
+					arm_lowmem_limit = block_end;
+			}
+
+			if (!memblock_limit) {
+				if (!IS_ALIGNED(block_start, SECTION_SIZE))
+					memblock_limit = block_start;
+				else if (!IS_ALIGNED(block_end, SECTION_SIZE))
+					memblock_limit = arm_lowmem_limit;
+			}
+
+		}
+	}
+
+	high_memory = __va(arm_lowmem_limit - 1) + 1; // 确定高端虚拟内存
+
+	if (memblock_limit)
+		memblock_limit = round_down(memblock_limit, SECTION_SIZE);
+	if (!memblock_limit)
+		memblock_limit = arm_lowmem_limit;
+
+	memblock_set_current_limit(memblock_limit);
+}
+```
+内核剩下的264MB高端虚拟内存，用于做什么呢？
+保留给vmalloc fixmap和高端向量表使用。
+内核很多驱动使用vmalloc分配连续虚拟内存，因为驱动不需要使用连续的物理内存，
+vmalloc还能用于高端物理内存的临时映射。一个32bit系统实际的物理内存会超过内核线性映射的长度，但内核要有对所有内存寻找的能力。
+
+![](./pic/42.jpg)
+内核将物理内存低于760MB的称为线性映射内存（Normal memory），高于760MB的称为高端内存（high memory），
+由于32位系统只有4GB寻址空间，对于物理内存高于760MB，低于4GB的情况，可以从保留的240MB虚拟地址空间划分一部分用于动态映射高端内存，
+这样内存就可以访问到全部4GB物理内存。
+如果物理内存高于4GB，则需要LPE机制扩展物理内存的访问。
+用于访问高端内存的虚拟内存是有限的，一部分为临时映射，一部分为固定映射。pkmap就是固定映射。
+
+# 分配物理页面
+前面使用过memblock_alloc分配物理内存块，并返回虚拟地址，memblock_alloc在 memblock.region 中查找可用的内存区域，并从中分配所需的内存块。分配内存时，memblock_alloc 会将所选的空闲内存区域从 memblock.region 中删除，并将其标记为已分配状态。
+这种分配是不细致的，伙伴系统是基于memblock.regions实现的，实现更好的物理内存管理。
+
+memblock.region 描述的是物理内存的分布情况，包括空闲区域和已经分配的区域等。在 Linux 内核中，伙伴系统是一种用于管理可变大小内存块的内存分配器，它是建立在物理内存之上的，即 memblock.region 描述的物理内存。
 
