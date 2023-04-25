@@ -856,3 +856,254 @@ vmalloc还能用于高端物理内存的临时映射。一个32bit系统实际�
 
 memblock.region 描述的是物理内存的分布情况，包括空闲区域和已经分配的区域等。在 Linux 内核中，伙伴系统是一种用于管理可变大小内存块的内存分配器，它是建立在物理内存之上的，即 memblock.region 描述的物理内存。
 
+
+## 伙伴系统分配物理内存
+![](./pic/43.jpg)
+alloc_pages是伙伴系统分配物理内存的接口，用于分配一个或多个连续的物理内存页，大小必须是2的整数幂次，
+分配连续的物理页，有助于减少内存碎片化，但即使如此内存碎片化也就是令人头痛的问题。
+```c
+struct page *alloc_pages(gfp_t gfp_mask, unsigned int order);
+```
+gfp_mask 称为分配掩码，分为两类：
+一类叫 zone modifiers : 用于指定从哪个zone中分配页面，由掩码低4位表示，分别为
+```c
+#define __GFP_DMA	((__force gfp_t)___GFP_DMA)
+#define __GFP_HIGHMEM	((__force gfp_t)___GFP_HIGHMEM)
+#define __GFP_DMA32	((__force gfp_t)___GFP_DMA32)
+#define __GFP_MOVABLE	((__force gfp_t)___GFP_MOVABLE)  /* Page is movable */
+#define GFP_ZONEMASK	(__GFP_DMA|__GFP_HIGHMEM|__GFP_DMA32|__GFP_MOVABLE)
+```
+另一类叫 action modifiers，决定分配行为，
+```c
+#define __GFP_WAIT	((__force gfp_t)___GFP_WAIT)	/* Can wait and reschedule? */
+#define __GFP_HIGH	((__force gfp_t)___GFP_HIGH)	/* Should access emergency pools? */
+#define __GFP_IO	((__force gfp_t)___GFP_IO)	/* Can start physical IO? */
+#define __GFP_FS	((__force gfp_t)___GFP_FS)	/* Can call down to low-level FS? */
+#define __GFP_COLD	((__force gfp_t)___GFP_COLD)	/* Cache-cold page required */
+#define __GFP_NOWARN	((__force gfp_t)___GFP_NOWARN)	/* Suppress page allocation failure warning */
+#define __GFP_REPEAT	((__force gfp_t)___GFP_REPEAT)	/* See above */
+#define __GFP_NOFAIL	((__force gfp_t)___GFP_NOFAIL)	/* See above */
+#define __GFP_NORETRY	((__force gfp_t)___GFP_NORETRY) /* See above */
+#define __GFP_MEMALLOC	((__force gfp_t)___GFP_MEMALLOC)/* Allow access to emergency reserves */
+#define __GFP_COMP	((__force gfp_t)___GFP_COMP)	/* Add compound page metadata */
+#define __GFP_ZERO	((__force gfp_t)___GFP_ZERO)	/* Return zeroed page on success */
+#define __GFP_NOMEMALLOC ((__force gfp_t)___GFP_NOMEMALLOC) /* Don't use emergency reserves.
+							 * This takes precedence over the
+							 * __GFP_MEMALLOC flag if both are
+							 * set
+							 */
+#define __GFP_HARDWALL   ((__force gfp_t)___GFP_HARDWALL) /* Enforce hardwall cpuset memory allocs */
+#define __GFP_THISNODE	((__force gfp_t)___GFP_THISNODE)/* No fallback, no policies */
+#define __GFP_RECLAIMABLE ((__force gfp_t)___GFP_RECLAIMABLE) /* Page is reclaimable */
+#define __GFP_NOTRACK	((__force gfp_t)___GFP_NOTRACK)  /* Don't track with kmemcheck */
+
+#define __GFP_NO_KSWAPD	((__force gfp_t)___GFP_NO_KSWAPD)
+#define __GFP_OTHER_NODE ((__force gfp_t)___GFP_OTHER_NODE) /* On behalf of other node */
+#define __GFP_WRITE	((__force gfp_t)___GFP_WRITE)	/* Allocator intends to dirty page */
+```
+
+
+alloc_pages首先要根据 gfp_mask 决定从哪个zone分配
+```c
+static inline struct page *alloc_pages_node(int nid, gfp_t gfp_mask,
+						unsigned int order)
+{
+	/* Unknown node is current node */
+	if (nid < 0)
+		nid = numa_node_id();
+
+	return __alloc_pages(gfp_mask, order, node_zonelist(nid, gfp_mask) /*根据node id 和 gfp_mask，找到从哪个zonelist分配*/);
+}
+
+struct page *
+__attribute__((optimize("O0")))
+__alloc_pages_nodemask(gfp_t gfp_mask /*GFP_KERNEL*/, unsigned int order,
+			struct zonelist *zonelist, nodemask_t *nodemask)
+{
+	struct zoneref *preferred_zoneref;
+	struct page *page = NULL;
+	unsigned int cpuset_mems_cookie;
+	int alloc_flags = ALLOC_WMARK_LOW|ALLOC_CPUSET|ALLOC_FAIR;
+	gfp_t alloc_mask; /* The gfp_t that was actually used for allocation */
+	struct alloc_context ac = {
+		.high_zoneidx = gfp_zone(gfp_mask),  // ZONE_NORMAL(0) 表示使用哪个zone分配
+		.nodemask = nodemask,                // 0x0
+		.migratetype = gfpflags_to_migratetype(gfp_mask), // 0x0 MIGRATE_UNMOVABLE, 将gfp_mask转换为migrate类型
+	};
+
+	...
+
+	// 首先从空闲的page分配，理想情况会成功
+	page = get_page_from_freelist(alloc_mask, order, alloc_flags, &ac);
+	if (unlikely(!page)) {
+		alloc_mask = memalloc_noio_flags(gfp_mask);
+		page = __alloc_pages_slowpath(alloc_mask, order, &ac);
+	}
+
+	...
+
+	return page;
+}
+
+static struct page *
+get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+						const struct alloc_context *ac)
+{
+	struct zonelist *zonelist = ac->zonelist;
+	struct zoneref *z;
+	struct page *page = NULL;
+	struct zone *zone;
+	nodemask_t *allowednodes = NULL;/* zonelist_cache approximation */
+	int zlc_active = 0;		/* set if using zonelist_cache */
+	int did_zlc_setup = 0;		/* just call zlc_setup() one time */
+	bool consider_zone_dirty = (alloc_flags & ALLOC_WMARK_LOW) &&
+				(gfp_mask & __GFP_WRITE);
+	int nr_fair_skipped = 0;
+	bool zonelist_rescan;
+
+zonelist_scan:
+	zonelist_rescan = false;
+
+	// 从zone_list找到合适的zone进行分配
+	// 默认优先从 ZONE_HIGHMEM分配，但是 high_zoneidx 指定为0 ZONE_NORMAL，所以这里会从ZONE_NORMAL分配
+	for_each_zone_zonelist_nodemask(zone, z, zonelist, ac->high_zoneidx,
+								ac->nodemask) {
+		unsigned long mark;
+
+		// 检查水平位
+		mark = zone->watermark[alloc_flags & ALLOC_WMARK_MASK];
+		if (!zone_watermark_ok(zone, order, mark,
+				       ac->classzone_idx, alloc_flags)) {
+
+			...
+			// 如果当前zone空闲的页面低于水平位，则回收页面 zone_allows_reclaim
+			ret = zone_reclaim(zone, gfp_mask, order);
+
+			...
+			}
+		}
+
+		// 如果空闲页面足够，调用 buffered_rmqueue 从伙伴系统分配页面
+try_this_zone:
+		page = buffered_rmqueue(ac->preferred_zone, zone, order,
+						gfp_mask, ac->migratetype);
+		if (page) {
+			if (prep_new_page(page, order, gfp_mask, alloc_flags))
+				goto try_this_zone;
+			return page;
+		}
+		...
+}
+```
+
+从伙伴系统中分配
+```c
+static inline
+struct page *buffered_rmqueue(struct zone *preferred_zone,
+			struct zone *zone, unsigned int order,
+			gfp_t gfp_flags, int migratetype)
+{
+	unsigned long flags;
+	struct page *page;
+	bool cold = ((gfp_flags & __GFP_COLD) != 0);
+
+	// 如果需要分配的页面的order为0，即只分配一个page,则从 zone->per_cpu_pages中分配
+	if (likely(order == 0)) {
+		struct per_cpu_pages *pcp;
+		struct list_head *list;
+
+		local_irq_save(flags);
+		pcp = &this_cpu_ptr(zone->pageset)->pcp;
+		list = &pcp->lists[migratetype];
+		if (list_empty(list)) {
+			pcp->count += rmqueue_bulk(zone, 0,
+					pcp->batch, list,
+					migratetype, cold);
+			if (unlikely(list_empty(list)))
+				goto failed;
+		}
+
+		if (cold)
+			page = list_entry(list->prev, struct page, lru);
+		else
+			page = list_entry(list->next, struct page, lru);
+
+		list_del(&page->lru);
+		pcp->count--;
+	} else {
+		// 如果需要分配的页面数量大于1，则调用 __rmqueue 分配
+		spin_lock_irqsave(&zone->lock, flags);
+		page = __rmqueue(zone, order, migratetype);
+		spin_unlock(&zone->lock);
+		if (!page)
+			goto failed;
+		__mod_zone_freepage_state(zone, -(1 << order),
+					  get_freepage_migratetype(page));
+	}
+
+	// 分配成功后进行一些检查
+	__mod_zone_page_state(zone, NR_ALLOC_BATCH, -(1 << order));
+	if (atomic_long_read(&zone->vm_stat[NR_ALLOC_BATCH]) <= 0 &&
+	    !test_bit(ZONE_FAIR_DEPLETED, &zone->flags))
+		set_bit(ZONE_FAIR_DEPLETED, &zone->flags);
+
+	__count_zone_vm_events(PGALLOC, zone, 1 << order);
+	zone_statistics(preferred_zone, zone, gfp_flags);
+	local_irq_restore(flags);
+
+	VM_BUG_ON_PAGE(bad_range(zone, page), page);
+	return page;
+
+failed:
+	local_irq_restore(flags);
+	return NULL;
+}
+
+// __rmqueue -> __rmqueue_smallest
+static inline
+struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
+						int migratetype)
+{
+	unsigned int current_order;
+	struct free_area *area;
+	struct page *page;
+
+	/* Find a page of the appropriate size in the preferred list */
+	// 从小order依次遍历，优先从小的内存开始分配，如果不满足则从大的内存切一块
+	for (current_order = order; current_order < MAX_ORDER; ++current_order) {
+		area = &(zone->free_area[current_order]);
+		if (list_empty(&area->free_list[migratetype])) 
+			continue; // 如果本order分配完了，则尝试下一个
+
+		page = list_entry(area->free_list[migratetype].next,
+							struct page, lru);
+		list_del(&page->lru);
+		rmv_page_order(page);
+		area->nr_free--;
+		expand(zone, page, order, current_order, area, migratetype); // 将大块内存切出一块返回为page，剩余的重新加入伙伴系统
+		set_freepage_migratetype(page, migratetype);
+		return page;
+	}
+
+	return NULL;
+}
+
+static inline void expand(struct zone *zone, struct page *page,
+	int low, int high, struct free_area *area,
+	int migratetype)
+{
+	unsigned long size = 1 << high;
+
+	while (high > low) {
+		area--;
+		high--;
+		size >>= 1;
+
+		list_add(&page[size].lru, &area->free_list[migratetype]);
+		area->nr_free++;
+		set_page_order(&page[size], high);
+	}
+}
+```
+
+
