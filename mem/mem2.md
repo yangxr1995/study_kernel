@@ -1088,22 +1088,307 @@ struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
 	return NULL;
 }
 
+/*
+ * page : 被分配的pages，其中包含需要切除的部分
+ * low  : 分配的pages的order
+ * high : 整个pages的order
+ * area : 伙伴池
+ */
 static inline void expand(struct zone *zone, struct page *page,
 	int low, int high, struct free_area *area,
 	int migratetype)
 {
-	unsigned long size = 1 << high;
+	unsigned long size = 1 << high; // pages的包含page的数量
 
-	while (high > low) {
-		area--;
-		high--;
-		size >>= 1;
+	while (high > low) { // 如果还有可以切除的部分，则继续，直到high == low，即pages只剩下需要的数量
+		area--;     // 伙伴池退一个
+		high--;     // 伙伴池对应的order
+		size >>= 1; // 剩余的需要pages数量
 
-		list_add(&page[size].lru, &area->free_list[migratetype]);
+		list_add(&page[size].lru, &area->free_list[migratetype]); // 将pages + size 开始，共 1 << high 个page加入伙伴系统 area->free_list
 		area->nr_free++;
 		set_page_order(&page[size], high);
 	}
 }
 ```
+![](./pic/44.jpg)
+
+## 释放伙伴系统的内存
+free_pages -> _free_pages
+```c
+void free_pages(unsigned long addr, unsigned int order)
+{
+	if (addr != 0) {
+		__free_pages(virt_to_page((void *)addr), order); // 将虚拟地址转换为page, 调用 __free_pages
+	}
+}
+
+#define virt_to_page(kaddr)	pfn_to_page(virt_to_pfn(kaddr))
+
+#define virt_to_pfn(kaddr) (__pa(kaddr) >> PAGE_SHIFT)
+
+#define __pa(x)			__virt_to_phys((unsigned long)(x))
+
+void __free_pages(struct page *page, unsigned int order)
+{
+	if (put_page_testzero(page)) {
+		if (order == 0)
+			free_hot_cold_page(page, false); // 如果order为0，则做特殊处理
+		else
+			__free_pages_ok(page, order);  // 如果order>0，则释放到伙伴系统
+	}
+}
 
 
+__free_pages_ok -> free_one_page -> __free_one_page
+static void __free_pages_ok(struct page *page, unsigned int order)
+{
+	unsigned long flags;
+	int migratetype;
+	unsigned long pfn = page_to_pfn(page);
+
+	if (!free_pages_prepare(page, order))
+		return;
+
+	migratetype = get_pfnblock_migratetype(page, pfn);
+	local_irq_save(flags);
+	__count_vm_events(PGFREE, 1 << order);
+	set_freepage_migratetype(page, migratetype);
+	free_one_page(page_zone(page), page, pfn, order, migratetype); // page_zone(page) 得到zone
+	local_irq_restore(flags);
+}
+
+// 将pages释放到伙伴系统，并做合并操作
+static inline void __free_one_page(struct page *page,
+		unsigned long pfn,
+		struct zone *zone, unsigned int order,
+		int migratetype)
+{
+	unsigned long page_idx;
+	unsigned long combined_idx;
+	unsigned long uninitialized_var(buddy_idx);
+	struct page *buddy;
+	int max_order = MAX_ORDER;
+
+	// (1 << max_order) : 得到 pageblock 有多少个 page
+	// pfn & ((1<<max_order) -1) : 等价于 pfn % ( (1 << max_order) - 1) ，相当于将整个内存按pageblock进行划分
+	// 求要释放的内存在相关pageblock的下标
+	page_idx = pfn & ((1 << max_order) - 1);
+
+	// for (; order < max_order - 1; order++) : 由小内存块到大内存块，如果遇到相邻内存块，则合并，并到下一层再次尝试合并
+	while (order < max_order - 1) {
+		buddy_idx = __find_buddy_index(page_idx, order); // 见下分析
+		buddy = page + (buddy_idx - page_idx);
+		if (!page_is_buddy(page, buddy, order)) // 检查buddy是否为空闲内存块, 且buddy的order必须等于page的order
+			break;
+
+		// 找到了可以合并的buddy
+		
+		// 将buddy从free_area中取出
+		if (page_is_guard(buddy)) {
+			clear_page_guard(zone, buddy, order, migratetype);
+		} else {
+			list_del(&buddy->lru);
+			zone->free_area[order].nr_free--;
+			rmv_page_order(buddy);
+		}
+
+		// 进行合并, 假设order为 1, 则 1<<order 为 0b0010
+		// 如果 page_idx : 0b0010 (2), 则 buddy_idx : 0b0000 (0), 则 combined_idx为 0b0000 (0)
+		// 如果 page_idx : 0b0100 (4), 则 buddy_idx : 0b0110 (6), 则 combined_idx为 0b0100 (4)
+		combined_idx = buddy_idx & page_idx;
+		page = page + (combined_idx - page_idx);
+		page_idx = combined_idx;
+		order++; // order增加，标志着pages变大了
+	}
+	set_page_order(page, order); //修改page的order，让他代表大的内存
+
+	if ((order < MAX_ORDER-2) && pfn_valid_within(page_to_pfn(buddy))) {
+		struct page *higher_page, *higher_buddy;
+		combined_idx = buddy_idx & page_idx;
+		higher_page = page + (combined_idx - page_idx);
+		buddy_idx = __find_buddy_index(combined_idx, order + 1);
+		higher_buddy = higher_page + (buddy_idx - combined_idx);
+		if (page_is_buddy(higher_page, higher_buddy, order + 1)) {
+			list_add_tail(&page->lru,
+				&zone->free_area[order].free_list[migratetype]);
+			goto out;
+		}
+	}
+
+	// 将合并出的新pages，添加到对应的链表
+	list_add(&page->lru, &zone->free_area[order].free_list[migratetype]);
+out:
+	zone->free_area[order].nr_free++;
+}
+
+/*
+ * Locate the struct page for both the matching buddy in our
+ * pair (buddy1) and the combined O(n+1) page they form (page).
+ *
+ * 1) Any buddy B1 will have an order O twin B2 which satisfies
+ * the following equation:
+ *     B2 = B1 ^ (1 << O)
+ * For example, if the starting buddy (buddy2) is #8 its order
+ * 1 buddy is #10:
+ *     B2 = 8 ^ (1 << 1) = 8 ^ 2 = 10
+ *
+ * 2) Any buddy B will have an order O+1 parent P which
+ * satisfies the following equation:
+ *     P = B & ~(1 << O)
+ *
+ * Assumption: *_mem_map is contiguous at least up to MAX_ORDER
+ * 详细分析见下面
+ */
+
+static inline unsigned long
+__find_buddy_index(unsigned long page_idx, unsigned int order)
+{
+	return page_idx ^ (1 << order);
+}
+
+static inline int page_is_buddy(struct page *page, struct page *buddy,
+							unsigned int order)
+{
+
+	// 检查buddy是否为空闲内存块
+	// PageBuddy(page) 确定page是否空闲
+	// page_order(buddy)确定大小
+	if (PageBuddy(buddy) && page_order(buddy) == order) {
+		/*
+		 * zone check is done late to avoid uselessly
+		 * calculating zone/node ids for pages that could
+		 * never merge.
+		 */
+		if (page_zone_id(page) != page_zone_id(buddy))
+			return 0;
+
+		return 1;
+	}
+	return 0;
+}
+```
+
+### __find_buddy_index分析
+考虑order为1的情况
+![](./pic/45.jpg)
+page[0-1] 和 page[2-3]互为伙伴，page[4-5]和page[6-7]互为伙伴
+所以得出结论：
+buddy_idx = page_index + 2^order
+buddy_idx = page_index - 2^order
+从二进制看，可以得到另一个规律
+![](./pic/46.jpg)
+0 和 4 之间增加或减少一个 1<<order就得到对方的index，其他同理，
+
+| page_idx的第order位 | buddy_idx的第order位 |
+| -----------------   | ------------------   |
+| 0                   | 1                    |
+| 1                   | 0                    |
+
+所以已知page_indx求其buddy_idx，只需要对page_indx的order进行对(1<<order)异或 
+```c
+static inline unsigned long
+__find_buddy_index(unsigned long page_idx, unsigned int order)
+{
+	return page_idx ^ (1 << order);
+}
+```
+
+### 合并的讨论
+![](./pic/47.jpg)
+
+## 特殊处理释放order为0的page
+
+zone->pageset为每个CPU初始化一个percpu变量struct per_cpu_pageset. 当释放order为0的page时，释放到per_cpu_page->list对应的链表中。
+```c
+void free_hot_cold_page(struct page *page, bool cold /*false*/)
+{
+	struct zone *zone = page_zone(page);
+	struct per_cpu_pages *pcp;
+	unsigned long flags;
+	unsigned long pfn = page_to_pfn(page);
+	int migratetype;
+
+	pcp = &this_cpu_ptr(zone->pageset)->pcp;
+	if (!cold)
+		list_add(&page->lru, &pcp->lists[migratetype]);
+	else
+		list_add_tail(&page->lru, &pcp->lists[migratetype]);
+	pcp->count++;
+	// 如果per_cpu_pages的页面数量大于high水平位，则释放到伙伴系统
+	// 一次释放batch个页面
+	if (pcp->count >= pcp->high) {
+		unsigned long batch = ACCESS_ONCE(pcp->batch);
+		free_pcppages_bulk(zone, batch, pcp);
+		pcp->count -= batch;
+	}
+
+out:
+	local_irq_restore(flags);
+}
+```
+
+```c
+struct per_cpu_pages {
+	int count;		// 当前zone 中per_cpu_pages的页面数量
+	int high;		// 当per_cpu_pages的页面数量高于high水平位，会回收到伙伴系统
+	int batch;		// 一次回收到伙伴系统的页面数量
+
+	/* Lists of pages, one per migrate type stored on the pcp-lists */
+	struct list_head lists[MIGRATE_PCPTYPES];
+};
+
+struct per_cpu_pageset {
+	struct per_cpu_pages pcp;
+};
+
+```
+
+从per_cpu_pages释放到伙伴系统
+```c
+static void free_pcppages_bulk(struct zone *zone, int count,
+					struct per_cpu_pages *pcp)
+{
+	int migratetype = 0;
+	int batch_free = 0;
+	int to_free = count;
+	unsigned long nr_scanned;
+
+	spin_lock(&zone->lock);
+	nr_scanned = zone_page_state(zone, NR_PAGES_SCANNED);
+	if (nr_scanned)
+		__mod_zone_page_state(zone, NR_PAGES_SCANNED, -nr_scanned);
+
+	while (to_free) {
+		struct page *page;
+		struct list_head *list;
+
+		do {
+			batch_free++;
+			if (++migratetype == MIGRATE_PCPTYPES)
+				migratetype = 0;
+			list = &pcp->lists[migratetype];
+		} while (list_empty(list));
+
+		/* This is the only non-empty list. Free them all. */
+		if (batch_free == MIGRATE_PCPTYPES)
+			batch_free = to_free;
+
+		do {
+			int mt;	/* migratetype of the to-be-freed page */
+
+			page = list_entry(list->prev, struct page, lru);
+			/* must delete as __free_one_page list manipulates */
+			list_del(&page->lru);
+			mt = get_freepage_migratetype(page);
+			if (unlikely(has_isolate_pageblock(zone)))
+				mt = get_pageblock_migratetype(page);
+
+			/* MIGRATE_MOVABLE list may include MIGRATE_RESERVEs */
+			__free_one_page(page, page_to_pfn(page), zone, 0, mt); // 依旧调用 __free_one_page，解释同上
+			trace_mm_page_pcpu_drain(page, 0, mt);
+		} while (--to_free && --batch_free && !list_empty(list));
+	}
+	spin_unlock(&zone->lock);
+}
+```
