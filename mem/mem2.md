@@ -1392,3 +1392,9 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 	spin_unlock(&zone->lock);
 }
 ```
+# 总结
+重点：伙伴系统算法 ， zone-based设计
+* 理解伙伴系统原理
+* 从分配掩码知道可以从哪些zone中分配，分配内存的属性是属于哪些 MIGRATE_TYPES类型。
+* 页面分配时从哪个方向来扫描zone 
+* zone水平位的判断
