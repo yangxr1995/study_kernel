@@ -1401,6 +1401,7 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 
 # slab
 伙伴系统用于分配page，但是很多需求是byte为单位，那么就需要用slab，slab是基于伙伴系统分配page，但是slab在基础上做了自己的算法，以实现对小内存的管理。
+slab用于分配固定大小的，以Byte为单位的内存。
 需要思考：
 * slab如何分配和释放小内存块
 * slab有着色的概念，着色有什么用
@@ -1854,13 +1855,33 @@ struct kmem_cache_node {
 
 };
 ```
-一个slab由2^gfporder个连续的物理页面，包含了num个slab对象，着色区，freelist区
-![](./pic/48.jpg)
-
-slab太复杂了，简单记录下，当创建slab分配器后，就可以从其分配固定大小的小内存块，
-理论上可以一直分配，当slab没有缓存时，从伙伴系统分配一个或多个page，并划分新的小内存块，
-继续分配，当释放时，小内存块被标记为空闲，当有大量的小内存时，超过了阈值则将其释放到伙伴系统。
-
-心情好时再仔细看看。
-终于的看懂了，起始还没有伙伴系统复杂。
 ![](./pic/49.jpg)
+
+
+# 理解cache 
+![](./pic/50.jpg)
+cache和主内存使用一样的地址，所以CPU可以直接用虚拟地址访问cache。
+当CPU发出虚拟地址时，会同时发给MMU和cache。
+MMU先使用TLB（缓存部分虚拟地址和对应物理地址）查询是否命中，若没有命中则从内存加载映射表进行映射...总之最后得到物理地址。
+cache根据虚拟地址找到cache line（cache line 是cache的最小访问单元），并使用MMU给的物理地址和cache line附带的物理地址进行比较，如果匹配，则cache命中，通过虚拟地址的偏移值从cache line 中获得数据返回给CPU，如果没有命中，则访问主内存，加载数据到cache line，然后返回数据给CPU。
+
+cache的寻址方式
+![](./pic/51.jpg)
+
+cache抖动的原因
+![](./pic/52.jpg)
+比如下面的代码就会导致上面的cache 情况下发生抖动
+```c
+void func(int *data1, int *data2, int *result, int size)
+{
+	int i;
+	for (i = 0; i < size; i++)
+		result[i] = data1[i] + data2[i];
+}
+
+main()
+{
+	func(0x00, 0x40, 0x80, 4);
+}
+```
+
