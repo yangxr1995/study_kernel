@@ -2461,3 +2461,414 @@ main()
 }
 ```
 
+# vmalloc
+kmalloc 基于slab分配器，slab缓存区建立在一个连续的物理地址的内存块上，所以其缓存的对象也是物理地址连续的。
+vmalloc：连续的虚拟地址内存块,但是分配内存是以page为单位，所以适合大内存的分配。
+```c
+void *vmalloc(unsigned long size)
+{
+	// 优先使用虚拟内存高端部分
+	return __vmalloc_node_flags(size, NUMA_NO_NODE,
+				    GFP_KERNEL | __GFP_HIGHMEM);
+}
+
+static inline void *__vmalloc_node_flags(unsigned long size,
+					int node, gfp_t flags)
+{
+	return __vmalloc_node(size, 1, flags, PAGE_KERNEL,
+					node, __builtin_return_address(0));
+}
+
+static void *__vmalloc_node(unsigned long size, unsigned long align,
+			    gfp_t gfp_mask, pgprot_t prot,
+			    int node, const void *caller)
+{
+	// VMALLOC_START和VMALLOC_END指定VMALLOC区范围
+	// vmallo区是在high memory指定的高端内存开始再加上8MB大小的安全区（VMALLOC_OFFSET）
+	return __vmalloc_node_range(size, align, VMALLOC_START, VMALLOC_END,
+				gfp_mask, prot, 0, node, caller);
+}
+
+void *__vmalloc_node_range(unsigned long size, unsigned long align,
+			unsigned long start, unsigned long end, gfp_t gfp_mask,
+			pgprot_t prot, unsigned long vm_flags, int node,
+			const void *caller)
+{
+	struct vm_struct *area;
+	void *addr;
+	unsigned long real_size = size;
+
+	// 需要的空间大小以page对齐
+	size = PAGE_ALIGN(size);
+	if (!size || (size >> PAGE_SHIFT) > totalram_pages)
+		goto fail;
+
+	// 分配虚拟空间
+	area = __get_vm_area_node(size, align, VM_ALLOC | VM_UNINITIALIZED |
+				vm_flags, start, end, node, gfp_mask, caller);
+	if (!area)
+		goto fail;
+
+	// 分配物理空间
+	addr = __vmalloc_area_node(area, gfp_mask, prot, node);
+	if (!addr)
+		return NULL;
+
+	return addr;
+}
+```
+
+分配虚拟空间
+```c
+static struct vm_struct *__get_vm_area_node(unsigned long size,
+		unsigned long align, unsigned long flags, unsigned long start,
+		unsigned long end, int node, gfp_t gfp_mask, const void *caller)
+{
+	struct vmap_area *va;
+	struct vm_struct *area;
+
+	BUG_ON(in_interrupt());
+	if (flags & VM_IOREMAP)
+		align = 1ul << clamp(fls(size), PAGE_SHIFT, IOREMAP_MAX_ORDER);
+
+	size = PAGE_ALIGN(size);
+	if (unlikely(!size))
+		return NULL;
+
+	area = kzalloc_node(sizeof(*area), gfp_mask & GFP_RECLAIM_MASK, node);
+	if (unlikely(!area))
+		return NULL;
+
+	// 如果没有VM_NO_GUARD，则多分配一个页做安全垫
+	if (!(flags & VM_NO_GUARD))
+		size += PAGE_SIZE;
+
+	va = alloc_vmap_area(size, align, start, end, node, gfp_mask);
+	if (IS_ERR(va)) {
+		kfree(area);
+		return NULL;
+	}
+
+	setup_vmalloc_vm(area, va, flags, caller);
+
+	return area;
+}
+
+// 在vmalloc整个空间中找到一块大小合适且没有使用的空间，称为hole
+static struct vmap_area *alloc_vmap_area(unsigned long size,
+				unsigned long align,
+				unsigned long vstart, unsigned long vend,
+				int node, gfp_t gfp_mask)
+{
+	struct vmap_area *va;
+	struct rb_node *n;
+	unsigned long addr;
+	int purged = 0;
+	struct vmap_area *first;
+
+	va = kmalloc_node(sizeof(struct vmap_area),
+			gfp_mask & GFP_RECLAIM_MASK, node);
+	if (unlikely(!va))
+		return ERR_PTR(-ENOMEM);
+
+	kmemleak_scan_area(&va->rb_node, SIZE_MAX, gfp_mask & GFP_RECLAIM_MASK);
+
+	// free_vmap_cache, cached_hole_size, cached_vstart 
+	// 这几个变量是想实现，从上次查找结果中开始查找，
+	// 是个优化选项
+retry:
+	spin_lock(&vmap_area_lock);
+	if (!free_vmap_cache ||
+			size < cached_hole_size ||
+			vstart < cached_vstart ||
+			align < cached_align) {
+nocache:
+		cached_hole_size = 0;
+		free_vmap_cache = NULL;
+	}
+	/* record if we encounter less permissive parameters */
+	cached_vstart = vstart;
+	cached_align = align;
+
+	/* find starting point for our search */
+	if (free_vmap_cache) {
+		first = rb_entry(free_vmap_cache, struct vmap_area, rb_node);
+		addr = ALIGN(first->va_end, align);
+		if (addr < vstart)
+			goto nocache;
+		if (addr + size < addr)
+			goto overflow;
+
+	} else {
+		// 从vmap_area_root红黑树上查找
+		// 其上存放着系统正在使用的vmalloc区块，
+		// 遍历左叶子节点找区间地址最小的区块
+		// 如果区块地址等于VMALLOC_START，说明是第一个vmalloc区块
+		// 如果红黑树没有一个节点，说明整个vmalloc都是空的
+		addr = ALIGN(vstart, align);
+		if (addr + size < addr)
+			goto overflow;
+
+		n = vmap_area_root.rb_node;
+		first = NULL;
+
+		while (n) {
+			struct vmap_area *tmp;
+			tmp = rb_entry(n, struct vmap_area, rb_node);
+			if (tmp->va_end >= addr) {
+				first = tmp;
+				if (tmp->va_start <= addr)
+					break;
+				n = n->rb_left;
+			} else
+				n = n->rb_right;
+		}
+		// 如果addr 在所有的区块的va_end之后，
+		// 说明addr, addr+size可以作为新的区块，
+		// 否则需要进一步查找
+		if (!first)
+			goto found;
+	}
+
+	// 进一步找hole
+	while (addr + size > first->va_start && addr + size <= vend) {
+		if (addr + cached_hole_size < first->va_start)
+			cached_hole_size = first->va_start - addr;
+		addr = ALIGN(first->va_end, align);
+		if (addr + size < addr)
+			goto overflow;
+
+		if (list_is_last(&first->list, &vmap_area_list))
+			goto found;
+
+		first = list_entry(first->list.next,
+				struct vmap_area, list);
+	}
+
+found:
+	if (addr + size > vend)
+		goto overflow;
+
+	// 找到新的区块hole，调用__insert_vmap_area把hole注册到红黑树
+	va->va_start = addr;
+	va->va_end = addr + size;
+	va->flags = 0;
+	__insert_vmap_area(va);
+	free_vmap_cache = &va->rb_node;
+	spin_unlock(&vmap_area_lock);
+
+	return va;
+
+overflow:
+	spin_unlock(&vmap_area_lock);
+	if (!purged) {
+		purge_vmap_area_lazy();
+		purged = 1;
+		goto retry;
+	}
+	if (printk_ratelimit())
+		pr_warn("vmap allocation for size %lu failed: "
+			"use vmalloc=<size> to increase size.\n", size);
+	kfree(va);
+	return ERR_PTR(-EBUSY);
+}
+
+// 回到__get_vm_area_node，把刚找到的struct vmap_area *va相关信息填到struct vm_struct *vm中
+static void setup_vmalloc_vm(struct vm_struct *vm, struct vmap_area *va,
+			      unsigned long flags, const void *caller)
+{
+	spin_lock(&vmap_area_lock);
+	vm->flags = flags;
+	vm->addr = (void *)va->va_start;
+	vm->size = va->va_end - va->va_start;
+	vm->caller = caller;
+	va->vm = vm;
+	va->flags |= VM_VM_AREA;
+	spin_unlock(&vmap_area_lock);
+}
+
+```
+分配物理空间
+```c
+static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+				 pgprot_t prot, int node)
+{
+	const int order = 0;
+	struct page **pages;
+	unsigned int nr_pages, array_size, i;
+	const gfp_t nested_gfp = (gfp_mask & GFP_RECLAIM_MASK) | __GFP_ZERO;
+	const gfp_t alloc_mask = gfp_mask | __GFP_NOWARN;
+
+	// 计算需要的页面数量 
+	nr_pages = get_vm_area_size(area) >> PAGE_SHIFT;
+	array_size = (nr_pages * sizeof(struct page *));
+
+	area->nr_pages = nr_pages;
+	/* Please note that the recursion is strictly bounded. */
+	if (array_size > PAGE_SIZE) {
+		pages = __vmalloc_node(array_size, 1, nested_gfp|__GFP_HIGHMEM,
+				PAGE_KERNEL, node, area->caller);
+		area->flags |= VM_VPAGES;
+	} else {
+		pages = kmalloc_node(array_size, nested_gfp, node);
+	}
+	area->pages = pages;
+	if (!area->pages) {
+		remove_vm_area(area->addr);
+		kfree(area);
+		return NULL;
+	}
+
+	// 分配页面
+	// 可以看出page是不连续的
+	for (i = 0; i < area->nr_pages; i++) {
+		struct page *page;
+
+		if (node == NUMA_NO_NODE)
+			page = alloc_page(alloc_mask);
+		else
+			page = alloc_pages_node(node, alloc_mask, order);
+
+		if (unlikely(!page)) {
+			/* Successfully allocated i pages, free them in __vunmap() */
+			area->nr_pages = i;
+			goto fail;
+		}
+		area->pages[i] = page;
+		if (gfp_mask & __GFP_WAIT)
+			cond_resched();
+	}
+
+	// 建立映射
+	if (map_vm_area(area, prot, pages))
+		goto fail;
+	return area->addr;
+
+fail:
+	warn_alloc_failed(gfp_mask, order,
+			  "vmalloc: allocation failure, allocated %ld of %ld bytes\n",
+			  (area->nr_pages*PAGE_SIZE), area->size);
+	vfree(area->addr);
+	return NULL;
+}
+
+int map_vm_area(struct vm_struct *area, pgprot_t prot, struct page **pages)
+{
+	unsigned long addr = (unsigned long)area->addr;
+	unsigned long end = addr + get_vm_area_size(area);
+	int err;
+
+	err = vmap_page_range(addr, end, prot, pages);
+
+	return err > 0 ? 0 : err;
+}
+
+static int vmap_page_range(unsigned long start, unsigned long end,
+			   pgprot_t prot, struct page **pages)
+{
+	int ret;
+
+	ret = vmap_page_range_noflush(start, end, prot, pages);
+	flush_cache_vmap(start, end);
+	return ret;
+}
+
+// 设置页表，建立映射
+static int vmap_page_range_noflush(unsigned long start, unsigned long end,
+				   pgprot_t prot, struct page **pages)
+{
+	pgd_t *pgd;
+	unsigned long next;
+	unsigned long addr = start;
+	int err = 0;
+	int nr = 0;
+
+	BUG_ON(addr >= end);
+	pgd = pgd_offset_k(addr); // 找到虚拟地址addr对应的pgd页表项 
+	do {
+		next = pgd_addr_end(addr, end); // 保存下一个pgd对应的虚拟地址next
+		err = vmap_pud_range(pgd, addr, next, prot, pages, &nr);
+		if (err)
+			return err;
+	} while (pgd++, addr = next, addr != end); //设置下一个pgd
+
+	return nr;
+}
+
+// pud pmd 都指向pgd，所以最后调用vmap_pte_range
+static int vmap_pte_range(pmd_t *pmd, unsigned long addr,
+		unsigned long end, pgprot_t prot, struct page **pages, int *nr)
+{
+	pte_t *pte;
+
+	pte = pte_alloc_kerne(pmd, addr); // 分配pte, 并设置pmd页表项指向pte
+	if (!pte)
+		return -ENOMEM;
+	do {
+		struct page *page = pages[*nr];
+
+		if (WARN_ON(!pte_none(*pte)))
+			return -EBUSY;
+		if (WARN_ON(!page))
+			return -ENOMEM;
+		set_pte_at(&init_mm, addr, pte, mk_pte(page, prot)/*生成pte值*/); // 设置pte
+		(*nr)++;
+	} while (pte++, addr += PAGE_SIZE, addr != end);
+	return 0;
+}
+```
+
+# VMA操作
+进程地址空间在内核中使用struct vm_area_struct描述，简称VMA
+```c
+struct vm_area_struct {
+	/* The first cache line has the info for VMA tree walking. */
+
+	// 虚拟空间的起始地址和结束地址
+	unsigned long vm_start;	
+	unsigned long vm_end;
+
+	// 进程的VMA都连城一个链表
+	struct vm_area_struct *vm_next, *vm_prev;
+
+	// 红黑树节点, 每个进程的struct mm_struct都有一个红黑树mm->mm_rb
+	struct rb_node vm_rb;
+
+	unsigned long rb_subtree_gap;
+
+	
+	struct mm_struct *vm_mm; // 指向所属进程的struct mm_struct
+	pgprot_t vm_page_prot;   // VMA的访问权限
+	unsigned long vm_flags;  // VMA的标志位
+
+	struct {
+		struct rb_node rb;
+		unsigned long rb_subtree_last;
+	} shared;
+
+	// 用于管理RMAP反向映射
+	struct list_head anon_vma_chain;
+	struct anon_vma *anon_vma;
+
+	// 方法集合，用于VMA中执行各种操作，通常用于文件映射
+	const struct vm_operations_struct *vm_ops;
+
+	// 指定文件映射的偏移量，单位不是Byte，而是页面的大小 PAGE_SIZE
+	unsigned long vm_pgoff;	
+
+	// 指向file实列，描述被映射的文件
+	struct file * vm_file;	
+	void * vm_private_data;	
+};
+
+// struct mm_struct是进程内存管理的核心数据结构
+struct mm_struct {
+	struct vm_area_struct *mmap;		/* list of VMAs */
+	struct rb_root mm_rb;
+	...
+}
+```
+每个VMA都要连接到mm_struct的链表和红黑树
+* mmap形成的单链表，进程所有的VMA都链接到这个链表中，表头是mm_struct->mmap
+* mm_rb是红黑树的根，每个进程都有一棵VMA红黑树
+VMA按照起始地址以递增的方式插入mm_struct->mmap链表中，当进程有大量VMA时，扫描链表和查找特定的VMA是非常低效的，所以内核中通常要靠红黑树来协助，提高查找速度。
