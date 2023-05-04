@@ -2872,3 +2872,661 @@ struct mm_struct {
 * mmap形成的单链表，进程所有的VMA都链接到这个链表中，表头是mm_struct->mmap
 * mm_rb是红黑树的根，每个进程都有一棵VMA红黑树
 VMA按照起始地址以递增的方式插入mm_struct->mmap链表中，当进程有大量VMA时，扫描链表和查找特定的VMA是非常低效的，所以内核中通常要靠红黑树来协助，提高查找速度。
+
+## vma查找
+
+```c
+struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
+{
+	struct rb_node *rb_node;
+	struct vm_area_struct *vma;
+
+	// 从current->vmacache[VMACACHE_SIZE]中记录最近访问过的vma
+	// 返回 vma->vm_start <= addr && vma->vm_end
+	// 由于局部性原理，很大概率可以找到
+	vma = vmacache_find(mm, addr);
+	if (likely(vma))
+		return vma;
+
+	rb_node = mm->mm_rb.rb_node;
+	vma = NULL;
+
+	while (rb_node) { // 当rb_node 为NULL时， 要么没有vma，要么 addr < vma->vm_end
+		struct vm_area_struct *tmp;
+
+		tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);
+
+		if (tmp->vm_end > addr) {
+			vma = tmp;
+			if (tmp->vm_start <= addr) // vma->vm_start <= addr < vma->vm_end
+				break;
+			rb_node = rb_node->rb_left;
+		} else
+			rb_node = rb_node->rb_right;
+	}
+
+	if (vma)
+		vmacache_update(addr, vma);
+	return vma;
+}
+```
+find_vma返回addr在vma中，距离addr最近的上一个vma
+![](./pic/53.jpg)
+
+
+```c
+static inline struct vm_area_struct * find_vma_intersection(struct mm_struct * mm, unsigned long start_addr, unsigned long end_addr)
+{
+	struct vm_area_struct * vma = find_vma(mm,start_addr);
+
+	if (vma && end_addr <= vma->vm_start)
+		vma = NULL;
+	return vma;
+}
+```
+find_vma_intersection 返回 start_addr, end_addr 在某个vma中
+
+```c
+struct vm_area_struct *
+find_vma_prev(struct mm_struct *mm, unsigned long addr,
+			struct vm_area_struct **pprev)
+{
+	struct vm_area_struct *vma;
+
+	vma = find_vma(mm, addr);
+	if (vma) {
+		*pprev = vma->vm_prev;
+	} else {
+		struct rb_node *rb_node = mm->mm_rb.rb_node;
+		*pprev = NULL;
+		while (rb_node) {
+			*pprev = rb_entry(rb_node, struct vm_area_struct, vm_rb);
+			rb_node = rb_node->rb_right;
+		}
+	}
+	return vma;
+}
+```
+返回vma前一个，或者最右边的一个
+
+
+## vma插入
+
+```c
+int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
+{
+	struct vm_area_struct *prev;
+	struct rb_node **rb_link, *rb_parent;
+
+	if (!vma->vm_file) {
+		BUG_ON(vma->anon_vma);
+		vma->vm_pgoff = vma->vm_start >> PAGE_SHIFT;
+	}
+	// 找到要插入的位置
+	if (find_vma_links(mm, vma->vm_start, vma->vm_end,
+			   &prev, &rb_link, &rb_parent))
+		return -ENOMEM;
+	if ((vma->vm_flags & VM_ACCOUNT) &&
+	     security_vm_enough_memory_mm(mm, vma_pages(vma)))
+		return -ENOMEM;
+	// 插入红黑树
+	vma_link(mm, vma, prev, rb_link, rb_parent);
+	return 0;
+}
+```
+
+## vma合并
+在加入新的vma时，内核会尝试将他和一个或多个现存的vma合并
+```c
+struct vm_area_struct *vma_merge(struct mm_struct *mm,
+			struct vm_area_struct *prev, unsigned long addr,
+			unsigned long end, unsigned long vm_flags,
+			struct anon_vma *anon_vma, struct file *file,
+			pgoff_t pgoff, struct mempolicy *policy)
+{
+	pgoff_t pglen = (end - addr) >> PAGE_SHIFT;
+	struct vm_area_struct *area, *next;
+	int err;
+
+	/*
+	 * We later require that vma->vm_flags == vm_flags,
+	 * so this tests vma->vm_flags & VM_SPECIAL, too.
+	 */
+	if (vm_flags & VM_SPECIAL)
+		return NULL;
+
+	if (prev)
+		next = prev->vm_next;
+	else
+		next = mm->mmap;
+	area = next;
+	if (next && next->vm_end == end)		/* cases 6, 7, 8 */
+		next = next->vm_next;
+
+	/*
+	 * Can it merge with the predecessor?
+	 */
+	if (prev && prev->vm_end == addr &&
+			mpol_equal(vma_policy(prev), policy) &&
+			can_vma_merge_after(prev, vm_flags,
+						anon_vma, file, pgoff)) {
+		/*
+		 * OK, it can.  Can we now merge in the successor as well?
+		 */
+		if (next && end == next->vm_start &&
+				mpol_equal(policy, vma_policy(next)) &&
+				can_vma_merge_before(next, vm_flags,
+					anon_vma, file, pgoff+pglen) &&
+				is_mergeable_anon_vma(prev->anon_vma,
+						      next->anon_vma, NULL)) {
+							/* cases 1, 6 */
+			err = vma_adjust(prev, prev->vm_start,
+				next->vm_end, prev->vm_pgoff, NULL); // 从 prev->vm_start 到 next->vm_end 合并
+		} else					/* cases 2, 5, 7 */
+			err = vma_adjust(prev, prev->vm_start,
+				end, prev->vm_pgoff, NULL);  // 从 prev->vm_start 到 end 合并
+		if (err)
+			return NULL;
+		khugepaged_enter_vma_merge(prev, vm_flags);
+		return prev;
+	}
+
+	/*
+	 * Can this new request be merged in front of next?
+	 */
+	if (next && end == next->vm_start &&
+			mpol_equal(policy, vma_policy(next)) &&
+			can_vma_merge_before(next, vm_flags,
+					anon_vma, file, pgoff+pglen)) {
+		if (prev && addr < prev->vm_end)	/* case 4 */
+			err = vma_adjust(prev, prev->vm_start,
+				addr, prev->vm_pgoff, NULL);
+		else					/* cases 3, 8 */
+			err = vma_adjust(area, addr, next->vm_end,
+				next->vm_pgoff - pglen, NULL);
+		if (err)
+			return NULL;
+		khugepaged_enter_vma_merge(area, vm_flags);
+		return area;
+	}
+
+	return NULL;
+}
+```
+![](./pic/54.jpg)
+
+# malloc
+malloc是个内存池，底层使用brk分配
+```c
+SYSCALL_DEFINE1(brk, unsigned long, brk)
+{
+	unsigned long retval;
+	unsigned long newbrk, oldbrk;
+	struct mm_struct *mm = current->mm;
+	unsigned long min_brk;
+	bool populate;
+
+	down_write(&mm->mmap_sem);
+
+	if (current->brk_randomized)
+		min_brk = mm->start_brk;
+	else
+		min_brk = mm->end_data;
+	if (brk < min_brk) // 如果brk小于最小值，无效
+		goto out;
+
+	if (check_data_rlimit(rlimit(RLIMIT_DATA), brk, mm->start_brk,
+			      mm->end_data, mm->start_data))
+		goto out;
+
+	newbrk = PAGE_ALIGN(brk);
+	oldbrk = PAGE_ALIGN(mm->brk);
+	if (oldbrk == newbrk)
+		goto set_brk;
+
+	/* Always allow shrinking brk. */
+	if (brk <= mm->brk) { // 如果brk向下移动，则释放堆空间
+		if (!do_munmap(mm, newbrk, oldbrk-newbrk))
+			goto set_brk;
+		goto out;
+	}
+
+	/* Check against existing mmap mappings. */  // 是否通过mmap分配了
+	if (find_vma_intersection(mm, oldbrk, newbrk+PAGE_SIZE))
+		goto out;
+
+	/* Ok, looks good - let it rip. */  // 分配
+	if (do_brk(oldbrk, newbrk-oldbrk) != oldbrk)
+		goto out;
+
+set_brk:
+	mm->brk = brk;
+	// 如果用了VM_LOCKED ，通常来自系统调用mlockall，
+	// 则要立即分配物理页面，
+	// 否则会在用户进程访问这些虚拟页面，发生缺页中断时，才分配物理内存，并建立映射关系。
+	populate = newbrk > oldbrk && (mm->def_flags & VM_LOCKED) != 0;
+	up_write(&mm->mmap_sem);
+	if (populate)
+		mm_populate(oldbrk, newbrk - oldbrk);
+	return brk;
+
+out:
+	retval = mm->brk;
+	up_write(&mm->mmap_sem);
+	return retval;
+}
+```
+
+用户空间
+堆从end_data向上沿伸，栈从用户空间顶部向下沿伸
+![](./pic/55.jpg)
+
+```c
+static unsigned long do_brk(unsigned long addr, unsigned long len)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma, *prev;
+	unsigned long flags;
+	struct rb_node **rb_link, *rb_parent;
+	pgoff_t pgoff = addr >> PAGE_SHIFT;
+	int error;
+
+	len = PAGE_ALIGN(len);
+	if (!len)
+		return addr;
+
+	flags = VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
+
+	// 判断虚拟空间是否够用
+	error = get_unmapped_area(NULL, addr, len, 0, MAP_FIXED);
+	if (error & ~PAGE_MASK)
+		return error;
+
+	error = mlock_future_check(mm, mm->def_flags, len);
+	if (error)
+		return error;
+
+	/*
+	 * mm->mmap_sem is required to protect against another thread
+	 * changing the mappings in case we sleep.
+	 */
+	verify_mm_writelocked(mm);
+
+	/*
+	 * Clear old maps.  this also does some error checking for us
+	 */
+ munmap_back:
+ 	// 使用虚拟空间为 [addr, addr+len], 找到插入红黑树的位置
+	if (find_vma_links(mm, addr, addr + len, &prev, &rb_link, &rb_parent)) {
+		if (do_munmap(mm, addr, len)) // 如果和现有空间重叠，则释放这段重叠空间
+			return -ENOMEM;
+		goto munmap_back;
+	}
+
+	/* Check against address space limits *after* clearing old maps... */
+	if (!may_expand_vm(mm, len >> PAGE_SHIFT))
+		return -ENOMEM;
+
+	if (mm->map_count > sysctl_max_map_count)
+		return -ENOMEM;
+
+	if (security_vm_enough_memory_mm(mm, len >> PAGE_SHIFT))
+		return -ENOMEM;
+
+	/* Can we just expand an old private anonymous mapping? */
+	// 是否有vma 可以和 [addr, addr+len]合并，如果不行则新建vma
+	vma = vma_merge(mm, prev, addr, addr + len, flags,
+					NULL, NULL, pgoff, NULL);
+	if (vma)
+		goto out;
+
+	/*
+	 * create a vma struct for an anonymous mapping
+	 */
+	vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
+	if (!vma) {
+		vm_unacct_memory(len >> PAGE_SHIFT);
+		return -ENOMEM;
+	}
+
+	INIT_LIST_HEAD(&vma->anon_vma_chain);
+	vma->vm_mm = mm;
+	vma->vm_start = addr;
+	vma->vm_end = addr + len;
+	vma->vm_pgoff = pgoff;
+	vma->vm_flags = flags;
+	vma->vm_page_prot = vm_get_page_prot(flags);
+	//加入红黑树
+	vma_link(mm, vma, prev, rb_link, rb_parent);
+out:
+	perf_event_mmap(vma);
+	mm->total_vm += len >> PAGE_SHIFT;
+	if (flags & VM_LOCKED)
+		mm->locked_vm += (len >> PAGE_SHIFT);
+	vma->vm_flags |= VM_SOFTDIRTY;
+	return addr;
+}
+
+```
+
+### VM_LOCK
+mm_populate -> __mm_populate
+```c
+int __mm_populate(unsigned long start, unsigned long len, int ignore_errors)
+{
+	struct mm_struct *mm = current->mm;
+	unsigned long end, nstart, nend;
+	struct vm_area_struct *vma = NULL;
+	int locked = 0;
+	long ret = 0;
+
+	VM_BUG_ON(start & ~PAGE_MASK);
+	VM_BUG_ON(len != PAGE_ALIGN(len));
+	end = start + len;
+
+	for (nstart = start; nstart < end; nstart = nend) {
+		/*
+		 * We want to fault in pages for [nstart; end) address range.
+		 * Find first corresponding VMA.
+		 */
+		if (!locked) {
+			locked = 1;
+			down_read(&mm->mmap_sem);
+			vma = find_vma(mm, nstart);  // 找到虚拟空间
+		} else if (nstart >= vma->vm_end)
+			vma = vma->vm_next;
+		if (!vma || vma->vm_start >= end)
+			break;
+
+		/*
+		 * Set [nstart; nend) to intersection of desired address
+		 * range with the first VMA. Also, skip undesirable VMA types.
+		 */
+		// 根据vma和start,len调整 nend nstart
+		nend = min(end, vma->vm_end);
+		if (vma->vm_flags & (VM_IO | VM_PFNMAP))
+			continue;
+		if (nstart < vma->vm_start)
+			nstart = vma->vm_start;
+
+		/*
+		 * Now fault in a range of pages. __mlock_vma_pages_range()
+		 * double checks the vma flags, so that it won't mlock pages
+		 * if the vma was already munlocked.
+		 */
+		 // 尽可能的分配page ,并建立映射关系
+		ret = __mlock_vma_pages_range(vma, nstart, nend, &locked);
+		if (ret < 0) {
+			if (ignore_errors) {
+				ret = 0;
+				continue;	/* continue at next VMA */
+			}
+			ret = __mlock_posix_error_return(ret);
+			break;
+		}
+		nend = nstart + ret * PAGE_SIZE;
+		ret = 0;
+	}
+	if (locked)
+		up_read(&mm->mmap_sem);
+	return ret;	/* 0 or negative error code */
+}
+
+long __mlock_vma_pages_range(struct vm_area_struct *vma,
+		unsigned long start, unsigned long end, int *nonblocking)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long nr_pages = (end - start) / PAGE_SIZE;
+	int gup_flags;
+
+	VM_BUG_ON(start & ~PAGE_MASK);
+	VM_BUG_ON(end   & ~PAGE_MASK);
+	VM_BUG_ON_VMA(start < vma->vm_start, vma);
+	VM_BUG_ON_VMA(end   > vma->vm_end, vma);
+	VM_BUG_ON_MM(!rwsem_is_locked(&mm->mmap_sem), mm);
+
+	gup_flags = FOLL_TOUCH | FOLL_MLOCK;
+	/*
+	 * We want to touch writable mappings with a write fault in order
+	 * to break COW, except for shared mappings because these don't COW
+	 * and we would not want to dirty them for nothing.
+	 */
+	if ((vma->vm_flags & (VM_WRITE | VM_SHARED)) == VM_WRITE)
+		gup_flags |= FOLL_WRITE;
+
+	/*
+	 * We want mlock to succeed for regions that have any permissions
+	 * other than PROT_NONE.
+	 */
+	if (vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC))
+		gup_flags |= FOLL_FORCE;
+
+	/*
+	 * We made sure addr is within a VMA, so the following will
+	 * not result in a stack expansion that recurses back here.
+	 */
+	return __get_user_pages(current, mm, start, nr_pages, gup_flags,
+				NULL, NULL, nonblocking);
+}
+
+// get_user_pages是很重要的分配物理内存的接口，很多驱动用这个API来为用户态分配物理内存。
+long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+		unsigned long start, unsigned long nr_pages,
+		unsigned int gup_flags, struct page **pages,
+		struct vm_area_struct **vmas, int *nonblocking)
+{
+	long i = 0;
+	unsigned int page_mask;
+	struct vm_area_struct *vma = NULL;
+
+	if (!nr_pages)
+		return 0;
+
+	VM_BUG_ON(!!pages != !!(gup_flags & FOLL_GET));
+
+	/*
+	 * If FOLL_FORCE is set then do not force a full fault as the hinting
+	 * fault information is unrelated to the reference behaviour of a task
+	 * using the address space
+	 */
+	if (!(gup_flags & FOLL_FORCE))
+		gup_flags |= FOLL_NUMA;
+
+	do {
+		struct page *page;
+		unsigned int foll_flags = gup_flags;
+		unsigned int page_increm;
+
+		/* first iteration or cross vma bound */
+		if (!vma || start >= vma->vm_end) {
+			// 调用find_vma找vma,如果vma->start > start 则扩展vma 
+			vma = find_extend_vma(mm, start);
+			if (!vma && in_gate_area(mm, start)) {
+				int ret;
+				ret = get_gate_page(mm, start & PAGE_MASK,
+						gup_flags, &vma,
+						pages ? &pages[i] : NULL);
+				if (ret)
+					return i ? : ret;
+				page_mask = 0;
+				goto next_page;
+			}
+
+			if (!vma || check_vma_flags(vma, gup_flags))
+				return i ? : -EFAULT;
+			if (is_vm_hugetlb_page(vma)) {
+				i = follow_hugetlb_page(mm, vma, pages, vmas,
+						&start, &nr_pages, i,
+						gup_flags);
+				continue;
+			}
+		}
+retry:
+		/*
+		 * If we have a pending SIGKILL, don't keep faulting pages and
+		 * potentially allocating memory.
+		 */
+		 // 如果进程收到SIGKILL则退出
+		if (unlikely(fatal_signal_pending(current)))
+			return i ? i : -ERESTARTSYS;
+		// 在while中加cond_resched,判断本进程是否需要被调度，可以优化系统延迟
+		cond_resched();
+		// 判断虚拟空间是否已经分配了物理内存
+		page = follow_page_mask(vma, start, foll_flags, &page_mask);
+		if (!page) {
+			int ret;
+			// 如果没有分配page，则调用faultin_page，人为的触发缺页中断，handle_mm_fault是处理缺页中断的核心
+			ret = faultin_page(tsk, vma, start, &foll_flags,
+					nonblocking);
+			switch (ret) {
+			case 0:
+				goto retry;
+			case -EFAULT:
+			case -ENOMEM:
+			case -EHWPOISON:
+				return i ? i : ret;
+			case -EBUSY:
+				return i;
+			case -ENOENT:
+				goto next_page;
+			}
+			BUG();
+		}
+		if (IS_ERR(page))
+			return i ? i : PTR_ERR(page);
+		if (pages) {
+			pages[i] = page;
+			flush_anon_page(vma, page, start);
+			flush_dcache_page(page);
+			page_mask = 0;
+		}
+next_page:
+		if (vmas) {
+			vmas[i] = vma;
+			page_mask = 0;
+		}
+		page_increm = 1 + (~(start >> PAGE_SHIFT) & page_mask);
+		if (page_increm > nr_pages)
+			page_increm = nr_pages;
+		i += page_increm;
+		start += page_increm * PAGE_SIZE;
+		nr_pages -= page_increm;
+	} while (nr_pages);
+	return i;
+}
+
+struct page *follow_page_mask(struct vm_area_struct *vma,
+			      unsigned long address, unsigned int flags,
+			      unsigned int *page_mask)
+{
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd;
+	spinlock_t *ptl;
+	struct page *page;
+	struct mm_struct *mm = vma->vm_mm;
+
+	*page_mask = 0;
+
+	pgd = pgd_offset(mm, address);
+	pud = pud_offset(pgd, address);
+	pmd = pmd_offset(pud, address);
+	return follow_page_pte(vma, address, pmd, flags);
+}
+
+static struct page *follow_page_pte(struct vm_area_struct *vma,
+		unsigned long address, pmd_t *pmd, unsigned int flags)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	struct page *page;
+	spinlock_t *ptl;
+	pte_t *ptep, pte;
+
+retry:
+	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+	pte = *ptep;
+	if (!pte_present(pte)) { // pte对应页面是否在内存中
+		swp_entry_t entry;   // 处理不在内存中的情况
+		/*
+		 * KSM's break_ksm() relies upon recognizing a ksm page
+		 * even while it is being migrated, so for that case we
+		 * need migration_entry_wait().
+		 */
+		if (likely(!(flags & FOLL_MIGRATION)))
+			goto no_page;
+		if (pte_none(pte))
+			goto no_page;
+		entry = pte_to_swp_entry(pte);
+		if (!is_migration_entry(entry))
+			goto no_page;
+		pte_unmap_unlock(ptep, ptl);
+		migration_entry_wait(mm, pmd, address);
+		goto retry;
+	}
+
+	if ((flags & FOLL_NUMA) && pte_protnone(pte))
+		goto no_page;
+	if ((flags & FOLL_WRITE) && !pte_write(pte)) {
+		pte_unmap_unlock(ptep, ptl);
+		return NULL;
+	}
+
+	page = vm_normal_page(vma, address, pte);
+	if (unlikely(!page)) {
+		if ((flags & FOLL_DUMP) ||
+		    !is_zero_pfn(pte_pfn(pte)))
+			goto bad_page;
+		page = pte_page(pte);
+	}
+
+	if (flags & FOLL_GET)
+		get_page_foll(page);
+	if (flags & FOLL_TOUCH) {
+		if ((flags & FOLL_WRITE) &&
+		    !pte_dirty(pte) && !PageDirty(page))
+			set_page_dirty(page);
+		/*
+		 * pte_mkyoung() would be more correct here, but atomic care
+		 * is needed to avoid losing the dirty bit: it is easier to use
+		 * mark_page_accessed().
+		 */
+		mark_page_accessed(page);
+	}
+	if ((flags & FOLL_MLOCK) && (vma->vm_flags & VM_LOCKED)) {
+		/*
+		 * The preliminary mapping check is mainly to avoid the
+		 * pointless overhead of lock_page on the ZERO_PAGE
+		 * which might bounce very badly if there is contention.
+		 *
+		 * If the page is already locked, we don't need to
+		 * handle it now - vmscan will handle it later if and
+		 * when it attempts to reclaim the page.
+		 */
+		if (page->mapping && trylock_page(page)) {
+			lru_add_drain();  /* push cached pages to LRU */
+			/*
+			 * Because we lock page here, and migration is
+			 * blocked by the pte's page reference, and we
+			 * know the page is still mapped, we don't even
+			 * need to check for file-cache page truncation.
+			 */
+			mlock_vma_page(page);
+			unlock_page(page);
+		}
+	}
+	pte_unmap_unlock(ptep, ptl);
+	return page;
+bad_page:
+	pte_unmap_unlock(ptep, ptl);
+	return ERR_PTR(-EFAULT);
+
+no_page:
+	pte_unmap_unlock(ptep, ptl);
+	if (!pte_none(pte))
+		return NULL;
+	return no_page_table(vma, flags);
+}
+```
+比较重要的函数
+follow_page : 查询页表， 通过虚拟地址addr找对应的page
+
