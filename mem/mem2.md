@@ -3530,3 +3530,328 @@ no_page:
 比较重要的函数
 follow_page : 查询页表， 通过虚拟地址addr找对应的page
 
+# mmap
+mmap 的flags参数很重要：
+MAP_SHARED : 创建共享映射区域，如果共享映射区域关联了文件，修改的内容会同步到磁盘文件。
+MAP_PRIVATE : 创建写时复制映射，修改后的内容不会同步到文件。
+MAP_ANONYMOUSE : 创建匿名映射，即没有关联文件
+MAP_FIXED : 使用参数addr创建映射，如果内核无法指定映射的addr，那么mmap会返回失败，参数addr要求页对齐，如果addr和length指定的进程地址空间和已有的VMA区域重叠，那么内存调用do_munmap函数把这段重叠区销毁，然后重新创建新的内容。
+MAP_POPULATE : 对于文件映射，会提前预读文件内容到映射区，该特性只支持私有映射。
+
+## mmap的使用场景
+### 私有匿名映射
+fd = -1, flags = MAP_ANONYMOUSE | MAP_PRIVATE, 私有匿名映射的最常见用途是glibc分配大块内存，当需要分配的内存大于MMAP_THREASHOLD(128KB)时，glibc默认使用mmap代替brk.
+MAP_PRIVATE会导致写时复制，也就是fork后父子进程谁写了私有映射，谁进行复制。
+
+### 共享匿名映射
+fd = -1, flags = MAP_ANONYMOUSE | MAP_SHARED, 共享匿名映射让相关进程共享一块内存区域，通常用于父子进程间通信。
+有两种方式创建共享匿名映射
+1. fd = -1 ，flags = MAP_ANONYMOUSE | MAP_SHARED, 这种情况下，do_mmap_pgoff->mmap_region最终调用shmem_zero_setup打开特殊的设备文件/dev/zero
+2. 直接打开/dev/zero，然后使用这个文件句柄来创建mmap
+这两种方式最终都是调用到shmem模块创建共享匿名映射
+
+### 私有文件映射
+fd != -1, flags = MAP_PRIVATE，私有文件映射最常见场景是加载动态链接库。
+
+### 共享文件映射
+fd != -1, flags = MAP_SHARED, 如果prot=PROT_WRITE，那么打开文件时需要指定O_RDWR。通常用于两个场景
+1. 读写文件，把文件内容映射到进程地址空间，同时对映射的内容做了修改，内核的写回机制最终会把修改的内容同步到磁盘中
+2. 进程间通信
+
+## mmap的流程
+![](./56.jpg)
+可以看出mmap和brk类似，只是多了文件映射和匿名映射的分别.
+并且mmap通常也是建立VMA，通过缺页中断分配物理内存。
+
+关于mmap的问题
+在一个播放系统中同时打开几十个不同的高清视频文件，发现播放卡顿，打开文件是使用mmap，请分析原因。
+由于mmap返回后并没有分配物理内容，当发生缺页中断时，才去读取磁盘中的文件，所以每次播放器真正读取文件时，会导致频繁的缺页中断，而磁盘读取性能差，导致播放视频卡顿。
+
+有些读者认为创建mmap后调用madvise(add, len, MADV_WILLNEED | MADV_SEQUENTIAL)对文件内容提前进行预读和顺序读，有利于改善磁盘读性能，但实际情况是：
+MADV_WILLNEED会立即启动磁盘IO进行预读，仅预读指定len长度，因此读取新区域时，要重新调用MADV_WILLNEED，显然不适合于流媒体。
+MADV_SEQUENTIAL有用，但改进不大。
+对于此问题，能够有效提高流媒体服务IO性能的方法是增大内容默认的预读窗口，现在默认预读大小是128KB，可以通过blockdev --setra命令修改。
+
+# 缺页中断处理
+当进程访问没有建立映射关系的内存（虚拟内存），处理器自动触发缺页中断。
+缺页中断要考虑很多细节：匿名页面，KSM页面，page cache页面，写时复制，私有映射，共享映射等。
+
+## do_page_fault
+硬件中断 -> 中断向量表 -> ... -> do_page_fault
+```c
+static int __kprobes
+do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+{
+	struct task_struct *tsk;
+	struct mm_struct *mm;
+	int fault, sig, code;
+	unsigned int flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE;
+
+	if (notify_page_fault(regs, fsr))
+		return 0;
+
+	tsk = current;
+	mm  = tsk->mm;
+
+	/* Enable interrupts if they were enabled in the parent context. */
+	if (interrupts_enabled(regs))
+		local_irq_enable();
+
+	/*
+	 * If we're in an interrupt or have no user
+	 * context, we must not take the fault..
+	 */
+	if (in_atomic() || !mm)
+		goto no_context;
+
+	if (user_mode(regs))
+		flags |= FAULT_FLAG_USER;
+	if (fsr & FSR_WRITE)
+		flags |= FAULT_FLAG_WRITE;
+
+	/*
+	 * As per x86, we may deadlock here.  However, since the kernel only
+	 * validly references user space from well defined areas of the code,
+	 * we can bug out early if this is from code which shouldn't.
+	 */
+	// down_read_trylock返回1，成功获得锁，返回0，失败获得锁
+	if (!down_read_trylock(&mm->mmap_sem)) {
+		// 如果失败，且是内核进程则直接oops
+		if (!user_mode(regs) && !search_exception_tables(regs->ARM_pc))
+			goto no_context;
+		// 如果是用户进程则睡眠等待锁释放
+retry:
+		down_read(&mm->mmap_sem);
+	} else {
+		/*
+		 * The above down_read_trylock() might have succeeded in
+		 * which case, we'll have missed the might_sleep() from
+		 * down_read()
+		 */
+		might_sleep();
+	}
+
+	fault = __do_page_fault(mm, addr, fsr, flags, tsk);
+
+	/* If we need to retry but a fatal signal is pending, handle the
+	 * signal first. We do not need to release the mmap_sem because
+	 * it would already be released in __lock_page_or_retry in
+	 * mm/filemap.c. */
+	if ((fault & VM_FAULT_RETRY) && fatal_signal_pending(current))
+		return 0;
+
+	/*
+	 * Major/minor page fault accounting is only done on the
+	 * initial attempt. If we go through a retry, it is extremely
+	 * likely that the page will be found in page cache at that point.
+	 */
+
+	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
+	if (!(fault & VM_FAULT_ERROR) && flags & FAULT_FLAG_ALLOW_RETRY) {
+		if (fault & VM_FAULT_MAJOR) {
+			tsk->maj_flt++;
+			perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS_MAJ, 1,
+					regs, addr);
+		} else {
+			tsk->min_flt++;
+			perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS_MIN, 1,
+					regs, addr);
+		}
+		if (fault & VM_FAULT_RETRY) {
+			/* Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk
+			* of starvation. */
+			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+			flags |= FAULT_FLAG_TRIED;
+			goto retry;
+		}
+	}
+
+	up_read(&mm->mmap_sem);
+
+	// 处理返回情况
+	// 缺页处理成功
+	/*
+	 * Handle the "normal" case first - VM_FAULT_MAJOR / VM_FAULT_MINOR
+	 */
+	if (likely(!(fault & (VM_FAULT_ERROR | VM_FAULT_BADMAP | VM_FAULT_BADACCESS))))
+		return 0;
+
+	/*
+	 * If we are in kernel mode at this point, we
+	 * have no context to handle this fault with.
+	 */
+	 // 如果是内核进程，直接进行oops
+	if (!user_mode(regs))
+		goto no_context;
+
+	if (fault & VM_FAULT_OOM) {
+		/*
+		 * We ran out of memory, call the OOM killer, and return to
+		 * userspace (which will retry the fault, or kill us if we
+		 * got oom-killed)
+		 */
+		pagefault_out_of_memory();
+		return 0;
+	}
+
+	if (fault & VM_FAULT_SIGBUS) {
+		/*
+		 * We had some memory, but were unable to
+		 * successfully fix up this page fault.
+		 */
+		sig = SIGBUS;
+		code = BUS_ADRERR;
+	} else {
+		/*
+		 * Something tried to access memory that
+		 * isn't in our memory map..
+		 */
+		sig = SIGSEGV;
+		code = fault == VM_FAULT_BADACCESS ?
+			SEGV_ACCERR : SEGV_MAPERR;
+	}
+	// 对于用户进程发送信号 SIGSEGV
+	__do_user_fault(tsk, addr, fsr, sig, code, regs);
+	return 0;
+
+no_context:
+	// 内核进程缺页处理失败,oops
+	__do_kernel_fault(mm, addr, fsr, regs);
+	return 0;
+}
+```
+
+```c
+static inline bool access_error(unsigned int fsr, struct vm_area_struct *vma)
+{
+	unsigned int mask = VM_READ | VM_WRITE | VM_EXEC;
+
+	if (fsr & FSR_WRITE)
+		mask = VM_WRITE;
+	if (fsr & FSR_LNX_PF)
+		mask = VM_EXEC;
+
+	return vma->vm_flags & mask ? false : true;
+}
+
+static int __kprobes
+__do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned int fsr,
+		unsigned int flags, struct task_struct *tsk)
+{
+	struct vm_area_struct *vma;
+	int fault;
+
+	// 找VMA，如果没有分配相关虚拟内存则错误
+	vma = find_vma(mm, addr);
+	fault = VM_FAULT_BADMAP;
+	if (unlikely(!vma))
+		goto out;
+	if (unlikely(vma->vm_start > addr))
+		goto check_stack;
+
+	/*
+	 * Ok, we have a good vm_area for this
+	 * memory access, so we can handle it.
+	 */
+good_area:
+	// 查看虚拟内存区域是否有相关权限
+	if (access_error(fsr, vma)) {
+		fault = VM_FAULT_BADACCESS;
+		goto out;
+	}
+
+	return handle_mm_fault(mm, vma, addr & PAGE_MASK, flags);
+
+check_stack:
+	/* Don't allow expansion below FIRST_USER_ADDRESS */
+	if (vma->vm_flags & VM_GROWSDOWN &&
+	    addr >= FIRST_USER_ADDRESS && !expand_stack(vma, addr))
+		goto good_area;
+out:
+	return fault;
+}
+```
+
+```c
+handle_mm_fault -> __handle_mm_fault
+
+static int __handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+			     unsigned long address, unsigned int flags)
+{
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	if (unlikely(is_vm_hugetlb_page(vma)))
+		return hugetlb_fault(mm, vma, address, flags);
+
+	pgd = pgd_offset(mm, address);
+	pud = pud_alloc(mm, pgd, address);
+	if (!pud)
+		return VM_FAULT_OOM;
+	pmd = pmd_alloc(mm, pud, address);
+	if (!pmd)
+		return VM_FAULT_OOM;
+	if (pmd_none(*pmd) && transparent_hugepage_enabled(vma)) {
+		int ret = VM_FAULT_FALLBACK;
+		if (!vma->vm_ops)
+			ret = do_huge_pmd_anonymous_page(mm, vma, address,
+					pmd, flags);
+		if (!(ret & VM_FAULT_FALLBACK))
+			return ret;
+	} else {
+		pmd_t orig_pmd = *pmd;
+		int ret;
+
+		barrier();
+		if (pmd_trans_huge(orig_pmd)) {
+			unsigned int dirty = flags & FAULT_FLAG_WRITE;
+
+			/*
+			 * If the pmd is splitting, return and retry the
+			 * the fault.  Alternative: wait until the split
+			 * is done, and goto retry.
+			 */
+			if (pmd_trans_splitting(orig_pmd))
+				return 0;
+
+			if (pmd_protnone(orig_pmd))
+				return do_huge_pmd_numa_page(mm, vma, address,
+							     orig_pmd, pmd);
+
+			if (dirty && !pmd_write(orig_pmd)) {
+				ret = do_huge_pmd_wp_page(mm, vma, address, pmd,
+							  orig_pmd);
+				if (!(ret & VM_FAULT_FALLBACK))
+					return ret;
+			} else {
+				huge_pmd_set_accessed(mm, vma, address, pmd,
+						      orig_pmd, dirty);
+				return 0;
+			}
+		}
+	}
+
+	/*
+	 * Use __pte_alloc instead of pte_alloc_map, because we can't
+	 * run pte_offset_map on the pmd, if an huge pmd could
+	 * materialize from under us from a different thread.
+	 */
+	if (unlikely(pmd_none(*pmd)) &&
+	    unlikely(__pte_alloc(mm, vma, pmd, address)))
+		return VM_FAULT_OOM;
+	/* if an huge pmd materialized from under us just retry later */
+	if (unlikely(pmd_trans_huge(*pmd)))
+		return 0;
+	/*
+	 * A regular pmd is established and it can't morph into a huge pmd
+	 * from under us anymore at this point because we hold the mmap_sem
+	 * read mode and khugepaged takes it in write mode. So now it's
+	 * safe to run pte_offset_map().
+	 */
+	pte = pte_offset_map(pmd, address);
+
+	return handle_pte_fault(mm, vma, address, pte, pmd, flags);
+}
+```
