@@ -4135,7 +4135,8 @@ oom:
 }
 ```
 
-## 私有页写时复制
+## 页缓存存在，pte没有可写属性，但希望进行写操作。
+
 			return do_wp_page(mm, vma, address,
 ```c
 static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
@@ -4152,16 +4153,11 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	unsigned long mmun_end = 0;	/* For mmu_notifiers */
 	struct mem_cgroup *memcg;
 
+	// 如果old_page为NULL，说明是一个special mapping的页面。
 	old_page = vm_normal_page(vma, address, orig_pte);
 	if (!old_page) {
-		/*
-		 * VM_MIXEDMAP !pfn_valid() case, or VM_SOFTDIRTY clear on a
-		 * VM_PFNMAP VMA.
-		 *
-		 * We should not cow pages in a shared writeable mapping.
-		 * Just mark the pages writable as we can't do any dirty
-		 * accounting on raw pfn maps.
-		 */
+		// 如果VAM属性是可写且共享的，则继续使用此页面，
+		// 否则跳到gotten分配新页面进行写时复制
 		if ((vma->vm_flags & (VM_WRITE|VM_SHARED)) ==
 				     (VM_WRITE|VM_SHARED))
 			goto reuse;
@@ -4172,25 +4168,23 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	 * Take out anonymous pages first, anonymous shared vmas are
 	 * not dirty accountable.
 	 */
+	 // 是匿名页面且不是KSM页面
 	if (PageAnon(old_page) && !PageKsm(old_page)) {
-		if (!trylock_page(old_page)) {
-			page_cache_get(old_page);
+		if (!trylock_page(old_page)) { // 避免其他进程正在操作此页面，成功返回true，失败返回false
+			page_cache_get(old_page);  // 增加_count
 			pte_unmap_unlock(page_table, ptl);
-			lock_page(old_page);
+			lock_page(old_page); // 睡眠在page的锁上，直到其他进程释放锁
 			page_table = pte_offset_map_lock(mm, pmd, address,
 							 &ptl);
 			if (!pte_same(*page_table, orig_pte)) {
-				unlock_page(old_page);
+				unlock_page(old_page); // 如果其他线程修改了pte，跳到unlock，不需要再次处理
 				goto unlock;
 			}
 			page_cache_release(old_page);
 		}
-		if (reuse_swap_page(old_page)) {
-			/*
-			 * The page is all ours.  Move it to our anon_vma so
-			 * the rmap code will not search our parent or siblings.
-			 * Protected against the rmap code by the page lock.
-			 */
+#define reuse_swap_page(page)	(page_mapcount(page) == 1)
+		if (reuse_swap_page(old_page)) { // old_page是否只有一个进程映射
+			// 若只有一个进程映射，则继续使用此页面
 			page_move_anon_rmap(old_page, vma, address);
 			unlock_page(old_page);
 			goto reuse;
@@ -4198,7 +4192,8 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
 		unlock_page(old_page);
 	} else if (unlikely((vma->vm_flags & (VM_WRITE|VM_SHARED)) ==
 					(VM_WRITE|VM_SHARED))) {
-		page_cache_get(old_page);
+		// 如果是page cache，且VMA需要写且共享
+		page_cache_get(old_page); // page->_count++
 		/*
 		 * Only catch write-faults on shared writable pages,
 		 * read-only shared pages can get COWed by
@@ -4208,7 +4203,7 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
 			int tmp;
 
 			pte_unmap_unlock(page_table, ptl);
-			tmp = do_page_mkwrite(vma, old_page, address);
+			tmp = do_page_mkwrite(vma, old_page, address); // 将pte改成可写且通知其他等待其可写的进程
 			if (unlikely(!tmp || (tmp &
 					(VM_FAULT_ERROR | VM_FAULT_NOPAGE)))) {
 				page_cache_release(old_page);
@@ -4232,6 +4227,7 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
 		dirty_shared = true;
 
 reuse:
+		// 复用页面，可能是单身匿名页面，共享special mapping，共享写页缓存
 		/*
 		 * Clear the pages cpupid information as the existing
 		 * information potentially belongs to a now completely
@@ -4241,9 +4237,9 @@ reuse:
 			page_cpupid_xchg_last(old_page, (1 << LAST_CPUPID_SHIFT) - 1);
 
 		flush_cache_page(vma, address, pte_pfn(orig_pte));
-		entry = pte_mkyoung(orig_pte);
-		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
-		if (ptep_set_access_flags(vma, address, page_table, entry,1))
+		entry = pte_mkyoung(orig_pte); // L_PTE_YOUNG 表示页面最近被访问过，不适合被swap
+		entry = maybe_mkwrite(pte_mkdirty(entry), vma); // entry添加写权限
+		if (ptep_set_access_flags(vma, address, page_table, entry,1)) // 修改*pte = entry
 			update_mmu_cache(vma, address, page_table);
 		pte_unmap_unlock(page_table, ptl);
 		ret |= VM_FAULT_WRITE;
@@ -4286,6 +4282,7 @@ gotten:
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
 
+	// 分配新页面
 	if (is_zero_pfn(pte_pfn(orig_pte))) {
 		new_page = alloc_zeroed_user_highpage_movable(vma, address);
 		if (!new_page)
@@ -4294,7 +4291,7 @@ gotten:
 		new_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, address);
 		if (!new_page)
 			goto oom;
-		cow_user_page(new_page, old_page, address, vma);
+		cow_user_page(new_page, old_page, address, vma); // 将 old_page内容拷贝到new_page
 	}
 	__SetPageUptodate(new_page);
 
@@ -4318,8 +4315,8 @@ gotten:
 		} else
 			inc_mm_counter_fast(mm, MM_ANONPAGES);
 		flush_cache_page(vma, address, pte_pfn(orig_pte));
-		entry = mk_pte(new_page, vma->vm_page_prot);
-		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+		entry = mk_pte(new_page, vma->vm_page_prot); // 使用new_page构造新entry
+		entry = maybe_mkwrite(pte_mkdirty(entry), vma); // entry添加可写属性
 		/*
 		 * Clear the pte entry and flush it first, before updating the
 		 * pte with the new entry. This will avoid a race condition
@@ -4335,7 +4332,7 @@ gotten:
 		 * mmu page tables (such as kvm shadow page tables), we want the
 		 * new page to be mapped directly into the secondary page table.
 		 */
-		set_pte_at_notify(mm, address, page_table, entry);
+		set_pte_at_notify(mm, address, page_table, entry); // 修改本进程的pte
 		update_mmu_cache(vma, address, page_table);
 		if (old_page) {
 			/*
@@ -4364,7 +4361,7 @@ gotten:
 		}
 
 		/* Free the old page.. */
-		new_page = old_page;
+		new_page = old_page; // 方便之后将old_page->_count--
 		ret |= VM_FAULT_WRITE;
 	} else
 		mem_cgroup_cancel_charge(new_page, memcg);
@@ -4396,4 +4393,32 @@ oom:
 	return VM_FAULT_OOM;
 }
 ```
+
+## 小结
+1. 匿名页面缺页中断 do_anonymous_page
+(1) 判断条件: pte的PRESENT没有置为，pte内容为空且没有指定vma->vm_ops->fault()
+(2) 应用场景：malloc分配内存
+
+2. 文件映射缺页中断 do_fault
+(1) 判断条件: pte的PRESENT没有置为，pte内容为空且指定vma->vm_ops->fault()函数指针
+* 如果发送读错误，调用 do_read_fault去读取这个页面
+* 如果私有映射VMA中发生写保护错误，那么发生写时复制，分配新页面，将旧页面复制，利用新页面生成pte entry并设置页表项.
+* 如果共享映射VMA中发生写保护错误，那么产生脏页，用回写机制回写脏页。
+(2) 应用场景：malloc分配内存
+* mmap读取文件内容
+* 动态库映射
+
+3. swap缺页 do_swap_page
+(1) 判断条件: pte的PRESENT没有置为，pte内容不为空
+
+4. 写时复制缺页中断 do_wp_page
+(1) do_wp_page最终处理两种情况
+* reuse 复用 old_page : 单身匿名页面和可写的共享页面
+* gotten 写时复制 : 非单生匿名页面，只读或非共享的文件映射页面
+
+(2) 判断条件 : pte页表项中PRESENT置位，且发生了写错误缺页中断
+
+(3) 应用场景 : fork，父子进程共享父进程匿名页面，属性为只读，当一方需要写时，发生写时复制
+
+
 
