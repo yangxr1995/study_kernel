@@ -304,7 +304,7 @@ struct sk_buff {
 	atomic_t		users;
 };
 ```
-## sock_create
+## sys_socket
 socket系统调用最终由sock_create处理
 ```c
 long sys_socket(int family, int type, int protocol)
@@ -314,24 +314,35 @@ long sys_socket(int family, int type, int protocol)
 	return retval; // 返回文件描述符
 ```
 
+### sock_map_fd
 sock_map_fd 将 socket 映射到 fd
 ```c
 int sock_map_fd(struct socket *sock)
 {
 	struct file *newfile;
-	int fd = sock_alloc_fd(&newfile);
+	int fd = sock_alloc_fd(&newfile); // 分配空闲fd, 分配 struct file
 		fd = get_unused_fd();
 		return fd;
 
 	if (likely(fd >= 0)) {
 		int err = sock_attach_fd(sock, newfile);
-			dentry = d_alloc(sock_mnt->mnt_sb->s_root, &name);
+			struct qstr name = { .name = "" };
+
+			dentry = d_alloc(sock_mnt->mnt_sb->s_root, &name);  // 分配dentry,初始化
+																// 设置sb,和parent
+				dentry = kmem_cache_alloc(dentry_cache, GFP_KERNEL);
+				dentry->d_parent = dget(parent);
+				dentry->d_sb = parent->d_sb;
+				...
+
 			dentry->d_op = &sockfs_dentry_operations;
 			d_instantiate(dentry, SOCK_INODE(sock)); // 将dentry 和 sock相关inode绑定
 			sock->file = file;
+
 			init_file(file, sock_mnt, dentry, FMODE_READ | FMODE_WRITE,
 				  &socket_file_ops);
 				file->f_op = fop; // socket_file_ops
+
 			SOCK_INODE(sock)->i_fop = &socket_file_ops;
 			file->f_flags = O_RDWR;
 			file->f_pos = 0;
@@ -348,11 +359,19 @@ int sock_map_fd(struct socket *sock)
 }
 ```
 
-sock_create
+### sock_create
+1. 分配并建立关系file fd inode
+2. 分配并建立关系socket sock prot
+最终建立关系
+![](./pic/1.jpg)
 ```c
 int sock_create(int family, int type, int protocol, struct socket **res)
 	return __sock_create(current->nsproxy->net_ns, family, type, protocol, res, 0);
 
+struct socket_alloc {
+	struct socket socket;
+	struct inode vfs_inode;
+};
 
 static int __sock_create(struct net *net, int family, int type, int protocol,
 			 struct socket **res, int kern)
@@ -369,7 +388,7 @@ static int __sock_create(struct net *net, int family, int type, int protocol,
 
 	...
 
-	sock = sock_alloc(); // 创建sock
+	sock = sock_alloc(); // 创建socket
 		struct inode *inode;
 		struct socket *sock;
 
@@ -392,9 +411,14 @@ static int __sock_create(struct net *net, int family, int type, int protocol,
 
 	pf = rcu_dereference(net_families[family]); // 获得协议族操作函数表
 
-	err = pf->create(net, sock, protocol); // 执行协议族创建
+	err = pf->create(net, sock, protocol); 	// 执行协议族创建
+											// 如果 family为 AF_INET
+											// 则调用 inet_create
+											// 完成创建 sock, 找到 prot
+											// 绑定 socket的sock，sock 的 prot
+											// 初始化 socket , sock
 
-	*res = sock; // 返回sock
+	*res = sock; // 返回socket
 
 	return 0;
 }
@@ -441,6 +465,11 @@ static int __init af_unix_init(void)
 ```
 
 如果使用AF_INET调用 socket，则 sock_create -> inet_create
+### inet_create
+大致完成下述功能
+0. 根据protocol 找到 struct prot prot
+1. 分配struct sock sk, 绑定 sock  prot socket
+2. 初始化 socket sock
 ```c
 static int inet_create(struct net *net, struct socket *sock, int protocol)
 {
@@ -466,6 +495,14 @@ static int inet_create(struct net *net, struct socket *sock, int protocol)
 lookup_protocol:
 	err = -ESOCKTNOSUPPORT;
 	rcu_read_lock();
+
+	// protocol 有三种 
+	// 	IPPROTO_IP :  虚拟IP类型，和SOCK_RAW 使用，表示原始套接字
+	//	IPPROTO_TCP : 和 SOCK_STREAM 使用，表示TCP
+	//	IPPROTO_UDP : 和 SOCK_DGRAM 使用，表示UDP
+	//
+	// static struct list_head inetsw[SOCK_MAX]; 预先注册好的 struct inet_protosw
+	// inet_init -> inet_register_protosw 完成注册
 	list_for_each_rcu(p, &inetsw[sock->type]) {
 		answer = list_entry(p, struct inet_protosw, list);
 
@@ -516,18 +553,27 @@ lookup_protocol:
 	if (!inet_netns_ok(net, protocol))
 		goto out_rcu_unlock;
 
-	sock->ops = answer->ops;
-	answer_prot = answer->prot;
-	answer_no_check = answer->no_check;
-	answer_flags = answer->flags;
+	// 如果protocol 为 IPPROTO_TCP , 则 answer 为 inetsw_array[0]
+	// 则下面的值为
+
+	sock->ops = answer->ops;			// inet_stream_ops
+	answer_prot = answer->prot;			// tcp_prot
+	answer_no_check = answer->no_check;	// 0
+	answer_flags = answer->flags;		// INET_PROTOSW_PERMANENT | INET_PROTOSW_ICSK
 	rcu_read_unlock();
 
 	BUG_TRAP(answer_prot->slab != NULL);
 
 	err = -ENOBUFS;
 	sk = sk_alloc(net, PF_INET, GFP_KERNEL, answer_prot);
-	if (sk == NULL)
-		goto out;
+			struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
+					  struct proto *prot)
+			struct sock *sk;
+			sk = sk_prot_alloc(prot, priority | __GFP_ZERO, family);
+			sk->sk_family = family;
+			sk->sk_prot = sk->sk_prot_creator = prot; // 建立struct sock和 struct proto 关系
+														// 此处 sk->sk_prot为 tcp_prot
+			sock_net_set(sk, get_net(net)); // sk->sk_net = net;
 
 	err = 0;
 	sk->sk_no_check = answer_no_check;
@@ -550,7 +596,10 @@ lookup_protocol:
 
 	inet->id = 0;
 
-	sock_init_data(sock, sk);
+	sock_init_data(sock, sk); // 绑定 struct socket  和 struct sock
+		void sock_init_data(struct socket *sock, struct sock *sk)
+		sock->sk	=	sk;
+		...
 
 	sk->sk_destruct	   = inet_sock_destruct;
 	sk->sk_family	   = PF_INET;
@@ -577,7 +626,7 @@ lookup_protocol:
 	}
 
 	if (sk->sk_prot->init) {
-		err = sk->sk_prot->init(sk);
+		err = sk->sk_prot->init(sk); // tcp_v4_init_sock
 		if (err)
 			sk_common_release(sk);
 	}
@@ -587,4 +636,424 @@ out_rcu_unlock:
 	rcu_read_unlock();
 	goto out;
 }
+```
+
+#### tcp_v4_init_sock
+```c
+static int tcp_v4_init_sock(struct sock *sk)
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	skb_queue_head_init(&tp->out_of_order_queue);
+	tcp_init_xmit_timers(sk);
+	tcp_prequeue_init(tp);
+
+	icsk->icsk_rto = TCP_TIMEOUT_INIT;
+	tp->mdev = TCP_TIMEOUT_INIT;
+
+	tp->snd_cwnd = 2;
+
+	tp->snd_ssthresh = 0x7fffffff;	/* Infinity */
+	tp->snd_cwnd_clamp = ~0;
+	tp->mss_cache = 536;
+
+	tp->reordering = sysctl_tcp_reordering;
+	icsk->icsk_ca_ops = &tcp_init_congestion_ops;
+
+	sk->sk_state = TCP_CLOSE;
+
+	sk->sk_write_space = sk_stream_write_space;
+	sock_set_flag(sk, SOCK_USE_WRITE_QUEUE);
+
+	icsk->icsk_af_ops = &ipv4_specific;
+	icsk->icsk_sync_mss = tcp_sync_mss;
+
+	sk->sk_sndbuf = sysctl_tcp_wmem[1];
+	sk->sk_rcvbuf = sysctl_tcp_rmem[1];
+```
+##### sock inet_sock inet_connection_sock tcp_sock 的关系
+```c
+struct sock {
+	/*
+	 * Now struct inet_timewait_sock also uses sock_common, so please just
+	 * don't add nothing before this first member (__sk_common) --acme
+	 */
+	struct sock_common	__sk_common;
+	...
+
+struct inet_sock {
+	/* sk and pinet6 has to be the first two members of inet_sock */
+	struct sock		sk;
+	...
+
+struct inet_connection_sock {
+	/* inet_sock has to be the first member! */
+	struct inet_sock	  icsk_inet;
+	...
+
+struct tcp_sock {
+	/* inet_connection_sock has to be the first member of tcp_sock */
+	struct inet_connection_sock	inet_conn;
+	...
+
+```
+sock 派生 inet_sock 派生 inet_connection_sock 派生 tcp_sock
+他们的关系
+![](./pic/2.jpg)
+
+### sock的构造和协议的注册
+以 family 为 AF_INET 为例
+```c
+static int __init inet_init(void)
+	// 注册AF_INET支持的协议
+	// struct proto 类型
+	// proto_register 将 prot 加入 proto_list 全局变量
+	rc = proto_register(&tcp_prot, 1);
+	rc = proto_register(&udp_prot, 1);
+	rc = proto_register(&raw_prot, 1);
+
+	// 安装协议族的ops到 net_families
+	(void)sock_register(&inet_family_ops);
+
+	// 安装基础协议
+	// struct net_protocol 类型
+	// 将 net_protocol 注册到 inet_protos[]
+	if (inet_add_protocol(&icmp_protocol, IPPROTO_ICMP) < 0)
+		printk(KERN_CRIT "inet_init: Cannot add ICMP protocol\n");
+	if (inet_add_protocol(&udp_protocol, IPPROTO_UDP) < 0)
+		printk(KERN_CRIT "inet_init: Cannot add UDP protocol\n");
+	if (inet_add_protocol(&tcp_protocol, IPPROTO_TCP) < 0)
+		printk(KERN_CRIT "inet_init: Cannot add TCP protocol\n");
+
+	/* Register the socket-side information for inet_create. */
+	// static struct list_head inetsw[SOCK_MAX];
+	struct list_head *r;
+	for (r = &inetsw[0]; r < &inetsw[SOCK_MAX]; ++r)
+		INIT_LIST_HEAD(r);
+
+	struct inet_protosw *q;
+	for (q = inetsw_array; q < &inetsw_array[INETSW_ARRAY_LEN]; ++q)
+		inet_register_protosw(q); // 将 inetsw_array[] 元素 安装到 inetsw[p->type] 链表
+
+			void inet_register_protosw(struct inet_protosw *p)
+			// 找到链表最后节点 last_perm
+			last_perm = &inetsw[p->type];
+			list_for_each(lh, &inetsw[p->type]) {
+				answer = list_entry(lh, struct inet_protosw, list);
+				if (INET_PROTOSW_PERMANENT & answer->flags) {
+					if (protocol == answer->protocol)
+						break;
+					last_perm = lh;
+				}
+
+				answer = NULL;
+			}
+			if (answer)
+				goto out_permanent;
+			// 将新的协议 struct inet_protosw 添加到链表尾部
+			list_add_rcu(&p->list, last_perm);
+
+	....
+
+```
+
+#### inetsw_array
+```c
+static struct inet_protosw inetsw_array[] =
+{
+	{
+		.type =       SOCK_STREAM,
+		.protocol =   IPPROTO_TCP,
+		.prot =       &tcp_prot,
+		.ops =        &inet_stream_ops,
+		.capability = -1,
+		.no_check =   0,
+		.flags =      INET_PROTOSW_PERMANENT |
+			      INET_PROTOSW_ICSK,
+	},
+
+	{
+		.type =       SOCK_DGRAM,
+		.protocol =   IPPROTO_UDP,
+		.prot =       &udp_prot,
+		.ops =        &inet_dgram_ops,
+		.capability = -1,
+		.no_check =   UDP_CSUM_DEFAULT,
+		.flags =      INET_PROTOSW_PERMANENT,
+       },
+
+
+       {
+	       .type =       SOCK_RAW,
+	       .protocol =   IPPROTO_IP,	/* wild card */
+	       .prot =       &raw_prot,
+	       .ops =        &inet_sockraw_ops,
+	       .capability = CAP_NET_RAW,
+	       .no_check =   UDP_CSUM_DEFAULT,
+	       .flags =      INET_PROTOSW_REUSE,
+       }
+};
+```
+
+
+#### proto_register
+```c
+static LIST_HEAD(proto_list);
+
+int proto_register(struct proto *prot, int alloc_slab)
+	if (alloc_slab) {
+		// 构造slab
+		prot->slab = kmem_cache_create(prot->name, prot->obj_size, 0,
+					       SLAB_HWCACHE_ALIGN, NULL);
+						   ...
+		prot->rsk_prot->slab = kmem_cache_create(request_sock_slab_name,
+							 prot->rsk_prot->obj_size, 0,
+							 SLAB_HWCACHE_ALIGN, NULL);
+		prot->twsk_prot->twsk_slab =
+			kmem_cache_create(timewait_sock_slab_name,
+					  prot->twsk_prot->twsk_obj_size,
+					  0, SLAB_HWCACHE_ALIGN,
+					  NULL);
+	}
+
+	list_add(&prot->node, &proto_list);
+```
+
+#### inet_add_protocol
+```c
+int inet_add_protocol(struct net_protocol *prot, unsigned char protocol)
+	hash = protocol & (MAX_INET_PROTOS - 1);
+	inet_protos[hash] = prot;
+
+```
+
+#### struct proto
+```c
+struct proto {
+	void			(*close)(struct sock *sk, 
+					long timeout);
+	int			(*connect)(struct sock *sk,
+				        struct sockaddr *uaddr, 
+					int addr_len);
+	int			(*disconnect)(struct sock *sk, int flags);
+
+	struct sock *		(*accept) (struct sock *sk, int flags, int *err);
+
+	int			(*ioctl)(struct sock *sk, int cmd,
+					 unsigned long arg);
+	int			(*init)(struct sock *sk);
+	int			(*destroy)(struct sock *sk);
+	void			(*shutdown)(struct sock *sk, int how);
+	int			(*setsockopt)(struct sock *sk, int level, 
+					int optname, char __user *optval,
+					int optlen);
+	int			(*getsockopt)(struct sock *sk, int level, 
+					int optname, char __user *optval, 
+					int __user *option);  	 
+	int			(*compat_setsockopt)(struct sock *sk,
+					int level,
+					int optname, char __user *optval,
+					int optlen);
+	int			(*compat_getsockopt)(struct sock *sk,
+					int level,
+					int optname, char __user *optval,
+					int __user *option);
+	int			(*sendmsg)(struct kiocb *iocb, struct sock *sk,
+					   struct msghdr *msg, size_t len);
+	int			(*recvmsg)(struct kiocb *iocb, struct sock *sk,
+					   struct msghdr *msg,
+					size_t len, int noblock, int flags, 
+					int *addr_len);
+	int			(*sendpage)(struct sock *sk, struct page *page,
+					int offset, size_t size, int flags);
+	int			(*bind)(struct sock *sk, 
+					struct sockaddr *uaddr, int addr_len);
+
+	int			(*backlog_rcv) (struct sock *sk, 
+						struct sk_buff *skb);
+
+	/* Keeping track of sk's, looking them up, and port selection methods. */
+	void			(*hash)(struct sock *sk);
+	void			(*unhash)(struct sock *sk);
+	int			(*get_port)(struct sock *sk, unsigned short snum);
+
+	/* Keeping track of sockets in use */
+#ifdef CONFIG_PROC_FS
+	unsigned int		inuse_idx;
+#endif
+
+	/* Memory pressure */
+	void			(*enter_memory_pressure)(void);
+	atomic_t		*memory_allocated;	/* Current allocated memory. */
+	atomic_t		*sockets_allocated;	/* Current number of sockets. */
+	/*
+	 * Pressure flag: try to collapse.
+	 * Technical note: it is used by multiple contexts non atomically.
+	 * All the __sk_mem_schedule() is of this nature: accounting
+	 * is strict, actions are advisory and have some latency.
+	 */
+	int			*memory_pressure;
+	int			*sysctl_mem;
+	int			*sysctl_wmem;
+	int			*sysctl_rmem;
+	int			max_header;
+
+	struct kmem_cache		*slab;
+	unsigned int		obj_size;
+
+	atomic_t		*orphan_count;
+
+	struct request_sock_ops	*rsk_prot;
+	struct timewait_sock_ops *twsk_prot;
+
+	union {
+		struct inet_hashinfo	*hashinfo;
+		struct hlist_head	*udp_hash;
+		struct raw_hashinfo	*raw_hash;
+	} h;
+
+	struct module		*owner;
+
+	char			name[32];
+
+	struct list_head	node;
+#ifdef SOCK_REFCNT_DEBUG
+	atomic_t		socks;
+#endif
+};
+```
+# 地址设置
+从bind出发
+## sys_bind
+```c
+asmlinkage long sys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen)
+{
+	struct socket *sock;
+	char address[MAX_SOCK_ADDR];
+	int err, fput_needed;
+
+	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+	if (sock) {
+
+		err = move_addr_to_kernel(umyaddr, addrlen, address);
+			int move_addr_to_kernel(void __user *uaddr, int ulen, void *kaddr)
+				if (copy_from_user(kaddr, uaddr, ulen))
+					return -EFAULT;
+				return audit_sockaddr(ulen, kaddr);
+
+		if (err >= 0) {
+			err = security_socket_bind(sock,
+						   (struct sockaddr *)address,
+						   addrlen);
+			if (!err)
+				// sock->ops = inet_stream_ops; // set in inet_create
+				err = sock->ops->bind(sock,
+						      (struct sockaddr *)
+						      address, addrlen); // inet_bind
+		}
+		fput_light(sock->file, fput_needed);
+	}
+	return err;
+}
+```
+
+### 从fd找到socket
+```c
+static struct socket *sockfd_lookup_light(int fd, int *err, int *fput_needed)
+{
+	struct file *file;
+	struct socket *sock;
+
+	*err = -EBADF;
+	file = fget_light(fd, fput_needed);
+	if (file) {
+		sock = sock_from_file(file, err);
+			static struct socket *sock_from_file(struct file *file, int *err)
+				if (file->f_op == &socket_file_ops)
+					return file->private_data;	/* set in sock_map_fd */
+		if (sock)
+			return sock;
+		fput_light(file, *fput_needed);
+	}
+	return NULL;
+}
+```
+
+## inet_bind
+```c
+int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+{
+	struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
+	struct sock *sk = sock->sk;
+	struct inet_sock *inet = inet_sk(sk);
+	unsigned short snum;
+	int chk_addr_ret;
+	int err;
+
+	/* If the socket has its own bind function then use it. (RAW) */
+	if (sk->sk_prot->bind) { // tcp_prot 没有自己的的 bind
+		err = sk->sk_prot->bind(sk, uaddr, addr_len);
+		goto out;
+	}
+	err = -EINVAL;
+	if (addr_len < sizeof(struct sockaddr_in))
+		goto out;
+
+	chk_addr_ret = inet_addr_type(sock_net(sk), addr->sin_addr.s_addr);
+
+	err = -EADDRNOTAVAIL;
+	if (!sysctl_ip_nonlocal_bind &&
+	    !inet->freebind &&
+	    addr->sin_addr.s_addr != htonl(INADDR_ANY) &&
+	    chk_addr_ret != RTN_LOCAL &&
+	    chk_addr_ret != RTN_MULTICAST &&
+	    chk_addr_ret != RTN_BROADCAST)
+		goto out;
+
+	snum = ntohs(addr->sin_port);
+	err = -EACCES;
+	if (snum && snum < PROT_SOCK && !capable(CAP_NET_BIND_SERVICE))
+		goto out;
+
+	lock_sock(sk);
+
+	/* Check these errors (active socket, double bind). */
+	err = -EINVAL;
+	// tcp初始化后 sk->sk_state = TCP_CLOSE;
+	if (sk->sk_state != TCP_CLOSE || inet->num)
+		goto out_release_sock;
+
+	// 设置源地址
+	inet->rcv_saddr = inet->saddr = addr->sin_addr.s_addr;
+	if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
+		inet->saddr = 0;  /* Use device */
+
+	/* Make sure we are allowed to bind here. */
+	// 对于tcp是 inet_csk_get_port,
+	if (sk->sk_prot->get_port(sk, snum)) {
+		inet->saddr = inet->rcv_saddr = 0;
+		err = -EADDRINUSE;
+		goto out_release_sock;
+	}
+
+	if (inet->rcv_saddr)
+		sk->sk_userlocks |= SOCK_BINDADDR_LOCK;
+	if (snum)
+		sk->sk_userlocks |= SOCK_BINDPORT_LOCK;
+	
+	// 设置源端口
+	inet->sport = htons(inet->num);
+
+	// 初始化目标地址目标端口
+	inet->daddr = 0;
+	inet->dport = 0;
+
+	sk_dst_reset(sk);
+	err = 0;
+out_release_sock:
+	release_sock(sk);
+out:
+	return err;
+}
+
 ```
