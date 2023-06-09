@@ -999,22 +999,24 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	if (addr_len < sizeof(struct sockaddr_in))
 		goto out;
 
+	// 在路由中检查地址类型
 	chk_addr_ret = inet_addr_type(sock_net(sk), addr->sin_addr.s_addr);
 
 	err = -EADDRNOTAVAIL;
 	if (!sysctl_ip_nonlocal_bind &&
 	    !inet->freebind &&
 	    addr->sin_addr.s_addr != htonl(INADDR_ANY) &&
-	    chk_addr_ret != RTN_LOCAL &&
-	    chk_addr_ret != RTN_MULTICAST &&
-	    chk_addr_ret != RTN_BROADCAST)
+	    chk_addr_ret != RTN_LOCAL && 		// 是否单播类型
+	    chk_addr_ret != RTN_MULTICAST &&	// 是否多播类型
+	    chk_addr_ret != RTN_BROADCAST)		// 是否广播类型
 		goto out;
 
-	snum = ntohs(addr->sin_port);
+	snum = ntohs(addr->sin_port); // 取得端口号
 	err = -EACCES;
 	if (snum && snum < PROT_SOCK && !capable(CAP_NET_BIND_SERVICE))
 		goto out;
 
+	// 如果其他进程占用sock则睡眠等待
 	lock_sock(sk);
 
 	/* Check these errors (active socket, double bind). */
@@ -1023,12 +1025,14 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	if (sk->sk_state != TCP_CLOSE || inet->num)
 		goto out_release_sock;
 
-	// 设置源地址
+	// 记录源地址
+	// rcv_saddr 用于哈希查找
+	// saddr 用于发送
 	inet->rcv_saddr = inet->saddr = addr->sin_addr.s_addr;
 	if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
 		inet->saddr = 0;  /* Use device */
 
-	/* Make sure we are allowed to bind here. */
+	// 检查是否允许绑定
 	// 对于tcp是 inet_csk_get_port,
 	if (sk->sk_prot->get_port(sk, snum)) {
 		inet->saddr = inet->rcv_saddr = 0;
@@ -1036,9 +1040,9 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		goto out_release_sock;
 	}
 
-	if (inet->rcv_saddr)
+	if (inet->rcv_saddr) // 如果已经绑定了地址，则增加锁，表示已经绑定地址
 		sk->sk_userlocks |= SOCK_BINDADDR_LOCK;
-	if (snum)
+	if (snum) // 如果端口已经确定，则增加锁，表示已经绑定端口
 		sk->sk_userlocks |= SOCK_BINDPORT_LOCK;
 	
 	// 设置源端口
@@ -1048,12 +1052,266 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	inet->daddr = 0;
 	inet->dport = 0;
 
+	// 清空缓存的路由内容
 	sk_dst_reset(sk);
 	err = 0;
 out_release_sock:
+	// 解锁唤醒其他进程
 	release_sock(sk);
 out:
 	return err;
 }
 
 ```
+主要设置
+	源地址，源端口，设置 sk->sk_userlocks 增加已绑定地址端口
+	初始化目标地址端口
+
+	inet->sport = htons(inet->num);
+	inet->daddr = 0;
+	inet->dport = 0;
+	sk->sk_userlocks |= SOCK_BINDADDR_LOCK;
+	sk->sk_userlocks |= SOCK_BINDPORT_LOCK;
+	inet->rcv_saddr = inet->saddr = addr->sin_addr.s_addr;
+
+### inet_addr_type
+分析此函数，搞懂地址类型
+```c
+inet_bind
+	chk_addr_ret = inet_addr_type(sock_net(sk), addr->sin_addr.s_addr);
+
+unsigned int inet_addr_type(struct net *net, __be32 addr)
+{
+	return __inet_dev_addr_type(net, NULL, addr);
+}
+
+static inline unsigned __inet_dev_addr_type(struct net *net,
+					    const struct net_device *dev,
+					    __be32 addr)
+{
+	// flowi 表示路由键值
+	struct flowi		fl = { .nl_u = { .ip4_u = { .daddr = addr } } };
+	struct fib_result	res;
+	unsigned ret = RTN_BROADCAST;
+	struct fib_table *local_table;
+
+	if (ipv4_is_zeronet(addr) || ipv4_is_lbcast(addr))
+		return RTN_BROADCAST;
+	if (ipv4_is_multicast(addr))
+		return RTN_MULTICAST;
+
+#ifdef CONFIG_IP_MULTIPLE_TABLES
+	res.r = NULL;
+#endif
+
+	// 获取本地路由表
+	local_table = fib_get_table(net, RT_TABLE_LOCAL);
+	if (local_table) {
+		ret = RTN_UNICAST;
+		// 查询路由表
+		if (!local_table->tb_lookup(local_table, &fl, &res)) {
+			if (!dev || dev == res.fi->fib_dev)
+				ret = res.type;
+			fib_res_put(&res);
+		}
+	}
+	return ret;
+}
+```
+
+### inet_csk_get_port
+```c
+inet_bind
+	if (sk->sk_prot->get_port(sk, snum))
+
+int inet_csk_get_port(struct sock *sk, unsigned short snum)
+{
+	struct inet_hashinfo *hashinfo = sk->sk_prot->h.hashinfo;
+	struct inet_bind_hashbucket *head;
+	struct hlist_node *node;
+	struct inet_bind_bucket *tb;
+	int ret;
+	struct net *net = sock_net(sk);
+
+	local_bh_disable();
+	if (!snum) {
+		// 若没有指定端口，则随机分配
+		int remaining, rover, low, high;
+
+		// 获得系统TCP端口的范围
+		inet_get_local_port_range(&low, &high);
+		remaining = (high - low) + 1;
+		rover = net_random() % remaining + low;
+
+		do {
+			// 查看随机分配的端口 rover 是否端口冲突
+			head = &hashinfo->bhash[inet_bhashfn(rover, hashinfo->bhash_size)];
+			spin_lock(&head->lock);
+			inet_bind_bucket_for_each(tb, node, &head->chain)
+				if (tb->ib_net == net && tb->port == rover)
+					goto next;
+			break;
+		next:
+			// 如果冲突了则  ++rover
+			spin_unlock(&head->lock);
+			if (++rover > high)
+				rover = low;
+		} while (--remaining > 0);
+
+		ret = 1;
+		// 没有找到
+		if (remaining <= 0)
+			goto fail;
+
+		// 找到合适的端口
+		snum = rover;
+	} else {
+		// 根据指定的端口号snum 找到 tb
+		head = &hashinfo->bhash[inet_bhashfn(snum, hashinfo->bhash_size)];
+		spin_lock(&head->lock);
+		inet_bind_bucket_for_each(tb, node, &head->chain)
+			if (tb->ib_net == net && tb->port == snum)
+				goto tb_found;
+	}
+	tb = NULL;
+	goto tb_not_found;
+tb_found:
+	// tb->owners 不为空，说明其他sock已经绑定了同样端口，需要检查是否冲突
+	if (!hlist_empty(&tb->owners)) {
+		if (tb->fastreuse > 0 &&
+		    sk->sk_reuse && sk->sk_state != TCP_LISTEN) {
+			// 如果tb开启fastreuse 和 sk 开启reuse，则成功
+			goto success;
+		} else {
+			ret = 1;
+			// 否则检查是否冲突
+			if (inet_csk(sk)->icsk_af_ops->bind_conflict(sk, tb))
+				goto fail_unlock;
+		}
+	}
+tb_not_found:
+	ret = 1;
+	// 若没找到tb，则创建tb，并关联 snum
+	if (!tb && (tb = inet_bind_bucket_create(hashinfo->bind_bucket_cachep,
+					net, head, snum)) == NULL)
+		goto fail_unlock;
+	if (hlist_empty(&tb->owners)) {
+		if (sk->sk_reuse && sk->sk_state != TCP_LISTEN)
+			tb->fastreuse = 1;
+		else
+			tb->fastreuse = 0;
+	} else if (tb->fastreuse &&
+		   (!sk->sk_reuse || sk->sk_state == TCP_LISTEN))
+		tb->fastreuse = 0;
+success:
+	if (!inet_csk(sk)->icsk_bind_hash)
+		inet_bind_hash(sk, tb, snum);
+	BUG_TRAP(inet_csk(sk)->icsk_bind_hash == tb);
+	ret = 0;
+
+fail_unlock:
+	spin_unlock(&head->lock);
+fail:
+	local_bh_enable();
+	return ret;
+}
+```
+
+### TCP 如何检查 bind_conflict
+```c
+// 此时tb上已经有其他sock，检查sock和sk是否端口冲突
+// 冲突返回 1
+int inet_csk_bind_conflict(const struct sock *sk,
+			   const struct inet_bind_bucket *tb)
+{
+	const __be32 sk_rcv_saddr = inet_rcv_saddr(sk); //  源地址
+	struct sock *sk2;
+	struct hlist_node *node;
+	int reuse = sk->sk_reuse;
+
+	sk_for_each_bound(sk2, node, &tb->owners) {
+		if (sk != sk2 &&
+		    !inet_v6_ipv6only(sk2) &&
+		    (!sk->sk_bound_dev_if || // 如果没有设置绑定设置则冲突
+		     !sk2->sk_bound_dev_if ||  // 如果sk 和 sk2 都绑定了设备
+		     sk->sk_bound_dev_if == sk2->sk_bound_dev_if)) { //检查设备是否相同
+			if (!reuse || !sk2->sk_reuse || // 如果有没有设置resue直接冲突
+			    sk2->sk_state == TCP_LISTEN) { //如果都设置了reuse且sk2的状态为TCP_LISTEN
+				const __be32 sk2_rcv_saddr = inet_rcv_saddr(sk2);
+				if (!sk2_rcv_saddr || !sk_rcv_saddr ||
+				    sk2_rcv_saddr == sk_rcv_saddr) // 如果源地址相同则冲突
+					break;
+			}
+		}
+	}
+	return node != NULL;
+}
+```
+总结如下：
+	如果有tcp sock设置相同端口
+		如果没有绑定设备，或设备相同
+		如果没有设置reuse，或设置了reuse，但以前的sock状态为 TCP_LISTEN
+			则检查源地址是否相同
+				相同则冲突
+
+可见 SO_REUSEADDR 只是解决 以前sock状态不为 TCP_LISTEN的情况 的冲突
+
+所以，对同设备同地址同端口的监听只能有一个sock
+
+而惊群是由于多个进程监听一个sock，此sock为 TCP_LISTEN，当sock可读时，多个进程都被唤醒。
+
+### 分析 sock 和 inet_bind_bucket 的关系
+在TCP情况下调用 bind 
+```c
+inet_bind
+	sk->sk_prot->get_port(sk, snum);
+		int inet_csk_get_port(struct sock *sk, unsigned short snum)
+			
+			// 根据源端口找到 tb
+			head = &hashinfo->bhash[inet_bhashfn(snum, hashinfo->bhash_size)];
+			inet_bind_bucket_for_each(tb, node, &head->chain)
+				if (tb->ib_net == net && tb->port == snum)
+					goto tb_found;
+
+			// 如果没有相关tb 则创建
+			tb = inet_bind_bucket_create(hashinfo->bind_bucket_cachep,
+							net, head, snum);
+
+			// 建立tb 和 sk 的关系
+			inet_bind_hash(sk, tb, snum);
+```
+
+#### 创建tb inet_bind_bucket_create
+```c
+struct inet_bind_bucket *inet_bind_bucket_create(struct kmem_cache *cachep,
+						 struct net *net,
+						 struct inet_bind_hashbucket *head,
+						 const unsigned short snum)
+{
+	struct inet_bind_bucket *tb = kmem_cache_alloc(cachep, GFP_ATOMIC);
+
+	if (tb != NULL) {
+		tb->ib_net       = hold_net(net);
+		tb->port      = snum;
+		tb->fastreuse = 0;
+		INIT_HLIST_HEAD(&tb->owners); // tb->owner链表 存放绑定在此snum上的tcp sk
+		hlist_add_head(&tb->node, &head->chain); // 所有tb加入hash的一个表
+	}
+	return tb;
+}
+```
+#### 建立tb和sk的关系
+```c
+void inet_bind_hash(struct sock *sk, struct inet_bind_bucket *tb,
+		    const unsigned short snum)
+{
+	inet_sk(sk)->num = snum;
+
+	sk_add_bind_node(sk, &tb->owners);
+		void sk_add_bind_node(struct sock *sk, struct hlist_head *list)
+			hlist_add_head(&sk->sk_bind_node, list);
+
+	inet_csk(sk)->icsk_bind_hash = tb;
+}
+```
+
