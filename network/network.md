@@ -1078,7 +1078,7 @@ out:
 分析此函数，搞懂地址类型
 ```c
 inet_bind
-	chk_addr_ret = inet_addr_type(sock_net(sk), addr->sin_addr.s_addr);
+	chk_addr_ret = inet_dev_addr_type(sock_net(sk), addr->sin_addr.s_addr);
 
 unsigned int inet_addr_type(struct net *net, __be32 addr)
 {
@@ -1314,4 +1314,1131 @@ void inet_bind_hash(struct sock *sk, struct inet_bind_bucket *tb,
 	inet_csk(sk)->icsk_bind_hash = tb;
 }
 ```
+
+# 路由
+
+## 路由表的初始化
+```c
+static int __init inet_init(void)
+	ip_init();
+		ip_rt_init(); // ip route init
+```
+
+```c
+// ip_rt_acct 用于路由统计
+struct ip_rt_acct
+{
+	__u32 	o_bytes;
+	__u32 	o_packets;
+	__u32 	i_bytes;
+	__u32 	i_packets;
+};
+
+
+int __init ip_rt_init(void)
+{
+	int rc = 0;
+
+	// 设置路由随机数
+	atomic_set(&rt_genid, (int) ((num_physpages ^ (num_physpages>>8)) ^
+			     (jiffies ^ (jiffies >> 7))));
+
+#ifdef CONFIG_NET_CLS_ROUTE
+	ip_rt_acct = __alloc_percpu(256 * sizeof(struct ip_rt_acct));
+	if (!ip_rt_acct)
+		panic("IP: failed to allocate ip_rt_acct\n");
+#endif
+
+	// 创建路由项的slab
+	ipv4_dst_ops.kmem_cachep =
+		kmem_cache_create("ip_dst_cache", sizeof(struct rtable), 0,
+				  SLAB_HWCACHE_ALIGN|SLAB_PANIC, NULL);
+
+	ipv4_dst_blackhole_ops.kmem_cachep = ipv4_dst_ops.kmem_cachep;
+
+	// 创建路由哈希缓存
+	rt_hash_table = (struct rt_hash_bucket *)
+		alloc_large_system_hash("IP route cache",
+					sizeof(struct rt_hash_bucket),
+					rhash_entries,
+					(num_physpages >= 128 * 1024) ?
+					15 : 17,
+					0,
+					&rt_hash_log,
+					&rt_hash_mask,
+					0);
+	memset(rt_hash_table, 0, (rt_hash_mask + 1) * sizeof(struct rt_hash_bucket));
+
+	// 初始化路由哈希队列
+	rt_hash_lock_init();
+
+	// 记录回收底线
+	ipv4_dst_ops.gc_thresh = (rt_hash_mask + 1);
+	// 哈希的最大长度
+	ip_rt_max_size = (rt_hash_mask + 1) * 16;
+
+	devinet_init();
+	ip_fib_init();
+
+	rt_secret_timer.function = rt_secret_rebuild;
+	rt_secret_timer.data = 0;
+	init_timer_deferrable(&rt_secret_timer);
+
+	/* All the timers, started at system startup tend
+	   to synchronize. Perturb it a bit.
+	 */
+	schedule_delayed_work(&expires_work,
+		net_random() % ip_rt_gc_interval + ip_rt_gc_interval);
+
+	rt_secret_timer.expires = jiffies + net_random() % ip_rt_secret_interval +
+		ip_rt_secret_interval;
+	add_timer(&rt_secret_timer);
+
+	if (ip_rt_proc_init())
+		printk(KERN_ERR "Unable to create route proc files\n");
+#ifdef CONFIG_XFRM
+	xfrm_init();
+	xfrm4_init();
+#endif
+	rtnl_register(PF_INET, RTM_GETROUTE, inet_rtm_getroute, NULL);
+
+	return rc;
+}
+```
+ipv4_dst_ops 是 ipv4 的路由相关操作函数集
+rt_hash_table 是用于路由的表，其通过fib_table提供的信息创建
+
+```c
+struct rt_hash_bucket {
+	struct rtable	*chain;
+};
+
+struct rtable
+{
+	union
+	{
+		struct dst_entry	dst;
+	} u;
+
+	...
+};
+
+
+struct dst_entry
+{
+	...
+	union {
+		struct dst_entry *next;
+		struct rtable    *rt_next;
+		struct rt6_info   *rt6_next;
+		struct dn_route  *dn_next;
+	};
+};
+```
+### devinet_init
+```c
+static __net_initdata struct pernet_operations devinet_ops = {
+	.init = devinet_init_net,
+	.exit = devinet_exit_net,
+};
+
+void __init devinet_init(void)
+{
+	// 注册网络空间操作表，这里提供初始化和释放网络空间的hook函数
+	register_pernet_subsys(&devinet_ops);
+
+	// 注册 general interface config 通用配置函数表
+	// 也就是 SIOCGIF 
+	register_gifconf(PF_INET, inet_gifconf);
+
+	// 注册通知点
+	register_netdevice_notifier(&ip_netdev_notifier);
+
+	// 注册路由处理的netlink
+	rtnl_register(PF_INET, RTM_NEWADDR, inet_rtm_newaddr, NULL);
+	rtnl_register(PF_INET, RTM_DELADDR, inet_rtm_deladdr, NULL);
+	rtnl_register(PF_INET, RTM_GETADDR, NULL, inet_dump_ifaddr);
+}
+```
+
+### ip_fib_init
+```c
+static struct pernet_operations fib_net_ops = {
+	.init = fib_net_init,
+	.exit = fib_net_exit,
+};
+
+void __init ip_fib_init(void)
+{
+	// 注册路由管理的netlink
+	rtnl_register(PF_INET, RTM_NEWROUTE, inet_rtm_newroute, NULL);
+	rtnl_register(PF_INET, RTM_DELROUTE, inet_rtm_delroute, NULL);
+	rtnl_register(PF_INET, RTM_GETROUTE, NULL, inet_dump_fib);
+
+	// 添加hook
+	register_pernet_subsys(&fib_net_ops);
+	register_netdevice_notifier(&fib_netdev_notifier);
+	register_inetaddr_notifier(&fib_inetaddr_notifier);
+
+	fib_hash_init();
+}
+```
+
+#### 路由表的初始化的关键 fib_net_init
+```c
+static int __net_init fib_net_init(struct net *net)
+{
+	int error;
+
+	error = ip_fib_net_init(net);
+	if (error < 0)
+		goto out;
+	error = nl_fib_lookup_init(net);
+	if (error < 0)
+		goto out_nlfl;
+	error = fib_proc_init(net);
+	if (error < 0)
+		goto out_proc;
+out:
+	return error;
+
+out_proc:
+	nl_fib_lookup_exit(net);
+out_nlfl:
+	ip_fib_net_exit(net);
+	goto out;
+}
+
+static int __net_init ip_fib_net_init(struct net *net)
+{
+	int err;
+	unsigned int i;
+
+	net->ipv4.fib_table_hash = kzalloc(
+			sizeof(struct hlist_head)*FIB_TABLE_HASHSZ, GFP_KERNEL);
+	if (net->ipv4.fib_table_hash == NULL)
+		return -ENOMEM;
+
+	for (i = 0; i < FIB_TABLE_HASHSZ; i++)
+		INIT_HLIST_HEAD(&net->ipv4.fib_table_hash[i]);
+
+	err = fib4_rules_init(net);
+	if (err < 0)
+		goto fail;
+	return 0;
+
+fail:
+	kfree(net->ipv4.fib_table_hash);
+	return err;
+}
+```
+
+## 通过路由函数表函数查找路由信息
+sys_bind 调用 inet_dev_addr_type 确定地址类型
+```c
+static inline unsigned __inet_dev_addr_type(struct net *net,
+					    const struct net_device *dev,
+					    __be32 addr)
+{
+	// flowi 表示路由键值
+	struct flowi		fl = { .nl_u = { .ip4_u = { .daddr = addr } } };
+	struct fib_result	res;
+	unsigned ret = RTN_BROADCAST;
+	struct fib_table *local_table;
+
+	if (ipv4_is_zeronet(addr) || ipv4_is_lbcast(addr))
+		return RTN_BROADCAST;
+	if (ipv4_is_multicast(addr))
+		return RTN_MULTICAST;
+
+#ifdef CONFIG_IP_MULTIPLE_TABLES
+	res.r = NULL;
+#endif
+
+	// 获取本地路由表
+	local_table = fib_get_table(net, RT_TABLE_LOCAL);
+	if (local_table) {
+		ret = RTN_UNICAST;
+		// 查询路由表
+		if (!local_table->tb_lookup(local_table, &fl, &res)) {
+			if (!dev || dev == res.fi->fib_dev)
+				ret = res.type;
+			fib_res_put(&res);
+		}
+	}
+	return ret;
+}
+```
+
+### 获得路由表
+```c
+struct fib_table *local_table;
+local_table = fib_get_table(net, RT_TABLE_LOCAL);
+
+static inline struct fib_table *fib_get_table(struct net *net, u32 id)
+{
+	struct hlist_head *ptr;
+
+	ptr = id == RT_TABLE_LOCAL ?
+		&net->ipv4.fib_table_hash[TABLE_LOCAL_INDEX] :
+		&net->ipv4.fib_table_hash[TABLE_MAIN_INDEX];
+	return hlist_entry(ptr->first, struct fib_table, tb_hlist);
+}
+```
+
+### 查询路由表
+```c
+//	struct flowi		fl = { .nl_u = { .ip4_u = { .daddr = addr } } };
+
+static int
+fn_hash_lookup(struct fib_table *tb, const struct flowi *flp, struct fib_result *res)
+{
+	int err;
+	struct fn_zone *fz;
+	struct fn_hash *t = (struct fn_hash*)tb->tb_data;
+
+	read_lock(&fib_hash_lock);
+	for (fz = t->fn_zone_list; fz; fz = fz->fz_next) {
+		struct hlist_head *head;
+		struct hlist_node *node;
+		struct fib_node *f;
+
+#define fl4_dst		nl_u.ip4_u.daddr
+
+		__be32 k = fz_key(flp->fl4_dst, fz); // 用目标地址和 路由项的子网掩码相与得到网络号 k
+			static inline __be32 fz_key(__be32 dst, struct fn_zone *fz)
+				return dst & FZ_MASK(fz);
+
+				#define FZ_MASK(fz)		((fz)->fz_mask)
+
+
+		head = &fz->fz_hash[fn_hash(k, fz)]; // 根据网络号找到 fib_node 列表
+		hlist_for_each_entry(f, node, head, fn_hash) {
+			if (f->fn_key != k) // fib_node 有 fn_alias 链表，fn_alias下才有真正的路由项
+				continue;       // 相同子网的 fn_alias 被组织到同个 fib_node
+
+			err = fib_semantic_match(&f->fn_alias,
+						 flp, res,
+						 f->fn_key, fz->fz_mask,
+						 fz->fz_order);
+			if (err <= 0)
+				goto out;
+		}
+	}
+	err = 1;
+out:
+	read_unlock(&fib_hash_lock);
+	return err;
+}
+
+
+struct fib_alias {
+	struct list_head	fa_list;  // 做fib_node的子节点
+	struct fib_info		*fa_info; // 路由信息结构，记录如何处理数据包
+	u8			fa_tos;      // 服务类型 
+	u8			fa_type;     // 路由类型
+	u8			fa_scope;    // 路由范围
+	u8			fa_state;    // 路由状态
+#ifdef CONFIG_IP_FIB_TRIE
+	struct rcu_head		rcu;
+#endif
+};
+
+
+int fib_semantic_match(struct list_head *head, const struct flowi *flp,
+		       struct fib_result *res, __be32 zone, __be32 mask,
+			int prefixlen)
+{
+	struct fib_alias *fa;
+	int nh_sel = 0;
+
+	list_for_each_entry_rcu(fa, head, fa_list) {
+		int err;
+
+		if (fa->fa_tos &&
+		    fa->fa_tos != flp->fl4_tos)
+			continue;
+
+		if (fa->fa_scope < flp->fl4_scope) 
+			continue;
+
+		fa->fa_state |= FA_S_ACCESSED;
+
+		// 是否支持此种类型的路由
+		err = fib_props[fa->fa_type].error;
+		if (err == 0) {
+			struct fib_info *fi = fa->fa_info;
+
+			if (fi->fib_flags & RTNH_F_DEAD)
+				continue;
+
+			switch (fa->fa_type) {
+			case RTN_UNICAST:
+			case RTN_LOCAL:
+			case RTN_BROADCAST:
+			case RTN_ANYCAST:
+			case RTN_MULTICAST:
+
+				for_nexthops(fi) { // 遍历 fi, 节点为 struct fib_nh *nb
+					if (nh->nh_flags&RTNH_F_DEAD)
+						continue;
+					// 如果没有设置出口设备，或者出口设备和路由项的出口设备匹配则找到了
+					if (!flp->oif || flp->oif == nh->nh_oif)
+						break;
+				}
+				// 如果找到了 nhsel < fi->fib_nhs 或 nhsel < 1 则到 out_fill_res
+#ifdef CONFIG_IP_ROUTE_MULTIPATH
+				if (nhsel < fi->fib_nhs) {
+					nh_sel = nhsel;
+					goto out_fill_res;
+				}
+#else
+				if (nhsel < 1) {
+					goto out_fill_res;
+				}
+#endif
+				endfor_nexthops(fi);
+				continue;
+
+			default:
+				printk(KERN_WARNING "fib_semantic_match bad type %#x\n",
+					fa->fa_type);
+				return -EINVAL;
+			}
+		}
+		return err;
+	}
+	return 1;
+
+out_fill_res:
+	// 返回路由信息
+	res->prefixlen = prefixlen;
+	res->nh_sel = nh_sel;
+	res->type = fa->fa_type;
+	res->scope = fa->fa_scope;
+	res->fi = fa->fa_info;
+	atomic_inc(&res->fi->fib_clntref);
+	return 0;
+}
+
+// 路由跳转结构
+struct fib_nh {
+	struct net_device	*nh_dev;
+	struct hlist_node	nh_hash;
+	struct fib_info		*nh_parent;
+	unsigned		nh_flags;
+	unsigned char		nh_scope;
+#ifdef CONFIG_IP_ROUTE_MULTIPATH
+	int			nh_weight;
+	int			nh_power;
+#endif
+#ifdef CONFIG_NET_CLS_ROUTE
+	__u32			nh_tclassid;
+#endif
+	int			nh_oif; // 发送设备的ID
+	__be32			nh_gw; // 网关IP地址
+};
+
+
+```
+
+#### 总结 路由查询
+```shell
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags Metric Ref    Use Iface
+default         192.168.112.2   0.0.0.0         UG    102    0        0 ens38
+default         192.168.3.1     0.0.0.0         UG    20100  0        0 ens33
+default         192.168.0.1     0.0.0.0         UG    20101  0        0 ens37
+10.10.10.0      0.0.0.0         255.255.255.0   U     0      0        0 wg0
+link-local      0.0.0.0         255.255.0.0     U     1000   0        0 ens33
+192.168.0.0     0.0.0.0         255.255.255.0   U     101    0        0 ens37
+192.168.3.0     0.0.0.0         255.255.255.0   U     100    0        0 ens33
+192.168.112.0   0.0.0.0         255.255.255.0   U     102    0        0 ens38
+```
+当发送报文 源IP 192.168.3.5 目的Ip 192.168.3.81 ， 没有指定设备
+获得网络号
+192.168.3.81 & 255.255.255.0 = 192.168.3.0  
+将网络号和路由项比较，找到合适的路由项
+192.168.3.0     0.0.0.0         255.255.255.0   U     100    0        0 ens33
+由于没有设置出口设备，所以可以路由，直接从 ens33 发出, 
+目标MAC地址为 目标IP的MAC
+
+当发送报文 源IP 192.168.3.5 目的Ip 114.114.114.114 ， 没有指定设备
+获得网络号
+使用 LAN口任何网络掩码获得网络号都不能找到路由项，
+使用WAN口网络掩码，获得网络号 0.0.0.0
+找到路由项
+default         192.168.112.2   0.0.0.0         UG    102    0        0 ens38
+比较出口设备
+由于没有设置出口设备，所以可以使用此规则。
+因为是WAN口，所以修改下一条为网关地址，从ens38发出
+目标MAC地址为 网关MAC
+
+
+## 路由设置
+路由设置可以通过两种方法设置
+	用户层命令 net-tools 和 iproute2
+	通知链
+
+net-tools 不能设置多路径路由和策略路由。
+
+### 使用net-tools 设置路由
+```c
+ioctl -> sys_ioctl -> do_vfs_ioctl -> vfs_ioctl -> sock_ioctl -> inet_ioctl -> ip_rt_ioctl
+
+int ip_rt_ioctl(struct net *net, unsigned int cmd, void __user *arg)
+{
+	struct fib_config cfg;
+	struct rtentry rt;
+	int err;
+
+	switch (cmd) {
+	case SIOCADDRT:		/* Add a route */
+	case SIOCDELRT:		/* Delete a route */
+		if (!capable(CAP_NET_ADMIN))
+			return -EPERM;
+
+		if (copy_from_user(&rt, arg, sizeof(rt)))
+			return -EFAULT;
+
+		rtnl_lock();
+		err = rtentry_to_fib_config(net, cmd, &rt, &cfg);
+		if (err == 0) {
+			struct fib_table *tb;
+
+// fib_hash_init中初始化
+// tb->tb_insert = fn_hash_insert;
+// tb->tb_delete = fn_hash_delete;
+
+			if (cmd == SIOCDELRT) {
+				tb = fib_get_table(net, cfg.fc_table);
+				if (tb)
+					err = tb->tb_delete(tb, &cfg);
+				else
+					err = -ESRCH;
+			} else {
+				tb = fib_new_table(net, cfg.fc_table);
+				if (tb)
+					err = tb->tb_insert(tb, &cfg);
+				else
+					err = -ENOBUFS;
+			}
+
+			/* allocated by rtentry_to_fib_config() */
+			kfree(cfg.fc_mx);
+		}
+		rtnl_unlock();
+		return err;
+	}
+	return -EINVAL;
+}
+```
+
+###  使用 iproute2 设置路由
+iproute2 使用netlink 设置路由
+	inet_rtm_newroute
+	inet_rtm_delroute
+```c
+static int inet_rtm_newroute(struct sk_buff *skb, struct nlmsghdr* nlh, void *arg)
+{
+	struct net *net = sock_net(skb->sk);
+	struct fib_config cfg;
+	struct fib_table *tb;
+	int err;
+
+	err = rtm_to_fib_config(net, skb, nlh, &cfg);
+	if (err < 0)
+		goto errout;
+
+	tb = fib_new_table(net, cfg.fc_table);
+	if (tb == NULL) {
+		err = -ENOBUFS;
+		goto errout;
+	}
+
+	err = tb->tb_insert(tb, &cfg);
+errout:
+	return err;
+}
+
+static int inet_rtm_delroute(struct sk_buff *skb, struct nlmsghdr* nlh, void *arg)
+{
+	struct net *net = sock_net(skb->sk);
+	struct fib_config cfg;
+	struct fib_table *tb;
+	int err;
+
+	err = rtm_to_fib_config(net, skb, nlh, &cfg);
+	if (err < 0)
+		goto errout;
+
+	tb = fib_get_table(net, cfg.fc_table);
+	if (tb == NULL) {
+		err = -ESRCH;
+		goto errout;
+	}
+
+	err = tb->tb_delete(tb, &cfg);
+errout:
+	return err;
+}
+```
+
+
+### 通知链设置路由
+在ip_fib_init中注册过两个通知节点
+	register_netdevice_notifier(&fib_netdev_notifier);
+	register_inetaddr_notifier(&fib_inetaddr_notifier);
+这两个通知点分别被插入到netdev_chain链（网络设备状态变动时通知链）,
+inetaddr_chain(地址变动的通知链).
+当网络设备安装或初始化时，和IP地址改变时都会触发通知链处理函数：
+只不过这次操作地址通知的节点是 fib_inetaddr_event
+```c
+static struct notifier_block fib_inetaddr_notifier = {
+	.notifier_call =fib_inetaddr_event,
+};
+
+static struct notifier_block fib_netdev_notifier = {
+	.notifier_call =fib_netdev_event,
+};
+```
+所以通知链机制设置路由通过 fib_inetaddr_event 或 fib_netdev_event 处理路由
+这两个函数又使用
+		fib_add_ifaddr(ifa);
+		fib_del_ifaddr(ifa);
+实现修改路由.
+
+fib_add_ifaddr 和 fib_del_ifaddr 都使用 fib_magic函数实现对路由地址的操作
+```c
+void fib_add_ifaddr(struct in_ifaddr *ifa)
+{
+	struct in_device *in_dev = ifa->ifa_dev;
+	struct net_device *dev = in_dev->dev;
+	struct in_ifaddr *prim = ifa;
+	__be32 mask = ifa->ifa_mask;
+	__be32 addr = ifa->ifa_local;
+	__be32 prefix = ifa->ifa_address&mask;
+
+	if (ifa->ifa_flags&IFA_F_SECONDARY) {
+		prim = inet_ifa_byprefix(in_dev, prefix, mask);
+		if (prim == NULL) {
+			printk(KERN_WARNING "fib_add_ifaddr: bug: prim == NULL\n");
+			return;
+		}
+	}
+
+	fib_magic(RTM_NEWROUTE, RTN_LOCAL, addr, 32, prim);
+
+	if (!(dev->flags&IFF_UP))
+		return;
+
+	/* Add broadcast address, if it is explicitly assigned. */
+	if (ifa->ifa_broadcast && ifa->ifa_broadcast != htonl(0xFFFFFFFF))
+		fib_magic(RTM_NEWROUTE, RTN_BROADCAST, ifa->ifa_broadcast, 32, prim);
+
+	if (!ipv4_is_zeronet(prefix) && !(ifa->ifa_flags&IFA_F_SECONDARY) &&
+	    (prefix != addr || ifa->ifa_prefixlen < 32)) {
+		fib_magic(RTM_NEWROUTE, dev->flags&IFF_LOOPBACK ? RTN_LOCAL :
+			  RTN_UNICAST, prefix, ifa->ifa_prefixlen, prim);
+
+		/* Add network specific broadcasts, when it takes a sense */
+		if (ifa->ifa_prefixlen < 31) {
+			fib_magic(RTM_NEWROUTE, RTN_BROADCAST, prefix, 32, prim);
+			fib_magic(RTM_NEWROUTE, RTN_BROADCAST, prefix|~mask, 32, prim);
+		}
+	}
+}
+
+static void fib_magic(int cmd, int type, __be32 dst, int dst_len, struct in_ifaddr *ifa)
+{
+	struct net *net = dev_net(ifa->ifa_dev->dev);
+	struct fib_table *tb;
+	struct fib_config cfg = {
+		.fc_protocol = RTPROT_KERNEL,
+		.fc_type = type,
+		.fc_dst = dst,
+		.fc_dst_len = dst_len,
+		.fc_prefsrc = ifa->ifa_local,
+		.fc_oif = ifa->ifa_dev->dev->ifindex,
+		.fc_nlflags = NLM_F_CREATE | NLM_F_APPEND,
+		.fc_nlinfo = {
+			.nl_net = net,
+		},
+	};
+
+	if (type == RTN_UNICAST)
+		tb = fib_new_table(net, RT_TABLE_MAIN);
+	else
+		tb = fib_new_table(net, RT_TABLE_LOCAL);
+
+	if (tb == NULL)
+		return;
+
+	cfg.fc_table = tb->tb_id;
+
+	if (type != RTN_LOCAL)
+		cfg.fc_scope = RT_SCOPE_LINK;
+	else
+		cfg.fc_scope = RT_SCOPE_HOST;
+
+	if (cmd == RTM_NEWROUTE)
+		tb->tb_insert(tb, &cfg);
+	else
+		tb->tb_delete(tb, &cfg);
+}
+```
+
+可见所有设置路由的机制都是通过下面函数实现
+	fn_hash_insert
+	fn_hash_delete
+
+### fib_new_table
+fib_new_table 有两种实现，
+下面为开启 CONFIG_IP_MULTIPLE_TABLES
+```c
+struct fib_table *fib_new_table(struct net *net, u32 id)
+{
+	struct fib_table *tb;
+	unsigned int h;
+
+	if (id == 0)
+		id = RT_TABLE_MAIN;
+	tb = fib_get_table(net, id); // 查找路由表
+	if (tb)
+		return tb;
+
+	tb = fib_hash_table(id); // 创建路由表
+	if (!tb)
+		return NULL;
+	h = id & (FIB_TABLE_HASHSZ - 1);
+	hlist_add_head_rcu(&tb->tb_hlist, &net->ipv4.fib_table_hash[h]); // 加入哈希表
+	return tb;
+}
+```
+另一种
+```c
+static inline struct fib_table *fib_new_table(struct net *net, u32 id)
+{
+	return fib_get_table(net, id);
+}
+```
+
+### fn_hash_insert
+```c
+static int fn_hash_insert(struct fib_table *tb, struct fib_config *cfg)
+{
+	struct fn_hash *table = (struct fn_hash *) tb->tb_data; // 根路由区
+	struct fib_node *new_f = NULL;
+	struct fib_node *f;
+	struct fib_alias *fa, *new_fa;
+	struct fn_zone *fz;
+	struct fib_info *fi;
+	u8 tos = cfg->fc_tos;
+	__be32 key;
+	int err;
+
+	// 确保目标地址合法
+	if (cfg->fc_dst_len > 32)
+		return -EINVAL;
+
+	// 找到子网路由区
+	fz = table->fn_zones[cfg->fc_dst_len];
+	if (!fz && !(fz = fn_new_zone(table, cfg->fc_dst_len)))
+		return -ENOBUFS;
+
+	key = 0;
+	if (cfg->fc_dst) {
+		if (cfg->fc_dst & ~FZ_MASK(fz))
+			return -EINVAL;
+		key = fz_key(cfg->fc_dst, fz);
+	}
+
+	fi = fib_create_info(cfg);
+	if (IS_ERR(fi))
+		return PTR_ERR(fi);
+
+	if (fz->fz_nent > (fz->fz_divisor<<1) &&
+	    fz->fz_divisor < FZ_MAX_DIVISOR &&
+	    (cfg->fc_dst_len == 32 ||
+	     (1 << cfg->fc_dst_len) > fz->fz_divisor))
+		fn_rehash_zone(fz);
+
+	f = fib_find_node(fz, key);
+
+	if (!f)
+		fa = NULL;
+	else
+		fa = fib_find_alias(&f->fn_alias, tos, fi->fib_priority);
+
+	/* Now fa, if non-NULL, points to the first fib alias
+	 * with the same keys [prefix,tos,priority], if such key already
+	 * exists or to the node before which we will insert new one.
+	 *
+	 * If fa is NULL, we will need to allocate a new one and
+	 * insert to the head of f.
+	 *
+	 * If f is NULL, no fib node matched the destination key
+	 * and we need to allocate a new one of those as well.
+	 */
+
+	if (fa && fa->fa_tos == tos &&
+	    fa->fa_info->fib_priority == fi->fib_priority) {
+		struct fib_alias *fa_first, *fa_match;
+
+		err = -EEXIST;
+		if (cfg->fc_nlflags & NLM_F_EXCL)
+			goto out;
+
+		/* We have 2 goals:
+		 * 1. Find exact match for type, scope, fib_info to avoid
+		 * duplicate routes
+		 * 2. Find next 'fa' (or head), NLM_F_APPEND inserts before it
+		 */
+		fa_match = NULL;
+		fa_first = fa;
+		fa = list_entry(fa->fa_list.prev, struct fib_alias, fa_list);
+		list_for_each_entry_continue(fa, &f->fn_alias, fa_list) {
+			if (fa->fa_tos != tos)
+				break;
+			if (fa->fa_info->fib_priority != fi->fib_priority)
+				break;
+			if (fa->fa_type == cfg->fc_type &&
+			    fa->fa_scope == cfg->fc_scope &&
+			    fa->fa_info == fi) {
+				fa_match = fa;
+				break;
+			}
+		}
+
+		if (cfg->fc_nlflags & NLM_F_REPLACE) {
+			struct fib_info *fi_drop;
+			u8 state;
+
+			fa = fa_first;
+			if (fa_match) {
+				if (fa == fa_match)
+					err = 0;
+				goto out;
+			}
+			write_lock_bh(&fib_hash_lock);
+			fi_drop = fa->fa_info;
+			fa->fa_info = fi;
+			fa->fa_type = cfg->fc_type;
+			fa->fa_scope = cfg->fc_scope;
+			state = fa->fa_state;
+			fa->fa_state &= ~FA_S_ACCESSED;
+			fib_hash_genid++;
+			write_unlock_bh(&fib_hash_lock);
+
+			fib_release_info(fi_drop);
+			if (state & FA_S_ACCESSED)
+				rt_cache_flush(-1);
+			rtmsg_fib(RTM_NEWROUTE, key, fa, cfg->fc_dst_len, tb->tb_id,
+				  &cfg->fc_nlinfo, NLM_F_REPLACE);
+			return 0;
+		}
+
+		/* Error if we find a perfect match which
+		 * uses the same scope, type, and nexthop
+		 * information.
+		 */
+		if (fa_match)
+			goto out;
+
+		if (!(cfg->fc_nlflags & NLM_F_APPEND))
+			fa = fa_first;
+	}
+
+	err = -ENOENT;
+	if (!(cfg->fc_nlflags & NLM_F_CREATE))
+		goto out;
+
+	err = -ENOBUFS;
+
+	if (!f) {
+		new_f = kmem_cache_zalloc(fn_hash_kmem, GFP_KERNEL);
+		if (new_f == NULL)
+			goto out;
+
+		INIT_HLIST_NODE(&new_f->fn_hash);
+		INIT_LIST_HEAD(&new_f->fn_alias);
+		new_f->fn_key = key;
+		f = new_f;
+	}
+
+	new_fa = &f->fn_embedded_alias;
+	if (new_fa->fa_info != NULL) {
+		new_fa = kmem_cache_alloc(fn_alias_kmem, GFP_KERNEL);
+		if (new_fa == NULL)
+			goto out;
+	}
+	new_fa->fa_info = fi;
+	new_fa->fa_tos = tos;
+	new_fa->fa_type = cfg->fc_type;
+	new_fa->fa_scope = cfg->fc_scope;
+	new_fa->fa_state = 0;
+
+	/*
+	 * Insert new entry to the list.
+	 */
+
+	write_lock_bh(&fib_hash_lock);
+	if (new_f)
+		fib_insert_node(fz, new_f);
+	list_add_tail(&new_fa->fa_list,
+		 (fa ? &fa->fa_list : &f->fn_alias));
+	fib_hash_genid++;
+	write_unlock_bh(&fib_hash_lock);
+
+	if (new_f)
+		fz->fz_nent++;
+	rt_cache_flush(-1);
+
+	rtmsg_fib(RTM_NEWROUTE, key, new_fa, cfg->fc_dst_len, tb->tb_id,
+		  &cfg->fc_nlinfo, 0);
+	return 0;
+
+out:
+	if (new_f)
+		kmem_cache_free(fn_hash_kmem, new_f);
+	fib_release_info(fi);
+	return err;
+}
+```
+
+#### fib_config
+
+```c
+struct fib_config {
+	u8			fc_dst_len;  // 地址长度
+	u8			fc_tos;      // 服务类型
+	u8			fc_protocol; // 路由协议
+	u8			fc_scope;    // 路由范围
+	u8			fc_type;     // 路由类型
+	/* 3 bytes unused */
+	u32			fc_table;    // 路由函数表
+	__be32			fc_dst;  // 路由目标地址
+	__be32			fc_gw;   // 路由网关地址
+	int			fc_oif;      // 出口设备ID
+	u32			fc_flags;    // 路由标志位
+	u32			fc_priority;    // 路由优先级
+	__be32			fc_prefsrc; // 
+	struct nlattr		*fc_mx; // 指向netlink属性队列
+	struct rtnexthop	*fc_mp; // 配置的跳转结构队列
+	int			fc_mx_len;
+	int			fc_mp_len;
+	u32			fc_flow;
+	u32			fc_nlflags;       // netlink  标志位
+	struct nl_info		fc_nlinfo; // netlink 信息结构
+ };
+```
+##### 设置fib_config
+fib_config分别在三条路线的这些地方被设置:
+	net-tools : ip_rt_ioctl -> rtentry_to_fib_config
+	iproute2 : inet_rtm_newroute -> rtm_to_fib_config
+	通知链 : fib_magic
+
+
+#### fn_new_zone
+```c
+static struct fn_zone *
+fn_new_zone(struct fn_hash *table, int z)
+{
+	int i;
+	struct fn_zone *fz = kzalloc(sizeof(struct fn_zone), GFP_KERNEL);
+	if (!fz)
+		return NULL;
+
+	if (z) {
+		fz->fz_divisor = 16;
+	} else {
+		fz->fz_divisor = 1;
+	}
+	fz->fz_hashmask = (fz->fz_divisor - 1);
+	fz->fz_hash = fz_hash_alloc(fz->fz_divisor);
+	if (!fz->fz_hash) {
+		kfree(fz);
+		return NULL;
+	}
+	fz->fz_order = z; // 记录子网掩码位数
+	fz->fz_mask = inet_make_mask(z); // 转换成子网掩码
+	                                 // 如果z为24, 则子网掩码 255.255.255.0
+									 // 如果z为16，则子网掩码 255.255.0.0
+
+	/* Find the first not empty zone with more specific mask */
+	for (i=z+1; i<=32; i++)
+		if (table->fn_zones[i])
+			break;
+	write_lock_bh(&fib_hash_lock);
+	if (i>32) {
+		/* No more specific masks, we are the first. */
+		fz->fz_next = table->fn_zone_list;
+		table->fn_zone_list = fz;
+	} else {
+		fz->fz_next = table->fn_zones[i]->fz_next;
+		table->fn_zones[i]->fz_next = fz;
+	}
+	table->fn_zones[z] = fz;
+	fib_hash_genid++;
+	write_unlock_bh(&fib_hash_lock);
+	return fz;
+}
+```
+
+## 基于输出方向的路由表查询与创建
+以tcp客户端connect操作为例
+	tcp_v4_connect -> ip_route_connect
+```c
+rp : 返回或设置路由项的双向指针
+dst : 目标地址
+src : 源地址
+tos : 服务类型
+protocol : 这里是IP协议
+sport : 源端口
+dport : 目标端口
+oif : 输出接口ID
+static inline int ip_route_connect(struct rtable **rp, __be32 dst,
+				   __be32 src, u32 tos, int oif, u8 protocol,
+				   __be16 sport, __be16 dport, struct sock *sk,
+				   int flags)
+{
+	struct flowi fl = { .oif = oif,
+			    .mark = sk->sk_mark,
+			    .nl_u = { .ip4_u = { .daddr = dst,
+						 .saddr = src,
+						 .tos   = tos } },
+			    .proto = protocol,
+			    .uli_u = { .ports =
+				       { .sport = sport,
+					 .dport = dport } } };
+
+	int err;
+	struct net *net = sock_net(sk);
+	if (!dst || !src) { // 如果没有指定目标地址 或 没有指定源地址，就要查路由表
+		err = __ip_route_output_key(net, rp, &fl);
+		if (err)
+			return err;
+		fl.fl4_dst = (*rp)->rt_dst; // 使用路由表的目的地址
+		fl.fl4_src = (*rp)->rt_src; // 使用路由表的源地址
+		ip_rt_put(*rp); // 递减路由表的路由项计数器
+		*rp = NULL;
+	}
+	security_sk_classify_flow(sk, &fl);
+	return ip_route_output_flow(net, rp, &fl, sk, flags); // 再次查找并调整地址
+}
+```
+
+### 重要的数据结构
+#### flowi
+用于网络层和传输层
+```c
+struct flowi {
+	int	oif;  // 出口ID
+	int	iif;  // 入口ID
+	__u32	mark; // 子网掩码
+
+	union {
+		struct {
+			__be32			daddr; // 目标地址
+			__be32			saddr; // 源地址
+			__u8			tos;   // 服务类型
+			__u8			scope; // 范围
+		} ip4_u;
+		
+		struct {
+			struct in6_addr		daddr;
+			struct in6_addr		saddr;
+			__be32			flowlabel;
+		} ip6_u;
+
+		struct {
+			__le16			daddr;
+			__le16			saddr;
+			__u8			scope;
+		} dn_u;
+	} nl_u; // 主要用于网络层
+#define fld_dst		nl_u.dn_u.daddr
+#define fld_src		nl_u.dn_u.saddr
+#define fld_scope	nl_u.dn_u.scope
+#define fl6_dst		nl_u.ip6_u.daddr
+#define fl6_src		nl_u.ip6_u.saddr
+#define fl6_flowlabel	nl_u.ip6_u.flowlabel
+#define fl4_dst		nl_u.ip4_u.daddr
+#define fl4_src		nl_u.ip4_u.saddr
+#define fl4_tos		nl_u.ip4_u.tos
+#define fl4_scope	nl_u.ip4_u.scope
+
+	__u8	proto;
+	__u8	flags;
+	union {
+		struct {
+			__be16	sport; // 源端口
+			__be16	dport; // 目的端口
+		} ports;
+
+		struct {
+			__u8	type;
+			__u8	code;
+		} icmpt;
+
+		struct {
+			__le16	sport;
+			__le16	dport;
+		} dnports;
+
+		__be32		spi;
+
+		struct {
+			__u8	type;
+		} mht;
+	} uli_u; // 主要用于传输层
+#define fl_ip_sport	uli_u.ports.sport
+#define fl_ip_dport	uli_u.ports.dport
+#define fl_icmp_type	uli_u.icmpt.type
+#define fl_icmp_code	uli_u.icmpt.code
+#define fl_ipsec_spi	uli_u.spi
+#define fl_mh_type	uli_u.mht.type
+	__u32           secid;	/* used by xfrm; see secid.txt */
+} __attribute__((__aligned__(BITS_PER_LONG/8)));
+```
+
+#### rtable
+```c
+struct rtable
+{
+	union
+	{
+		struct dst_entry	dst;
+	} u;
+
+	/* Cache lookup keys */
+	struct flowi		fl;
+
+	struct in_device	*idev;
+	
+	int			rt_genid;
+	unsigned		rt_flags;
+	__u16			rt_type;
+
+	__be32			rt_dst;	/* Path destination	*/
+	__be32			rt_src;	/* Path source		*/
+	int			rt_iif;
+
+	/* Info on neighbour */
+	__be32			rt_gateway;
+
+	/* Miscellaneous cached information */
+	__be32			rt_spec_dst; /* RFC1122 specific destination */
+	struct inet_peer	*peer; /* long-living peer info */
+};
+```
+
+# 疑问
+
+	fib_table_hash[TABLE_LOCAL_INDEX]
+	fib_table_hash[TABLE_MAIN_INDEX]
+本地路由表什么时候构建
+主路由表呢
+本地路由表和主路由表什么关系
+
 
