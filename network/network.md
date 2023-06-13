@@ -924,144 +924,101 @@ struct proto {
 ```
 # 地址设置
 从bind出发
-## sys_bind
+## __sys_bind
 ```c
-asmlinkage long sys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen)
-{
-	struct socket *sock;
-	char address[MAX_SOCK_ADDR];
-	int err, fput_needed;
-
-	sock = sockfd_lookup_light(fd, &err, &fput_needed);
-	if (sock) {
-
-		err = move_addr_to_kernel(umyaddr, addrlen, address);
-			int move_addr_to_kernel(void __user *uaddr, int ulen, void *kaddr)
-				if (copy_from_user(kaddr, uaddr, ulen))
-					return -EFAULT;
-				return audit_sockaddr(ulen, kaddr);
-
-		if (err >= 0) {
-			err = security_socket_bind(sock,
-						   (struct sockaddr *)address,
-						   addrlen);
-			if (!err)
-				// sock->ops = inet_stream_ops; // set in inet_create
-				err = sock->ops->bind(sock,
-						      (struct sockaddr *)
-						      address, addrlen); // inet_bind
-		}
-		fput_light(sock->file, fput_needed);
-	}
-	return err;
-}
+int __sys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen)
+	sock = sockfd_lookup_light(fd, &err, &fput_needed); // fd -> file -> sock
+	move_addr_to_kernel(umyaddr, addrlen, &address); // 将数据拷贝到内核空间
+	err = sock->ops->bind(sock,
+				  (struct sockaddr *)
+				  &address, addrlen); // 调用 inet_bind
 ```
-
-### 从fd找到socket
-```c
-static struct socket *sockfd_lookup_light(int fd, int *err, int *fput_needed)
-{
-	struct file *file;
-	struct socket *sock;
-
-	*err = -EBADF;
-	file = fget_light(fd, fput_needed);
-	if (file) {
-		sock = sock_from_file(file, err);
-			static struct socket *sock_from_file(struct file *file, int *err)
-				if (file->f_op == &socket_file_ops)
-					return file->private_data;	/* set in sock_map_fd */
-		if (sock)
-			return sock;
-		fput_light(file, *fput_needed);
-	}
-	return NULL;
-}
-```
-
 ## inet_bind
 ```c
 int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
-{
-	struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
 	struct sock *sk = sock->sk;
-	struct inet_sock *inet = inet_sk(sk);
-	unsigned short snum;
-	int chk_addr_ret;
-	int err;
 
-	/* If the socket has its own bind function then use it. (RAW) */
-	if (sk->sk_prot->bind) { // tcp_prot 没有自己的的 bind
-		err = sk->sk_prot->bind(sk, uaddr, addr_len);
-		goto out;
-	}
-	err = -EINVAL;
-	if (addr_len < sizeof(struct sockaddr_in))
-		goto out;
+	if (sk->sk_prot->bind) { // 如果是RAW会走自己的bind
+		return sk->sk_prot->bind(sk, uaddr, addr_len);
+	return __inet_bind(sk, uaddr, addr_len, BIND_WITH_LOCK);
 
-	// 在路由中检查地址类型
-	chk_addr_ret = inet_addr_type(sock_net(sk), addr->sin_addr.s_addr);
+		int __inet_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len,
+				u32 flags)
+			struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
+			struct inet_sock *inet = inet_sk(sk);
+			struct net *net = sock_net(sk);
+			
+			// 根据要绑定的地址，获得地址的类型
+			chk_addr_ret = inet_addr_type_table(net, addr->sin_addr.s_addr, tb_id);
+				return __inet_dev_addr_type(net, NULL, addr, tb_id);
+					__inet_dev_addr_type(struct net *net,
+											const struct net_device *dev,
+											__be32 addr, u32 tb_id)
+						// 将目标地址封装到 flowi4 
+						struct flowi4		fl4 = { .daddr = addr };
 
-	err = -EADDRNOTAVAIL;
-	if (!sysctl_ip_nonlocal_bind &&
-	    !inet->freebind &&
-	    addr->sin_addr.s_addr != htonl(INADDR_ANY) &&
-	    chk_addr_ret != RTN_LOCAL && 		// 是否单播类型
-	    chk_addr_ret != RTN_MULTICAST &&	// 是否多播类型
-	    chk_addr_ret != RTN_BROADCAST)		// 是否广播类型
-		goto out;
+						table = fib_get_table(net, tb_id);
+						// 传输fl4 ， 传出 res
+						fib_table_lookup(table, &fl4, &res, FIB_LOOKUP_NOREF);
+						return ret;
 
-	snum = ntohs(addr->sin_port); // 取得端口号
-	err = -EACCES;
-	if (snum && snum < PROT_SOCK && !capable(CAP_NET_BIND_SERVICE))
-		goto out;
 
-	// 如果其他进程占用sock则睡眠等待
-	lock_sock(sk);
+			// 过滤掉非法地址
+			if (!inet_can_nonlocal_bind(net, inet) &&
+				addr->sin_addr.s_addr != htonl(INADDR_ANY) &&
+				chk_addr_ret != RTN_LOCAL &&
+				chk_addr_ret != RTN_MULTICAST &&
+				chk_addr_ret != RTN_BROADCAST)
+				goto out;
 
-	/* Check these errors (active socket, double bind). */
-	err = -EINVAL;
-	// tcp初始化后 sk->sk_state = TCP_CLOSE;
-	if (sk->sk_state != TCP_CLOSE || inet->num)
-		goto out_release_sock;
+			// 得到源端口
+			snum = ntohs(addr->sin_port);
 
-	// 记录源地址
-	// rcv_saddr 用于哈希查找
-	// saddr 用于发送
-	inet->rcv_saddr = inet->saddr = addr->sin_addr.s_addr;
-	if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
-		inet->saddr = 0;  /* Use device */
+			// 得到源IP
+			inet->inet_rcv_saddr = inet->inet_saddr = addr->sin_addr.s_addr;
+			if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
+				inet->inet_saddr = 0;  /* Use device */
 
-	// 检查是否允许绑定
-	// 对于tcp是 inet_csk_get_port,
-	if (sk->sk_prot->get_port(sk, snum)) {
-		inet->saddr = inet->rcv_saddr = 0;
-		err = -EADDRINUSE;
-		goto out_release_sock;
-	}
+			// 调用传输层回调，确保地址可以绑定
+			if (snum || !(inet->bind_address_no_port ||
+					  (flags & BIND_FORCE_ADDRESS_NO_PORT)))
+				if (sk->sk_prot->get_port(sk, snum))
+					inet->inet_saddr = inet->inet_rcv_saddr = 0;
+					err = -EADDRINUSE;
+					goto out_release_sock;
 
-	if (inet->rcv_saddr) // 如果已经绑定了地址，则增加锁，表示已经绑定地址
-		sk->sk_userlocks |= SOCK_BINDADDR_LOCK;
-	if (snum) // 如果端口已经确定，则增加锁，表示已经绑定端口
-		sk->sk_userlocks |= SOCK_BINDPORT_LOCK;
-	
-	// 设置源端口
-	inet->sport = htons(inet->num);
+			// 地址绑定合法
+			// 设置sock已经绑定的标记
+			if (inet->inet_rcv_saddr)
+				sk->sk_userlocks |= SOCK_BINDADDR_LOCK;
+			if (snum)
+				sk->sk_userlocks |= SOCK_BINDPORT_LOCK;
 
-	// 初始化目标地址目标端口
-	inet->daddr = 0;
-	inet->dport = 0;
+			inet->inet_sport = htons(inet->inet_num);
+			inet->inet_daddr = 0;
+			inet->inet_dport = 0;
 
-	// 清空缓存的路由内容
-	sk_dst_reset(sk);
-	err = 0;
-out_release_sock:
-	// 解锁唤醒其他进程
-	release_sock(sk);
-out:
-	return err;
+			
+			// 将sock的目的地址设置为空，
+			// 之后，当发送报文时，会根据当前环境确定目的地址，保证数据路由到正确的目标
+			sk_dst_reset(sk);
+				sk_dst_set(sk, NULL);
+
+				sk_dst_set(struct sock *sk, struct dst_entry *dst)
+					sk_tx_queue_clear(sk); // 发送队列清零
+					sk->sk_dst_pending_confirm = 0;
+					// 将 sk->sk_dst_cache 设置为NULL, 返回以前的值
+					old_dst = xchg((__force struct dst_entry **)&sk->sk_dst_cache, dst);
+					dst_release(old_dst);
+
+
+xchg的效果
+int xchg(int *a, int *b)
+{
+	int tmp = *a;
+	*a = *b;
+	return tmp;
 }
-
 ```
 主要设置
 	源地址，源端口，设置 sk->sk_userlocks 增加已绑定地址端口
@@ -1074,49 +1031,102 @@ out:
 	sk->sk_userlocks |= SOCK_BINDPORT_LOCK;
 	inet->rcv_saddr = inet->saddr = addr->sin_addr.s_addr;
 
-### inet_addr_type
-分析此函数，搞懂地址类型
+### fib_table_lookup
 ```c
-inet_bind
-	chk_addr_ret = inet_dev_addr_type(sock_net(sk), addr->sin_addr.s_addr);
+struct key_vector {
+	t_key key;
+	unsigned char pos;		/* 2log(KEYLENGTH) bits needed */
+	unsigned char bits;		/* 2log(KEYLENGTH) bits needed */
+	unsigned char slen;
+	union {
+		/* This list pointer if valid if (pos | bits) == 0 (LEAF) */
+		struct hlist_head leaf;
+		/* This array is valid if (pos | bits) > 0 (TNODE) */
+		struct key_vector __rcu *tnode[0];
+	};
+};
 
-unsigned int inet_addr_type(struct net *net, __be32 addr)
-{
-	return __inet_dev_addr_type(net, NULL, addr);
-}
+int fib_table_lookup(struct fib_table *tb, const struct flowi4 *flp,
+		     struct fib_result *res, int fib_flags)
+	// 获得前缀树的根节点
+	struct trie *t = (struct trie *) tb->tb_data;
+	// 获得key, key为目标地址转换
+	const t_key key = ntohl(flp->daddr);
 
-static inline unsigned __inet_dev_addr_type(struct net *net,
-					    const struct net_device *dev,
-					    __be32 addr)
-{
-	// flowi 表示路由键值
-	struct flowi		fl = { .nl_u = { .ip4_u = { .daddr = addr } } };
-	struct fib_result	res;
-	unsigned ret = RTN_BROADCAST;
-	struct fib_table *local_table;
+	struct key_vector *n, *pn;
 
-	if (ipv4_is_zeronet(addr) || ipv4_is_lbcast(addr))
-		return RTN_BROADCAST;
-	if (ipv4_is_multicast(addr))
-		return RTN_MULTICAST;
+	pn = t->kv;
+	cindex = 0;
+	
+	// 获得 tv->kv->tnode[0]
+	n = get_child_rcu(pn, cindex); // pn->tnode[i]
 
-#ifdef CONFIG_IP_MULTIPLE_TABLES
-	res.r = NULL;
-#endif
+	// 下面循环相当于对目标地址的网络位和路由条目检查，得到最长的匹配条目
+	for (;;) {
 
-	// 获取本地路由表
-	local_table = fib_get_table(net, RT_TABLE_LOCAL);
-	if (local_table) {
-		ret = RTN_UNICAST;
-		// 查询路由表
-		if (!local_table->tb_lookup(local_table, &fl, &res)) {
-			if (!dev || dev == res.fi->fib_dev)
-				ret = res.type;
-			fib_res_put(&res);
+#define get_cindex(key, kv) (((key) ^ (kv)->key) >> (kv)->pos)
+		// kv->key 是路由条目的网络段
+		// 执行异或，如果两者网络位不一样，则  index会超过n可处理的位数
+		// 否则index得到子节点的索引值
+		index = get_cindex(key, n);
+
+		// 此处一定的匹配异常
+		if (index >= (1ul << n->bits))
+			break;
+
+		// 一直匹配到最长位置
+		if (IS_LEAF(n))
+			goto found;
+
+		if (n->slen > n->pos) {
+			pn = n;
+			cindex = index;
 		}
+
+		// 下一个节点
+		n = get_child_rcu(n, index);
 	}
-	return ret;
-}
+
+	// 处理网络位不匹配，此时会回溯节点，
+	// 默认路由就会在这里找到
+	for (;;) {
+
+	}
+
+found:
+	/* this line carries forward the xor from earlier in the function */
+	index = key ^ n->key;
+
+	// 网络位匹配，比较 叶子节点 上的链表，链表元素位 fib_alias
+	// 如果同样的网络位有多条路由，比如默认路由，则选排在前面的
+	hlist_for_each_entry_rcu(fa, &n->leaf, fa_list) {
+		struct fib_info *fi = fa->fa_info;
+
+		if (fa->fa_tos && fa->fa_tos != flp->flowi4_tos)
+			continue;
+		if (fi->fib_dead)
+			continue;
+		if (fa->fa_info->fib_scope < flp->flowi4_scope)
+			continue;
+
+		// fib_info->fib_nh[]
+		for (nhsel = 0; nhsel < fib_info_num_path(fi); nhsel++)
+		 	struct fib_nh_common *nhc = fib_info_nhc(fi, nhsel);
+			...
+set_result:
+
+			res->prefix = htonl(n->key);
+			res->prefixlen = KEYLENGTH - fa->fa_slen;
+			res->nh_sel = nhsel;
+			res->nhc = nhc;
+			res->type = fa->fa_type;
+			res->scope = fi->fib_scope;
+			res->fi = fi;
+			res->table = tb;
+			res->fa_head = &n->leaf;
+
+			return ;
+
 ```
 
 ### inet_csk_get_port
