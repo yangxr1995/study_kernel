@@ -934,12 +934,127 @@ int __sys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen)
 				  &address, addrlen); // 调用 inet_bind
 ```
 ## inet_bind
+
+### 理解路由表和策略路由
+要理解下面的内容，先要知道路由表有255张，除了下面一定有的两张表外，用户可以自定义表
+```c
+ 系统有一定有两张表，
+ tb_id == 255 是 MAIN 表，这个表由系统维护，用户不应该修改
+/ # ip route show table 255
+broadcast 127.0.0.0 dev lo scope link  src 127.0.0.1
+local 127.0.0.0/8 dev lo scope host  src 127.0.0.1
+local 127.0.0.1 dev lo scope host  src 127.0.0.1
+broadcast 127.255.255.255 dev lo scope link  src 127.0.0.1
+broadcast 192.168.3.0 dev eth0 scope link  src 192.168.3.10
+local 192.168.3.10 dev eth0 scope host  src 192.168.3.10
+broadcast 192.168.3.255 dev eth0 scope link  src 192.168.3.10
+/ #
+ tb_id == 254 是 LOCAL表，由用户设置，不如 ip route 命令添加
+/ # ip route show table 254
+default via 192.168.3.10 dev eth0 scope link
+192.168.3.0/24 dev eth0 scope link  src 192.168.3.10
+192.168.3.12 via 192.168.3.10 dev eth0
+```
+那么路由时应该选择那张路由表呢？
+由路由规则决定.
+如
+```c
+# 数据包的来源端 IP 是 192.168.1.10，就参考路由表 10
+ip rule add from 192.168.1.10 table 10
+# 如果来源端 IP 为 192.168.2.0/24 网段的 IP，就参考路由表 20
+ip rule add from 192.168.2.0/24 table 20
+
+# 查看策略表，系统默认会创建三个策略
+/ # ip rule
+0:      from all lookup local
+32766:  from all lookup main
+32767:  from all lookup default
+
+匹配路由表的规则和netfilter类似，按照优先级从高到低匹配（数值越小优先级越高）,
+首先使用 0 号表匹配，如果没找到，则使用下张表，若所有表都没有找到则路由失败。
+
+而在某张路由表中匹配时，按照最长匹配算法，得到路由项。
+
+具体是使用前缀树算法得到，可以查看当前的路由前缀树：
+/ # cat /proc/1/task/1/net/fib_trie
+Main:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 0.0.0.0
+        /0 universe UNICAST
+     +-- 127.0.0.0/8 2 0 2
+        +-- 127.0.0.0/31 1 0 0
+           |-- 127.0.0.0
+              /32 link BROADCAST
+              /8 host LOCAL
+           |-- 127.0.0.1
+              /32 host LOCAL
+        |-- 127.255.255.255
+           /32 link BROADCAST
+     +-- 192.168.3.0/24 2 0 2
+        +-- 192.168.3.0/28 2 0 2
+           |-- 192.168.3.0
+              /32 link BROADCAST
+              /24 link UNICAST
+           |-- 192.168.3.10
+              /32 host LOCAL
+        |-- 192.168.3.255
+           /32 link BROADCAST
+Local:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 0.0.0.0
+        /0 universe UNICAST
+     +-- 127.0.0.0/8 2 0 2
+        +-- 127.0.0.0/31 1 0 0
+           |-- 127.0.0.0
+              /32 link BROADCAST
+              /8 host LOCAL
+           |-- 127.0.0.1
+              /32 host LOCAL
+        |-- 127.255.255.255
+           /32 link BROADCAST
+     +-- 192.168.3.0/24 2 0 2
+        +-- 192.168.3.0/28 2 0 2
+           |-- 192.168.3.0
+              /32 link BROADCAST
+              /24 link UNICAST
+           |-- 192.168.3.10
+```
+
+### IP 层对bind 的检查
+	inet_bind 主要确保要绑定的IP能在本机访问到，如何知道IP能在本机访问到呢？
+	使用 fib_table_lookup 在 local_table  查询要绑定的地址，获得相关路由条目 fib_alias，
+	路由条目的 fib_alias->fa_type 说明应该如何访问此IP。
+	其中 RTN_UNICAST 在本机不能直接访问，只能通过下一条或给网关处理
+	RTN_LOCAL 在本机可以直接访问
+	RTN_BROADCAST 和 RTN_MULTICAST 可以本机直接访问
+```c
+enum {
+	RTN_UNSPEC,
+	RTN_UNICAST,		/* Gateway or direct route	*/
+	RTN_LOCAL,		/* Accept locally		*/
+	RTN_BROADCAST,		/* Accept locally as broadcast,
+				   send as broadcast */
+	RTN_ANYCAST,		/* Accept locally as broadcast,
+				   but send as unicast */
+	RTN_MULTICAST,		/* Multicast route		*/
+	RTN_BLACKHOLE,		/* Drop				*/
+	RTN_UNREACHABLE,	/* Destination is unreachable   */
+	RTN_PROHIBIT,		/* Administratively prohibited	*/
+	RTN_THROW,		/* Not in this table		*/
+	RTN_NAT,		/* Translate this address	*/
+	RTN_XRESOLVE,		/* Use external resolver	*/
+	__RTN_MAX
+};
+```
+
+代码分析
 ```c
 int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	struct sock *sk = sock->sk;
 
-	if (sk->sk_prot->bind) { // 如果是RAW会走自己的bind
+	if (sk->sk_prot->bind) // 如果是RAW会走自己的bind
 		return sk->sk_prot->bind(sk, uaddr, addr_len);
+
 	return __inet_bind(sk, uaddr, addr_len, BIND_WITH_LOCK);
 
 		int __inet_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len,
@@ -948,7 +1063,7 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 			struct inet_sock *inet = inet_sk(sk);
 			struct net *net = sock_net(sk);
 			
-			// 根据要绑定的地址，获得地址的类型
+			// 根据要绑定的地址，获得要绑定的IP的类型
 			chk_addr_ret = inet_addr_type_table(net, addr->sin_addr.s_addr, tb_id);
 				return __inet_dev_addr_type(net, NULL, addr, tb_id);
 					__inet_dev_addr_type(struct net *net,
@@ -957,18 +1072,21 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 						// 将目标地址封装到 flowi4 
 						struct flowi4		fl4 = { .daddr = addr };
 
+						// tb_id 默认位 255
 						table = fib_get_table(net, tb_id);
 						// 传输fl4 ， 传出 res
 						fib_table_lookup(table, &fl4, &res, FIB_LOOKUP_NOREF);
+						ret = res.type;
 						return ret;
 
 
-			// 过滤掉非法地址
+			// 过滤本地不能绑定的IP
+			// RTN_UNICAST 此IP需要走网关或直接路由才能访问，所以不能绑定本地主机
 			if (!inet_can_nonlocal_bind(net, inet) &&
 				addr->sin_addr.s_addr != htonl(INADDR_ANY) &&
-				chk_addr_ret != RTN_LOCAL &&
-				chk_addr_ret != RTN_MULTICAST &&
-				chk_addr_ret != RTN_BROADCAST)
+				chk_addr_ret != RTN_LOCAL &&       // 此IP在本地可以获得
+				chk_addr_ret != RTN_MULTICAST &&   // 此IP为多播,所以可以绑定本地
+				chk_addr_ret != RTN_BROADCAST)     // 此Ip为广播，所以可以绑定本地
 				goto out;
 
 			// 得到源端口
@@ -1020,212 +1138,145 @@ int xchg(int *a, int *b)
 	return tmp;
 }
 ```
-主要设置
-	源地址，源端口，设置 sk->sk_userlocks 增加已绑定地址端口
-	初始化目标地址端口
 
-	inet->sport = htons(inet->num);
-	inet->daddr = 0;
-	inet->dport = 0;
-	sk->sk_userlocks |= SOCK_BINDADDR_LOCK;
-	sk->sk_userlocks |= SOCK_BINDPORT_LOCK;
-	inet->rcv_saddr = inet->saddr = addr->sin_addr.s_addr;
+### 传输层对 bind 的检查 inet_csk_get_port
+数据结构间关系
+struct sock
+	struct proto		*skc_prot;
 
-### fib_table_lookup
-```c
-struct key_vector {
-	t_key key;
-	unsigned char pos;		/* 2log(KEYLENGTH) bits needed */
-	unsigned char bits;		/* 2log(KEYLENGTH) bits needed */
-	unsigned char slen;
+struct proto {
 	union {
-		/* This list pointer if valid if (pos | bits) == 0 (LEAF) */
-		struct hlist_head leaf;
-		/* This array is valid if (pos | bits) > 0 (TNODE) */
-		struct key_vector __rcu *tnode[0];
-	};
+		struct inet_hashinfo	*hashinfo;
+	} h;
+
+
+struct inet_hashinfo {
+	struct inet_bind_hashbucket	*bhash;
+
+struct inet_bind_hashbucket {
+	spinlock_t		lock;
+	struct hlist_head	chain;
 };
 
-int fib_table_lookup(struct fib_table *tb, const struct flowi4 *flp,
-		     struct fib_result *res, int fib_flags)
-	// 获得前缀树的根节点
-	struct trie *t = (struct trie *) tb->tb_data;
-	// 获得key, key为目标地址转换
-	const t_key key = ntohl(flp->daddr);
+结构图
+```txt
+[ struct sock || struct proto *sk_prot || sk_bind_node ] { basename: sock1 } 
+[ struct sock || struct proto *sk_prot || sk_bind_node ] { basename: sock2 } 
 
-	struct key_vector *n, *pn;
+[ struct sock | struct proto *sk_prot | sk_bind_node ] { basename: sock } 
 
-	pn = t->kv;
-	cindex = 0;
+[ struct proto | struct inet_hashinfo *hashinfo ] {basename : proto}
+
+[ struct inet_hashinfo | struct hlist_head chain ] { basename : inet_hashinfo }
+
+[ struct inet_bind_bucket | unsigned short port | node | struct hlist_head owners ] {basename : inet_bind_bucket0 }
+[ struct inet_bind_bucket | unsigned short port | node | struct hlist_head owners ] {basename : inet_bind_bucket1}
+[ struct inet_bind_bucket | unsigned short port | node | struct hlist_head owners ] {basename : inet_bind_bucket2}
 	
-	// 获得 tv->kv->tnode[0]
-	n = get_child_rcu(pn, cindex); // pn->tnode[i]
+[ sock.1 ]  ->  [ proto.0 ]
 
-	// 下面循环相当于对目标地址的网络位和路由条目检查，得到最长的匹配条目
-	for (;;) {
+[ proto.1 ] -> [inet_hashinfo.0]
 
-#define get_cindex(key, kv) (((key) ^ (kv)->key) >> (kv)->pos)
-		// kv->key 是路由条目的网络段
-		// 执行异或，如果两者网络位不一样，则  index会超过n可处理的位数
-		// 否则index得到子节点的索引值
-		index = get_cindex(key, n);
+[ inet_hashinfo.1 ] -> [ inet_bind_bucket0.2 ]
 
-		// 此处一定的匹配异常
-		if (index >= (1ul << n->bits))
-			break;
+[ inet_bind_bucket0.2] -> [inet_bind_bucket1.2]
+[ inet_bind_bucket1.2] -> [inet_bind_bucket2.2]
 
-		// 一直匹配到最长位置
-		if (IS_LEAF(n))
-			goto found;
+[inet_bind_bucket0.3] -> {flow:east} [sock1.2]
+[sock1.2] -> {flow:south} [sock2.2]
 
-		if (n->slen > n->pos) {
-			pn = n;
-			cindex = index;
-		}
-
-		// 下一个节点
-		n = get_child_rcu(n, index);
-	}
-
-	// 处理网络位不匹配，此时会回溯节点，
-	// 默认路由就会在这里找到
-	for (;;) {
-
-	}
-
-found:
-	/* this line carries forward the xor from earlier in the function */
-	index = key ^ n->key;
-
-	// 网络位匹配，比较 叶子节点 上的链表，链表元素位 fib_alias
-	// 如果同样的网络位有多条路由，比如默认路由，则选排在前面的
-	hlist_for_each_entry_rcu(fa, &n->leaf, fa_list) {
-		struct fib_info *fi = fa->fa_info;
-
-		if (fa->fa_tos && fa->fa_tos != flp->flowi4_tos)
-			continue;
-		if (fi->fib_dead)
-			continue;
-		if (fa->fa_info->fib_scope < flp->flowi4_scope)
-			continue;
-
-		// fib_info->fib_nh[]
-		for (nhsel = 0; nhsel < fib_info_num_path(fi); nhsel++)
-		 	struct fib_nh_common *nhc = fib_info_nhc(fi, nhsel);
-			...
-set_result:
-
-			res->prefix = htonl(n->key);
-			res->prefixlen = KEYLENGTH - fa->fa_slen;
-			res->nh_sel = nhsel;
-			res->nhc = nhc;
-			res->type = fa->fa_type;
-			res->scope = fi->fib_scope;
-			res->fi = fi;
-			res->table = tb;
-			res->fa_head = &n->leaf;
-
-			return ;
-
+               +-------------------------+--------------------------------+-------------------------+--------------------------+
+               | struct inet_bind_bucket |       unsigned short port      |           node          | struct hlist_head owners |
+               +-------------------------+--------------------------------+-------------------------+--------------------------+
+                                                                             ^
+                                                                             |
+                                                                             |
+               +-------------------------+--------------------------------+-------------------------+--------------------------+     +-----------------------+     +-----------------------+
+               | struct inet_bind_bucket |       unsigned short port      |           node          | struct hlist_head owners |     |      struct sock      |     |      struct sock      |
+               +-------------------------+--------------------------------+-------------------------+--------------------------+     +-----------------------+     +-----------------------+
+                                                                             ^                                                       |                       |     |                       |
+                                                                             |                                                       | struct proto *sk_prot |     | struct proto *sk_prot |
+                                                                             |                                                       +-----------------------+     +-----------------------+
+               +-------------------------+--------------------------------+-------------------------+--------------------------+     |                       |     |                       |
+               | struct inet_bind_bucket |       unsigned short port      |           node          | struct hlist_head owners | --> |     sk_bind_node      | --> |     sk_bind_node      |
+               +-------------------------+--------------------------------+-------------------------+--------------------------+     +-----------------------+     +-----------------------+
+                                                                             ^
+                                                                             |
+                                                                             |
+                                          +-------------------------------+-------------------------+
+                                          |     struct inet_hashinfo      | struct hlist_head chain |
+                                          +-------------------------------+-------------------------+
+                                            ^
+                                            |
+                                            |
+               +-------------------------+--------------------------------+
+               |      struct proto       | struct inet_hashinfo *hashinfo |
+               +-------------------------+--------------------------------+
+                 ^
+                 |
+                 |
++-------------+--------------------------+--------------------------------+
+| struct sock |   struct proto *sk_prot  |          sk_bind_node          |
++-------------+--------------------------+--------------------------------+
 ```
 
-### inet_csk_get_port
+
+
 ```c
-inet_bind
-	if (sk->sk_prot->get_port(sk, snum))
-
-int inet_csk_get_port(struct sock *sk, unsigned short snum)
+int inet_csk_get_port(struct sock *sk, unsigned short snum /*要绑定的端口*/)
 {
-	struct inet_hashinfo *hashinfo = sk->sk_prot->h.hashinfo;
+	// 获得本sock是否支持端口复用
+	bool reuse = sk->sk_reuse && sk->sk_state != TCP_LISTEN;
+
+	struct inet_hashinfo *hinfo = sk->sk_prot->h.hashinfo;
+	int ret = 1, port = snum;
 	struct inet_bind_hashbucket *head;
-	struct hlist_node *node;
-	struct inet_bind_bucket *tb;
-	int ret;
 	struct net *net = sock_net(sk);
+	struct inet_bind_bucket *tb = NULL;
+	int l3mdev;
 
-	local_bh_disable();
-	if (!snum) {
-		// 若没有指定端口，则随机分配
-		int remaining, rover, low, high;
+	// 如果没有显示绑定，则随机分配一个端口
+	if (!port) 
+		head = inet_csk_find_open_port(sk, &tb, &port);
+		goto success;
 
-		// 获得系统TCP端口的范围
-		inet_get_local_port_range(&low, &high);
-		remaining = (high - low) + 1;
-		rover = net_random() % remaining + low;
-
-		do {
-			// 查看随机分配的端口 rover 是否端口冲突
-			head = &hashinfo->bhash[inet_bhashfn(rover, hashinfo->bhash_size)];
-			spin_lock(&head->lock);
-			inet_bind_bucket_for_each(tb, node, &head->chain)
-				if (tb->ib_net == net && tb->port == rover)
-					goto next;
-			break;
-		next:
-			// 如果冲突了则  ++rover
-			spin_unlock(&head->lock);
-			if (++rover > high)
-				rover = low;
-		} while (--remaining > 0);
-
-		ret = 1;
-		// 没有找到
-		if (remaining <= 0)
-			goto fail;
-
-		// 找到合适的端口
-		snum = rover;
-	} else {
-		// 根据指定的端口号snum 找到 tb
-		head = &hashinfo->bhash[inet_bhashfn(snum, hashinfo->bhash_size)];
-		spin_lock(&head->lock);
-		inet_bind_bucket_for_each(tb, node, &head->chain)
-			if (tb->ib_net == net && tb->port == snum)
-				goto tb_found;
-	}
-	tb = NULL;
-	goto tb_not_found;
-tb_found:
-	// tb->owners 不为空，说明其他sock已经绑定了同样端口，需要检查是否冲突
-	if (!hlist_empty(&tb->owners)) {
-		if (tb->fastreuse > 0 &&
-		    sk->sk_reuse && sk->sk_state != TCP_LISTEN) {
-			// 如果tb开启fastreuse 和 sk 开启reuse，则成功
-			goto success;
-		} else {
-			ret = 1;
-			// 否则检查是否冲突
-			if (inet_csk(sk)->icsk_af_ops->bind_conflict(sk, tb))
-				goto fail_unlock;
-		}
-	}
+	head = &hinfo->bhash[inet_bhashfn(net, port,
+					  hinfo->bhash_size)];
+	spin_lock_bh(&head->lock);
+	inet_bind_bucket_for_each(tb, &head->chain)
+		if (net_eq(ib_net(tb), net) && tb->l3mdev == l3mdev &&
+		    tb->port == port)
+			goto tb_found;
 tb_not_found:
-	ret = 1;
-	// 若没找到tb，则创建tb，并关联 snum
-	if (!tb && (tb = inet_bind_bucket_create(hashinfo->bind_bucket_cachep,
-					net, head, snum)) == NULL)
+	tb = inet_bind_bucket_create(hinfo->bind_bucket_cachep,
+				     net, head, port, l3mdev);
+	if (!tb)
 		goto fail_unlock;
-	if (hlist_empty(&tb->owners)) {
-		if (sk->sk_reuse && sk->sk_state != TCP_LISTEN)
-			tb->fastreuse = 1;
-		else
-			tb->fastreuse = 0;
-	} else if (tb->fastreuse &&
-		   (!sk->sk_reuse || sk->sk_state == TCP_LISTEN))
-		tb->fastreuse = 0;
+tb_found:
+	if (!hlist_empty(&tb->owners)) {
+		if (sk->sk_reuse == SK_FORCE_REUSE)
+			goto success;
+
+		if ((tb->fastreuse > 0 && reuse) ||
+		    sk_reuseport_match(tb, sk))
+			goto success;
+		if (inet_csk_bind_conflict(sk, tb, true, true))
+			goto fail_unlock;
+	}
 success:
+	inet_csk_update_fastreuse(tb, sk);
+
 	if (!inet_csk(sk)->icsk_bind_hash)
-		inet_bind_hash(sk, tb, snum);
-	BUG_TRAP(inet_csk(sk)->icsk_bind_hash == tb);
+		inet_bind_hash(sk, tb, port);
+	WARN_ON(inet_csk(sk)->icsk_bind_hash != tb);
 	ret = 0;
 
 fail_unlock:
-	spin_unlock(&head->lock);
-fail:
-	local_bh_enable();
+	spin_unlock_bh(&head->lock);
 	return ret;
 }
 ```
+
 
 ### TCP 如何检查 bind_conflict
 ```c
