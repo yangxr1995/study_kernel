@@ -1160,64 +1160,71 @@ struct inet_bind_hashbucket {
 
 结构图
 ```txt
-[ struct sock || struct proto *sk_prot || sk_bind_node ] { basename: sock1 } 
-[ struct sock || struct proto *sk_prot || sk_bind_node ] { basename: sock2 } 
 
-[ struct sock | struct proto *sk_prot | sk_bind_node ] { basename: sock } 
+[ struct sock || struct proto *sk_prot || sk_bind_node ] { basename: sock1 }
+[ struct sock || struct proto *sk_prot || sk_bind_node ] { basename: sock2 }
 
-[ struct proto | struct inet_hashinfo *hashinfo ] {basename : proto}
+[ struct sock || struct proto *sk_prot || sk_bind_node ] { basename: sock }
 
-[ struct inet_hashinfo | struct hlist_head chain ] { basename : inet_hashinfo }
+[ struct proto || struct inet_hashinfo *hashinfo ] {basename : proto}
 
-[ struct inet_bind_bucket | unsigned short port | node | struct hlist_head owners ] {basename : inet_bind_bucket0 }
-[ struct inet_bind_bucket | unsigned short port | node | struct hlist_head owners ] {basename : inet_bind_bucket1}
-[ struct inet_bind_bucket | unsigned short port | node | struct hlist_head owners ] {basename : inet_bind_bucket2}
-	
-[ sock.1 ]  ->  [ proto.0 ]
+[ struct inet_hashinfo || struct hlist_head chain ] { basename : inet_hashinfo }
 
-[ proto.1 ] -> [inet_hashinfo.0]
+[ struct inet_bind_bucket b0 || unsigned short port || node || struct hlist_head owners ] {basename : inet_bind_bucket0 }
+[ struct inet_bind_bucket b1 || unsigned short port || node || struct hlist_head owners ] {basename : inet_bind_bucket1}
+[ struct inet_bind_bucket b2 || unsigned short port || node || struct hlist_head owners ] {basename : inet_bind_bucket2}
 
-[ inet_hashinfo.1 ] -> [ inet_bind_bucket0.2 ]
+[ sock.1 ] ->  {start:east;} [ proto.0 ]  { origin: sock.1; offset: 2,0; }
+
+[ proto.1 ] -> {start:east;} [inet_hashinfo.0] {origin:proto.1; offset: 2,0;}
+
+[ inet_hashinfo.1 ] -> {start:south; end:north} [ inet_bind_bucket0.0 ] {origin:inet_hashinfo.1; offset: 0,2; }
 
 [ inet_bind_bucket0.2] -> [inet_bind_bucket1.2]
+
 [ inet_bind_bucket1.2] -> [inet_bind_bucket2.2]
 
-[inet_bind_bucket0.3] -> {flow:east} [sock1.2]
-[sock1.2] -> {flow:south} [sock2.2]
+[inet_bind_bucket1.3] -> {start:south; end:north} [sock1.0] {origin:inet_bind_bucket1.3; offset : 0,2;}
 
-               +-------------------------+--------------------------------+-------------------------+--------------------------+
-               | struct inet_bind_bucket |       unsigned short port      |           node          | struct hlist_head owners |
-               +-------------------------+--------------------------------+-------------------------+--------------------------+
-                                                                             ^
-                                                                             |
-                                                                             |
-               +-------------------------+--------------------------------+-------------------------+--------------------------+     +-----------------------+     +-----------------------+
-               | struct inet_bind_bucket |       unsigned short port      |           node          | struct hlist_head owners |     |      struct sock      |     |      struct sock      |
-               +-------------------------+--------------------------------+-------------------------+--------------------------+     +-----------------------+     +-----------------------+
-                                                                             ^                                                       |                       |     |                       |
-                                                                             |                                                       | struct proto *sk_prot |     | struct proto *sk_prot |
-                                                                             |                                                       +-----------------------+     +-----------------------+
-               +-------------------------+--------------------------------+-------------------------+--------------------------+     |                       |     |                       |
-               | struct inet_bind_bucket |       unsigned short port      |           node          | struct hlist_head owners | --> |     sk_bind_node      | --> |     sk_bind_node      |
-               +-------------------------+--------------------------------+-------------------------+--------------------------+     +-----------------------+     +-----------------------+
-                                                                             ^
-                                                                             |
-                                                                             |
-                                          +-------------------------------+-------------------------+
-                                          |     struct inet_hashinfo      | struct hlist_head chain |
-                                          +-------------------------------+-------------------------+
-                                            ^
-                                            |
-                                            |
-               +-------------------------+--------------------------------+
-               |      struct proto       | struct inet_hashinfo *hashinfo |
-               +-------------------------+--------------------------------+
-                 ^
-                 |
-                 |
-+-------------+--------------------------+--------------------------------+
-| struct sock |   struct proto *sk_prot  |          sk_bind_node          |
-+-------------+--------------------------+--------------------------------+
+[sock1.2] -> [sock2.2]
+
+
++----------------------------+
+|        struct sock         |
++----------------------------+
+|                            |     +--------------------------------+
+|   struct proto *sk_prot    | --> |          struct proto          |
++----------------------------+     +--------------------------------+
+|                            |     |                                |     +----------------------------+
+|        sk_bind_node        |     | struct inet_hashinfo *hashinfo | --> |    struct inet_hashinfo    |
++----------------------------+     +--------------------------------+     +----------------------------+
+                                                                          |  struct hlist_head chain   |
+                                                                          +----------------------------+
+                                                                            |
+                                                                            |
+                                                                            v
++----------------------------+     +--------------------------------+     +----------------------------+
+| struct inet_bind_bucket b2 |     |   struct inet_bind_bucket b1   |     | struct inet_bind_bucket b0 |
++----------------------------+     +--------------------------------+     +----------------------------+
+|    unsigned short port     |     |      unsigned short port       |     |    unsigned short port     |
++----------------------------+     +--------------------------------+     +----------------------------+
+|                            |     |                                |     |                            |
+|            node            | <-- |              node              | <-- |            node            |
++----------------------------+     +--------------------------------+     +----------------------------+
+|  struct hlist_head owners  |     |    struct hlist_head owners    |     |  struct hlist_head owners  |
++----------------------------+     +--------------------------------+     +----------------------------+
+                                     |
+                                     |
+                                     v
+                                   +--------------------------------+     +----------------------------+
+                                   |          struct sock           |     |        struct sock         |
+                                   +--------------------------------+     +----------------------------+
+                                   |     struct proto *sk_prot      |     |   struct proto *sk_prot    |
+                                   +--------------------------------+     +----------------------------+
+                                   |                                |     |                            |
+                                   |          sk_bind_node          | --> |        sk_bind_node        |
+                                   +--------------------------------+     +----------------------------+
+
 ```
 
 
