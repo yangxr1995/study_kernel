@@ -1,4 +1,4 @@
-基于 linux-2.6.26
+基于 linux-5.10
 
 # 1. 网络文件系统
 
@@ -1437,6 +1437,42 @@ default         192.168.112.2   0.0.0.0         UG    102    0        0 ens38
 
 net-tools 不能设置多路径路由和策略路由。
 
+### 介绍多路经路由和策略路由
+* 多路经路由
+多路经路由（Multi-path Routing）是一种网络路由技术，旨在通过同时利用多条路径来增加网络的带宽利用率、减少传输延迟、提高网络性能和可靠性。传统的单路经路由只会选择一条路径来传输数据，而多路经路由允许同时使用多条路径，将数据流量分散到多个路径上进行传输。
+
+多路经路由的核心思想是根据网络状况和数据流量需求，动态地选择最优的路径来传输数据。它可以基于多种策略来实现路径选择，例如基于负载均衡、最短路径、链路质量等。多路经路由可以在不同层次的网络中实现，包括局域网（LAN）、广域网（WAN）以及互联网。
+
+* 策略路由
+策略路由是实现多路经路由的方式之一。
+
+多路经路由策略是通过定义特定的路由策略，使得根据不同的规则将流量分发到不同的路由路径上。这可以通过使用iproute2工具集中的ip rule和ip route命令来实现。
+
+首先，使用ip rule命令设置路由策略，例如：
+
+将来自源IP地址到目标IP地址的数据包路由到指定的路由表（table）。可以设置多个规则，每个规则对应不同的源、目标和路由表。
+```shell
+ip rule add from <source> to <destination> lookup <table>
+```
+
+接下来，使用ip route命令定义路由表，例如：
+```shell
+ip route add <network> via <gateway> dev <interface> table <table>
+```
+上述命令将目标网络的流量通过指定的网关和接口路由到相应的路由表。可以为不同的路由表定义不同的路由。
+
+通过组合使用ip rule和ip route命令，可以根据自定义规则将流量分发到不同的路径上，实现多路经路由。
+
+
+* 动态路由协议
+动态路由协议是实现多路经路由的另一种技术.
+
+动态路由协议是通过网络设备之间的协商和交互，自动选择最佳路径来进行路由。在Linux环境中，常见的动态路由协议包括Routing Information Protocol（RIP）、Open Shortest Path First（OSPF）和Border Gateway Protocol（BGP）等。
+
+使用动态路由协议，可以在网络中的路由器之间建立动态路由邻居关系，交换路由信息，并根据网络的动态变化自动更新路由表。每个路由器根据接收到的路由信息计算出最佳路径，并将数据包发送到相应的下一跳路由器。
+
+要配置动态路由协议，需要在每个路由器上安装并配置相应的协议软件，例如Quagga、Bird等。每个路由器需要指定邻居路由器的IP地址、协议参数和网络拓扑等信息。一旦配置完成，路由器将自动与邻居路由器建立邻居关系，并通过交换路由信息来实现动态路由。
+
 ### 使用net-tools 设置路由
 ```c
 ioctl -> sys_ioctl -> do_vfs_ioctl -> vfs_ioctl -> sock_ioctl -> inet_ioctl -> ip_rt_ioctl
@@ -1566,43 +1602,23 @@ static struct notifier_block fib_netdev_notifier = {
 fib_add_ifaddr 和 fib_del_ifaddr 都使用 fib_magic函数实现对路由地址的操作
 ```c
 void fib_add_ifaddr(struct in_ifaddr *ifa)
-{
-	struct in_device *in_dev = ifa->ifa_dev;
-	struct net_device *dev = in_dev->dev;
-	struct in_ifaddr *prim = ifa;
-	__be32 mask = ifa->ifa_mask;
-	__be32 addr = ifa->ifa_local;
-	__be32 prefix = ifa->ifa_address&mask;
-
-	if (ifa->ifa_flags&IFA_F_SECONDARY) {
-		prim = inet_ifa_byprefix(in_dev, prefix, mask);
-		if (prim == NULL) {
-			printk(KERN_WARNING "fib_add_ifaddr: bug: prim == NULL\n");
-			return;
-		}
-	}
-
 	fib_magic(RTM_NEWROUTE, RTN_LOCAL, addr, 32, prim);
 
 	if (!(dev->flags&IFF_UP))
 		return;
 
-	/* Add broadcast address, if it is explicitly assigned. */
 	if (ifa->ifa_broadcast && ifa->ifa_broadcast != htonl(0xFFFFFFFF))
 		fib_magic(RTM_NEWROUTE, RTN_BROADCAST, ifa->ifa_broadcast, 32, prim);
 
 	if (!ipv4_is_zeronet(prefix) && !(ifa->ifa_flags&IFA_F_SECONDARY) &&
-	    (prefix != addr || ifa->ifa_prefixlen < 32)) {
+	    (prefix != addr || ifa->ifa_prefixlen < 32))
+
 		fib_magic(RTM_NEWROUTE, dev->flags&IFF_LOOPBACK ? RTN_LOCAL :
 			  RTN_UNICAST, prefix, ifa->ifa_prefixlen, prim);
-
-		/* Add network specific broadcasts, when it takes a sense */
-		if (ifa->ifa_prefixlen < 31) {
+		if (ifa->ifa_prefixlen < 31)
 			fib_magic(RTM_NEWROUTE, RTN_BROADCAST, prefix, 32, prim);
 			fib_magic(RTM_NEWROUTE, RTN_BROADCAST, prefix|~mask, 32, prim);
-		}
-	}
-}
+
 
 static void fib_magic(int cmd, int type, __be32 dst, int dst_len, struct in_ifaddr *ifa)
 {
