@@ -195,7 +195,7 @@ int ip_rt_ioctl(struct net *net, unsigned int cmd, struct rtentry *rt)
 								trie_rebalance(t, tp);
 ```
 
-## 查询路由逻辑
+## 基于输出方向的路由查询
 ```
 #===========#
 H fib_table H
@@ -234,7 +234,7 @@ H fib_table H
 	需要再遍历 leaf->leaf 链表，找到对于的 fib_alias.
 	fib_alias->fa_info 有具体的路由信息
 	
-# connect
+## connect
 connect 127.0.0.1
 __sys_connect -> inet_stream_connect -> tcp_v4_connect
 ```c
@@ -260,3 +260,15 @@ tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 	tcp_connect(sk);
 ```
 
+# 输入方向的路由查询
+接受IP报文后，需要查询路由以判断是否转发，若转发目的地址能否到达，等，都需要查询路由。
+```c
+skb : 接受到的数据包
+dst : IP头记录的目的地址
+src : IP头记录的源地址
+tos : IP头记录的服务类型
+devin : 接受数据包的网络设备
+ip_route_input(struct sk_buff *skb, __be32 dst, __be32 src,
+				 u8 tos, struct net_device *devin)
+	ip_route_input_noref(skb, dst, src, tos, devin);
+```
