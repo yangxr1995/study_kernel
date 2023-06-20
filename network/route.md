@@ -271,4 +271,217 @@ devin : 接受数据包的网络设备
 ip_route_input(struct sk_buff *skb, __be32 dst, __be32 src,
 				 u8 tos, struct net_device *devin)
 	ip_route_input_noref(skb, dst, src, tos, devin);
+		if (ipv4_is_multicast(daddr)) // 检查目的地址是否为组播地址
+			// 检查组播地址是否本地配置的组播地址
+			our = ip_check_mc_rcu(in_dev, daddr, saddr,
+						  ip_hdr(skb)->protocol);
+
+			// 如果是本地配置的组播地址，则为其创建路由表
+			if (our)
+				err = ip_route_input_mc(skb, daddr, saddr,
+							tos, dev, our);
+			return err;
+
+		//  为广播或单播创建路由表
+		return ip_route_input_slow(skb, daddr, saddr, tos, dev, res);
 ```
+## ip_route_input_slow
+根据目标地址创建本地路由表或转发路由表.
+(根据挂载的函数不同，而分为不同类型的路由表)
+
+处理 目标地址为单播，广播，
+分为 RTN_LOCAL, RTN_BROADCAST, RTN_UNICAST
+```c
+ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+			       u8 tos, struct net_device *dev,
+			       struct fib_result *res)
+	// 获取设备结构	
+	struct in_device *in_dev = __in_dev_get_rcu(dev);
+
+	/* IP on this device is disabled. */
+	if (!in_dev)
+		goto out;
+
+	// 如果源地址是多播或广播，则为源地址错误
+	if (ipv4_is_multicast(saddr) || ipv4_is_lbcast(saddr))
+		goto martian_source;
+
+	// 如果目的地址是广播，或 源地址和目的地址都为 0，则使用广播处理
+	if (ipv4_is_lbcast(daddr) || (saddr == 0 && daddr == 0))
+		goto brd_input;
+
+	// 如果源地址是 0 ，则为源地址错误
+	if (ipv4_is_zeronet(saddr))
+		goto martian_source;
+
+	// 如果目的地址是0，则为目的地址错误
+	if (ipv4_is_zeronet(daddr))
+		goto martian_destination;
+
+
+	// 根据IP包构造 flowi4 
+	fl4.daddr = daddr;
+	fl4.saddr = saddr;
+	...
+
+	// 如果目标或源地址是回环地址，但设备不是本地网络设备，则错误
+	// 本地网络设备就是主机自己的设备
+	if (ipv4_is_loopback(daddr)) {
+		if (!IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
+			goto martian_destination;
+	} else if (ipv4_is_loopback(saddr)) {
+		if (!IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
+			goto martian_source;
+	}
+
+	//  查询到达目标地址的路由
+	err = fib_lookup(net, &fl4, res, 0);
+	if (err != 0) {
+		// 无法路由
+		// 设备不支持转发，报错，主机无法到达
+		if (!IN_DEV_FORWARD(in_dev))
+			err = -EHOSTUNREACH;
+		// 设备支持转发，报错，没有路由
+		goto no_route;
+	}
+
+	// 如果目标地址是广播
+	if (res->type == RTN_BROADCAST) {
+		// 如果设备支持转发，则跳转到 make_route
+		if (IN_DEV_BFORWARD(in_dev))
+			goto make_route;
+		// 如果设备不支持转发，跳转到 brd_input
+		goto brd_input;
+	}
+
+	// 如果目标地址是本机
+	if (res->type == RTN_LOCAL) {
+		// 检查源地址
+		err = fib_validate_source(skb, saddr, daddr, tos,
+					  0, dev, in_dev, &itag);
+		if (err < 0) // 源地址错误
+			goto martian_source;
+		// 跳转到本地
+		goto local_input;
+	}
+
+	// 处理目标地址是 RTN_UNICAST，也就是需要转发到其他主机
+
+	// 如果不支持转发, 报错
+	if (!IN_DEV_FORWARD(in_dev)) {
+		err = -EHOSTUNREACH;
+		goto no_route;
+	}
+
+	// 如果 目标地址不是 RTN_UNICAST ，则错误
+	if (res->type != RTN_UNICAST)
+		goto martian_destination;
+
+make_route:
+	// 处理转发
+	// 对于需要转发的数据包，调用 ip_mkroute_input 处理
+	err = ip_mkroute_input(skb, res, in_dev, daddr, saddr, tos, flkeys);
+
+out:	return err;
+
+brd_input:
+	// 处理接受广播输入
+	if (skb->protocol != htons(ETH_P_IP))
+		goto e_inval;
+
+	// 如果源地址不为0，确保源地址合法
+	if (!ipv4_is_zeronet(saddr)) {
+		err = fib_validate_source(skb, saddr, 0, tos, 0, dev,
+					  in_dev, &itag);
+		if (err < 0)
+			goto martian_source;
+	}
+	flags |= RTCF_BROADCAST;
+	res->type = RTN_BROADCAST;
+	RT_CACHE_STAT_INC(in_brd);
+
+local_input:
+
+	...
+
+	// 创建路由项
+	// 对于输入主机的数据包，创建本地路由表项，设置下一步处理函数为 ip_local_deliver
+	rth = rt_dst_alloc(ip_rt_get_dev(net, res),
+			   flags | RTCF_LOCAL, res->type,
+			   no_policy, false);
+		if (flags & RTCF_LOCAL)
+			rt->dst.input = ip_local_deliver;
+
+	rth->dst.output= ip_rt_bug; // 设置输出方向函数
+	... // 设置 rtable rth
+
+
+	// 设置数据包的 目的地址相关信息：如下一跳地址，路由索引等
+	skb_dst_set(skb, &rth->dst);
+
+	goto out;
+
+no_route:
+	RT_CACHE_STAT_INC(in_no_route);
+	res->type = RTN_UNREACHABLE;
+	res->fi = NULL;
+	res->table = NULL;
+	goto local_input;
+
+	...
+```
+
+## ip_mkroute_input
+```c
+ip_mkroute_input(struct sk_buff *skb,
+			    struct fib_result *res,
+			    struct in_device *in_dev,
+			    __be32 daddr, __be32 saddr, u32 tos,
+			    struct flow_keys *hkeys)
+
+	return __mkroute_input(skb, res, in_dev, daddr, saddr, tos);
+
+
+__mkroute_input(struct sk_buff *skb,
+			   const struct fib_result *res,
+			   struct in_device *in_dev,
+			   __be32 daddr, __be32 saddr, u32 tos)
+
+	struct fib_nh_common *nhc = FIB_RES_NHC(*res); // 准备路由信息
+	struct net_device *dev = nhc->nhc_dev; // 获得输出设备
+	
+
+	out_dev = __in_dev_get_rcu(dev);
+
+	// 判断源地址合法
+	err = fib_validate_source(skb, saddr, daddr, tos, FIB_RES_OIF(*res),
+				  in_dev->dev, in_dev, &itag);
+
+	...	
+
+
+	// 分配路由缓存项
+	// 设置输出方向函数为 ip_forward
+	rth = rt_dst_alloc(out_dev->dev, 0, res->type, no_policy,
+			   IN_DEV_ORCONF(out_dev, NOXFRM));
+		rt->dst.output = ip_output;
+		if (flags & RTCF_LOCAL)
+			rt->dst.input = ip_local_deliver;
+
+	rth->dst.input = ip_forward;
+
+	// 设置下一跳
+	rt_set_nexthop(rth, daddr, res, fnhe, res->fi, res->type, itag,
+		       do_cache);
+		rt->rt_gw4 = nhc->nhc_gw.ipv4;
+
+	skb_dst_set(skb, &rth->dst);
+		skb->_skb_refdst = (unsigned long)dst;
+```
+
+
+# dst_entry
+不论是输入的数据包还是输出的数据包，都会查询路由表，会获得rtable，rtable封装了dst_entry，
+dst_entry包含了路由相关信息，被设置到 sk的 dst字段，帮助协议栈在处理数据包的过程中进行路由选择和转发。
+
+
