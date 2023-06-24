@@ -1459,5 +1459,174 @@ __sys_accept4(int fd, struct sockaddr __user *upeer_sockaddr,
 	__sys_accept4_file(f.file, 0, upeer_sockaddr,
 						upeer_addrlen, flags,
 						rlimit(RLIMIT_NOFILE));
+		// 获得空闲fd
+		newfd = __get_unused_fd_flags(flags, nofile);
+			__alloc_fd(current->files, 0, nofile, flags);
+				__alloc_fd(struct files_struct *files,
+						   unsigned start, unsigned end, unsigned flags)
 
+		newfile = do_accept(file, file_flags, upeer_sockaddr, upeer_addrlen,
+					flags);
+			// 根据file获得sock
+			sock = sock_from_file(file, &err);
+			// 创建新sock
+			newsock = sock_alloc();
+			newsock->type = sock->type;
+			newsock->ops = sock->ops;
+			newfile = sock_alloc_file(newsock, flags, sock->sk->sk_prot_creator->name);
+				// 创建file 关联 socket inode，绑定 fops
+				file = alloc_file_pseudo(SOCK_INODE(sock), sock_mnt, dname,
+							O_RDWR | (flags & O_NONBLOCK),
+							&socket_file_ops);
+				sock->file = file;
+				file->private_data = sock;
+
+
+			sock->ops->accept(sock, newsock, sock->file->f_flags | file_flags,
+							false);
+				inet_accept(struct socket *sock, struct socket *newsock, int flags, bool kern)
+					struct sock *sk1 = sock->sk;
+					struct sock *sk2 = sk1->sk_prot->accept(sk1, flags, &err, kern);
+						inet_csk_accept(struct sock *sk, int flags, int *err, bool kern)
+
+							// 获得监听sock的接受队列
+							struct inet_connection_sock *icsk = inet_csk(sk);
+							struct request_sock_queue *queue = &icsk->icsk_accept_queue;
+							// 如果接受队列为空，则挂起等待
+							if (reqsk_queue_empty(queue)) // READ_ONCE(queue->rskq_accept_head) == NULL
+								inet_csk_wait_for_connect(sk, timeo);
+									for (;;)
+										// 挂起自己，直到请求队列不为空 
+										sched_annotate_sleep();
+										if (!reqsk_queue_empty(&icsk->icsk_accept_queue))
+											break;
+							// 如果请求队列有待处理的请求，则取出请求，返回请求的sock
+							req = reqsk_queue_remove(queue, sk);
+							newsk = req->sk;
+							return newsk;
+
+				// 将请求队列获得的 sock *sk2 和 socket *newsock 建立关系
+				sock_graft(sk2, newsock);
+					newsock->sk = sk2;
+					sk2->sk_socket = newsock;
+				// 修改newsock状态，返回newsock
+				newsock->state = SS_CONNECTED;
+
+
+			// 拷贝对端地址信息到用户空间 upeer_sockaddr
+			len = newsock->ops->getname(newsock,
+						(struct sockaddr *)&address, 2);
+			err = move_addr_to_user(&address,
+						len, upeer_sockaddr, upeer_addrlen);
+			return newfile;
+
+
+		// 建立文件会话和fd关联
+		fd_install(newfd, newfile);
+		return newfd;
 ```
+
+# 发起连接
+## __sys_connect
+```c
+__sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
+	struct fd f;
+	f = fdget(fd);
+	move_addr_to_kernel(uservaddr, addrlen, &address);
+	__sys_connect_file(f.file, &address, addrlen, 0);
+		struct socket *sock;
+		sock = sock_from_file(file, &err);
+		sock->ops->connect(sock, (struct sockaddr *)address, addrlen,
+					 sock->file->f_flags | file_flags);
+
+			inet_stream_connect(struct socket *sock, struct sockaddr *uaddr,
+						int addr_len, int flags)
+				__inet_stream_connect(sock, uaddr, addr_len, flags, 0);
+
+					switch (sock->state) {
+						case SS_UNCONNECTED:
+							sk->sk_prot->connect(sk, uaddr, addr_len);
+								tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+									struct sockaddr_in *usin = (struct sockaddr_in *)uaddr;
+									nexthop = daddr = usin->sin_addr.s_addr;
+									orig_sport = inet->inet_sport;
+									orig_dport = usin->sin_port;
+									fl4 = &inet->cork.fl.u.ip4;
+									// 查询路由
+									rt = ip_route_connect(fl4, nexthop, inet->inet_saddr,
+												  RT_CONN_FLAGS(sk), sk->sk_bound_dev_if,
+												  IPPROTO_TCP,
+												  orig_sport, orig_dport, sk);
+									// 设置路由项
+									sk_setup_caps(sk, &rt->dst);
+										sk_dst_set(sk, dst);
+											sk->sk_dst_cache = dst;
+
+									// 构建SYN并且发送
+									tcp_connect(sk);
+```
+
+## tcp_connect 构建SYN并发送
+```c
+tcp_connect(struct sock *sk)
+	struct sk_buff *buff;
+
+	// 初始化tcp_sock结构内容
+	tcp_connect_init(sk);
+	
+	// 准备SYN数据包
+	buff = sk_stream_alloc_skb(sk, 0, sk->sk_allocation, true);
+		sk_stream_alloc_skb(struct sock *sk, int size, gfp_t gfp, bool force_schedule)
+			// 如果没有指定size，且cache有skb，则返回缓存的skb
+			if (likely(!size))
+				skb = sk->sk_tx_skb_cache;
+				sk->sk_tx_skb_cache = NULL;
+				if (skb)
+					return skb;
+
+			skb = alloc_skb_fclone(size + sk->sk_prot->max_header, gfp);
+				return __alloc_skb(size, priority, SKB_ALLOC_FCLONE, NUMA_NO_NODE);
+					struct kmem_cache *cache;
+					// 分配skb
+					skb = kmem_cache_alloc_node(cache, gfp_mask & ~__GFP_DMA, node);
+					// 分配数据包内存
+					data = kmalloc_reserve(size, gfp_mask, node, &pfmemalloc);
+					// 将skb和数据包缓存绑定
+					skb->head = data;
+					skb->data = data;
+					skb->tail = skb->data;
+					skb->end = skb->tail + size;
+					return skb;
+
+			// 给header留空间
+			skb_reserve(skb, sk->sk_prot->max_header);
+				skb->data += len;
+				skb->tail += len;
+			skb->reserved_tailroom = skb->end - skb->tail - size;
+			INIT_LIST_HEAD(&skb->tcp_tsorted_anchor);
+			return skb;
+
+		// 设置报文TCP部分
+		tcp_init_nondata_skb(buff, tp->write_seq++, TCPHDR_SYN);
+			TCP_SKB_CB(skb)->tcp_flags = flags;
+			TCP_SKB_CB(skb)->sacked = 0;
+			TCP_SKB_CB(skb)->seq = seq;
+			...
+		// 设置报文和sk		
+		...
+		
+		// 将报文加入发送队列
+		tcp_rbtree_insert(&sk->tcp_rtx_queue, buff);
+
+		// 发送SYN
+		err = tp->fastopen_req ? tcp_send_syn_data(sk, buff) :
+			  tcp_transmit_skb(sk, buff, 1, sk->sk_allocation);
+			return __tcp_transmit_skb(sk, skb, clone_it, gfp_mask,
+						  tcp_sk(sk)->rcv_nxt);
+
+				tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it, gfp_t gfp_mask)
+					__tcp_transmit_skb(sk, skb, clone_it, gfp_mask,
+								  tcp_sk(sk)->rcv_nxt);
+			    
+```
+
