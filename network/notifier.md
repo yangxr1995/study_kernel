@@ -1,5 +1,11 @@
 # 简介
-为了及时响应事件，采用通知链的方式来指向指定函数，每个事件都对应一个通知链节点。
+Linux模块之间相互依赖，当一个模块发生事件，需要通知其他模块，但问题是，他不知道
+谁依赖于他，这就需要事件通知链。
+
+事件通知链是一个函数链表，
+被通知方提供事件处理函数，
+通知方在事件发生时遍历函数链表，执行函数.
+
 通知链节点定义如下：
 ```c
 struct notifier_block {
@@ -9,6 +15,14 @@ struct notifier_block {
 };
 ```
 由于优先级的存在，通知链会按照一定顺序执行。
+
+对于网络子系统，特别重要的通知链有3个：
+* inetaddr_chain : IPv4地址改变时通知
+* inet6addr_chain : IPv6地址改变时通知
+* netdev_chain : 设备注册，状态变化时通知
+
+网络子系统通知链包装函数
+![](./pic/15.jpg)
 
 # 设备通知链
 ## 设备通知链节点的挂入
@@ -305,6 +319,6 @@ fib_inetaddr_event(struct notifier_block *this, unsigned long event, void *ptr)
 	struct in_ifaddr *ifa = (struct in_ifaddr *)ptr;
 	struct net_device *dev = ifa->ifa_dev->dev;
 	struct net *net = dev_net(dev);
-
-
 ```
+
+
