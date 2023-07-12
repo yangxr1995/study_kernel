@@ -98,7 +98,8 @@ el3_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
 ### 网络子系统的软中断
 网络子系统使用软中断 NET_TX_SOFTIRQ, NET_RX_SOFTIRQ, 都是在 net_dev_init初始化。
-因为同一个软中断处理程序可以在不同CPU同时执行，所以网络代码的延迟很小，两个软中断的优先级都比tasklet一般优先级 TASKLET_SOFTIRQ 高，但低于最高优先级 HI_SOFTIRQ, 保证在网络流量高峰时其他任务也能得到响应。
+因为同一个软中断处理程序可以在不同CPU同时执行，所以网络代码的延迟很小，
+两个软中断的优先级都比tasklet一般优先级 TASKLET_SOFTIRQ 高，但低于最高优先级 HI_SOFTIRQ, 保证在网络流量高峰时其他任务也能得到响应。
 
 # 网络驱动程序的实现
 ## 初始化
@@ -207,8 +208,8 @@ static int __init netcard_probe1(struct net_device *dev, int ioaddr)
 }
 ```
 
-### 网络设备的活动功能
-#### open close
+## 网络设备的活动功能
+### open close
 注册网络设备后，不能用于发送数据包，还需要分配IP，激活设备。这两个操作在用户空间使用ifconfig执行，ifconfig调用ioctl完成任务：
 * ioctl SIOCSIFADDR, 设置IP地址
 * ioctl SIOCSIFFLAGS, 设置 dev->flags 的 IFFUP，激活设备
@@ -266,7 +267,7 @@ net_close(struct net_device *dev)
 	return 0;
 }
 ```
-### 数据传输
+## 发送数据包
 当内核要发送数据时调用netdev->hard_start_xmit.
 hard_start_xmit会尽可能保证发送成功，如果成功返回0，内核会释放socket buffer, 如果返回非0，发送失败，内核会过一段时间后重新发送，这时驱动程序应该停止发送队列，直到错误恢复。
 ```c
@@ -311,4 +312,316 @@ static int net_send_packet(struct sk_buff *skb, struct net_device *dev)
 	return 0;
 }
 ```
+### 网络设备的工作特点
+网络设备和CPU是并行工作，网络设备按照给定的MAC层协议自动向网络介质发送或接受数据包，
+网络设备和CPU之间通过IO端口（寄存器）和中断进行交互，
+当需要发送数据时，CPU将数据写到IO端口，并设置设备控制寄存器开始发送，
+当网络设备收到数据包时，他产生中断，CPU执行中断服务程序接受数据包。
 
+当内核调用 dev->hard_start_xmit/ndo_start_xmit (这里就是net_send_packet) 将数据包放到
+设备缓冲区，设备会自动将数据发送到网络介质，
+当数据包被成功复制到设备缓冲区，内核就认为数据包发送成功，那么dev->hard_start_xmit返回0，
+
+内核和设备之间发送数据包时，需要区分两种技术：
+* 老技术，网络设备一次只能容纳一个数据包，如果缓冲区为空，数据包可以立即复制到网络设备上，内核可以释放对应 socket buffer
+* 新技术，驱动程序管理着一个循环缓冲区，其中存放16-64个指针，指向要发送的socket buffer, 当一个数据包要发送时，将他的地址放到缓存区，一个数据包发送完成后，网络设备产生中断，刚发送的socket buffer 可以释放。
+
+新技术下， 驱动发送数据前需要检查循环缓冲区（发送队列）释放满了，如果满了则停止队列，直到设备产生发送完成的中断，在中断处理程序中发现有新的空间就重启发送队列。
+
+### 数据发送超时
+驱动需要考虑硬件失效的情况，处理方法是设置一个定时器，在向硬件发出发送指令后，启动定时器，如果直到超时发送仍没有结束，则认为发送出错，驱动程序需要处理这个错误。
+在示例程序中，probe时初始化了dev->watchdog_timeo，数据包发送过程的时间超过了watchdog_timeo的值，触发发送超时处理函数 tx_timeout，该函数负责分析错误，一般是重启硬件，重新发送。
+```c
+static void net_tx_timeout(struct net_device *dev)
+{
+	struct net_local *np = netdev_priv(dev);
+
+	//  重启硬件
+	chipset_init(dev, 1);
+
+	// 增加错误统计计数
+	np->stats.tx_errors++;
+
+	// 如果有剩余空间，重启发送队列，让内核可以添加新数据包
+	// 对于老的数据包，由于发送队列中指向的socket buffer并没有释放，所以会重新发送
+	if (!tx_full(dev))
+		netif_wake_queue(dev);
+}
+```
+
+## 接受数据包
+接受数据包的主要任务是分配socket buffer,
+从设备获得数据包拷贝到socket buffer，并设置 skbuff
+将接受的数据包放到CPU输入队列
+```c
+static void
+net_rx(struct net_device *dev)
+{
+	struct net_local *lp = netdev_priv(dev);
+	int ioaddr = dev->base_addr;
+	int boguscount = 10;
+
+	do {
+	// 读取寄存器获取数据包状态和长度
+		int status = inw(ioaddr);
+		int pkt_len = inw(ioaddr);
+
+		if (pkt_len == 0)		/* Read all the frames? */
+			break;			/* Done for now */
+
+		if (status & 0x40) {	/* There was an error. */
+			lp->stats.rx_errors++;
+			if (status & 0x20) lp->stats.rx_frame_errors++;
+			if (status & 0x10) lp->stats.rx_over_errors++;
+			if (status & 0x08) lp->stats.rx_crc_errors++;
+			if (status & 0x04) lp->stats.rx_fifo_errors++;
+		} else {
+			// 数据包正确
+
+			/* Malloc up new buffer. */
+			struct sk_buff *skb;
+
+			lp->stats.rx_bytes+=pkt_len;
+
+			// 分配 socket buffer
+			skb = dev_alloc_skb(pkt_len);
+			skb->dev = dev;
+
+			// 拷贝数据包到socket buffer的数据缓存区
+			// 使用 memcpy （设备缓冲区为内存映射方式）
+			// 或者使用IO端口读取（设备缓冲区使用IO端口方式）
+			memcpy(skb_put(skb,pkt_len), (void*)dev->rmem_start,
+				   pkt_len);
+			insw(ioaddr, skb->data, (pkt_len + 1) >> 1);
+
+			// 将数据包放到CPU接受队列，并更新统计信息
+			netif_rx(skb);
+			lp->stats.rx_packets++;
+			lp->stats.rx_bytes += pkt_len;
+		}
+	} while (--boguscount);
+
+	return;
+}
+```
+
+## 中断处理程序
+网络设备的中断原因有很多，这里只关心两个
+* 接受到一个新的数据包
+* 上次发送数据包结束
+
+驱动程序需要区分网络设备中断的原因，然后调用对应的处理方法，
+通常硬件中断导致CPU调度驱动的中断处理程序，驱动需要读取设备的寄存器判断中断原因。
+```c
+static irqreturn_t net_interrupt(int irq, void *dev_id)
+{
+	struct net_device *dev = dev_id;
+	struct net_local *np;
+	int ioaddr, status;
+	int handled = 0;
+
+	ioaddr = dev->base_addr;
+
+	np = netdev_priv(dev);
+	// 读取寄存器状态，如果当前没有中断则退出
+	status = inw(ioaddr + 0);
+	if (status == 0)
+		goto out;
+
+	handled = 1;
+	// 接受新数据包导致的中断
+	if (status & RX_INTR) {
+		/* Got a packet(s). */
+		net_rx(dev);
+	}
+#if TX_RING
+	// 数据包发送成功导致的中断
+	if (status & TX_INTR) {
+		/* Transmit complete. */
+		net_tx(dev);
+		np->stats.tx_packets++;
+		netif_wake_queue(dev);
+	}
+#endif
+	if (status & COUNTERS_INTR) {
+		/* Increment the appropriate 'localstats' field. */
+		np->stats.tx_window_errors++;
+	}
+out:
+	return IRQ_RETVAL(handled);
+}
+```
+### 处理发送数据包成功的中断
+主要任务是更新统计信息，释放已发送的socket buffer, 重启网络设备发送队列
+```c
+void net_tx(struct net_device *dev)
+{
+	struct net_local *np = netdev_priv(dev);
+	int entry;
+
+	spin_lock(&np->lock);
+
+	entry = np->tx_old;
+	while (tx_entry_is_sent(np, entry)) {
+		struct sk_buff *skb = np->skbs[entry];
+
+		// 更新统计信息，并释放socket buffer
+		np->stats.tx_bytes += skb->len;
+		dev_kfree_skb_irq (skb); // 发送NET_TX_SOFTIRQ 软中断
+			raise_softirq_irqoff(NET_TX_SOFTIRQ);
+
+		entry = next_tx_entry(np, entry);
+	}
+	np->tx_old = entry;
+
+	// 如果曾经停止过队列，且现在发送队列有空间，则唤醒队列
+	if (netif_queue_stopped(dev) && ! tx_full(dev))
+		netif_wake_queue(dev);
+
+	spin_unlock(&np->lock);
+}
+```
+
+### 处理接受数据包的中断
+接受数据包的主要任务是分配socket buffer,
+从设备获得数据包拷贝到socket buffer，并设置 skbuff
+将接受的数据包放到CPU输入队列
+```c
+static void
+net_rx(struct net_device *dev)
+{
+	struct net_local *lp = netdev_priv(dev);
+	int ioaddr = dev->base_addr;
+	int boguscount = 10;
+
+	do {
+	// 读取寄存器获取数据包状态和长度
+		int status = inw(ioaddr);
+		int pkt_len = inw(ioaddr);
+
+		if (pkt_len == 0)		/* Read all the frames? */
+			break;			/* Done for now */
+
+		if (status & 0x40) {	/* There was an error. */
+			lp->stats.rx_errors++;
+			if (status & 0x20) lp->stats.rx_frame_errors++;
+			if (status & 0x10) lp->stats.rx_over_errors++;
+			if (status & 0x08) lp->stats.rx_crc_errors++;
+			if (status & 0x04) lp->stats.rx_fifo_errors++;
+		} else {
+			// 数据包正确
+
+			/* Malloc up new buffer. */
+			struct sk_buff *skb;
+
+			lp->stats.rx_bytes+=pkt_len;
+
+			// 分配 socket buffer
+			skb = dev_alloc_skb(pkt_len);
+			skb->dev = dev;
+
+			// 拷贝数据包到socket buffer的数据缓存区
+			// 使用 memcpy （设备缓冲区为内存映射方式）
+			// 或者使用IO端口读取（设备缓冲区使用IO端口方式）
+			memcpy(skb_put(skb,pkt_len), (void*)dev->rmem_start,
+				   pkt_len);
+			insw(ioaddr, skb->data, (pkt_len + 1) >> 1);
+
+			// 将数据包放到CPU接受队列，并更新统计信息
+			netif_rx(skb); // 发送 NET_RX_SOFTIRQ 软中断
+				__raise_softirq_irqoff(NET_RX_SOFTIRQ);  
+			lp->stats.rx_packets++;
+			lp->stats.rx_bytes += pkt_len;
+		}
+	} while (--boguscount);
+
+	return;
+}
+```
+#### 优化接受数据包
+一般的接受数据包时，每触发一个中断，接受一个数据包，如果流量高峰会导致中断消耗很大。
+NAPI就是用于解决这个问题，NAPI是中断加轮询的方式，当获得接受数据包中断，则进入轮询模式，轮询一段时间接受数据包。
+要将一般的接受中断改成NAPI需要注意：
+dev->poll : 函数指针，实现轮询读取设备
+dev->weight : 描述CPU一次可从设备读入多少数据包
+
+将中断处理关于接受数据包部分改成：
+```c
+	if (status & RX_INTR) {
+		.. // 关中断
+
+		netif_rx_schedule(dev);
+	}
+```
+netif_rx_schedule 会调用 poll
+poll 的逻辑为
+![](./pic/18.jpg)
+
+## 支持组播
+网络设备通过分析数据包的MAC层地址判断是否接受数据包，这是硬件判断不需要CPU参与，对于单播和广播的判断很简单，
+但是组播，设备通常管理一组组播地址表，主机需要发送加入的组播地址给设备，网络设备根据组播地址表判断是否接受。
+
+所以驱动程序需要提供发送加入组播的功能，任务就是接受内核发送来的组播地址，将其送往设备硬件。
+
+组播包指能被特定组的主机接受的包，组播功能通过为一组主机分配特殊的硬件地址实现。
+组播功能最复杂的部分已由应用层和内核实现，驱动接口不需要关心这些问题，对于驱动接口而言，组播包的发送和其他
+数据包一样，只需要将其放到设备缓存。内核已经为其分配了正确的地址。
+
+内核需要完成的工作是跟踪有效组播地址列表，因为这些地址随时可能变化，应用程序负责修改组播地址列表，驱动程序
+负责接受符合组播地址列表的数据包，传递给内核。
+至于驱动应该如何实现，依赖于设备提供的功能，大多数属于下面3种：
+
+1. 硬件接口不能自己处理组播包，这类接口只能接受与自己地址匹配的数据包和所有数据包，只能通过接受所有数据包来
+实现组播的接受，这种接受方式会导致CPU负荷过大，对于这种设备不能使用组播功能，dev->flags 的 IFFMULTICAST位不应设置。
+但点对点接口是特殊，因为点对点设备不做任何过滤，他们总是接受所有数据包。
+
+2. 接口可以区分组播包和其他数据包，这类设备接受所有的组播包，有内核判断是否为发送给本机的组播包，这种工作方式
+在可接受范围内。
+
+3. 接口可以检测发送的硬件地址，这些接口提供一个组播地址列表，只接受符合组播地址列表的组播包，对于内核而言是最有方式。
+
+### 内核对组播的支持
+1. 数据结构
+```c
+dev->mc_list : 本设备的组播地址表
+dev->mc_count : 查看是否需要做组发送，查看mc_count是否为0，比查看mc_list是否为空更快。
+```
+2. 设备标志
+设备标志说明了网络设备是否工作在组发送模式。
+IFFMULTICAST : 设备工作在组播模式
+IFFALLMULTI : 接受所有的组播包，不使用mc_list 过滤
+IFFPROMISC : 混杂模式，接受所有数据包
+
+3. 驱动接口函数 dev->set_muticast_list
+```c
+static void
+set_multicast_list(struct net_device *dev)
+{
+	short ioaddr = dev->base_addr;
+	// 设备使能混杂模式
+	if (dev->flags&IFF_PROMISC)
+	{
+		outw(MULTICAST|PROMISC, ioaddr);
+	}
+	// 设备接受所有组播包，或组播地址数量大于硬件最大能存放的地址数量
+	// 禁止混杂模式，接受所有组播包
+	else if((dev->flags&IFF_ALLMULTI) || dev->mc_count > HW_MAX_ADDRS)
+	{
+		/* Disable promiscuous mode, use normal mode. */
+		hardware_set_filter(NULL);
+
+		outw(MULTICAST, ioaddr);
+	}
+	// 设备接受组播包
+	// 禁止混杂模式，接受部分组播包
+	else if(dev->mc_count)
+	{
+		/* Walk the address list, and load the filter */
+		hardware_set_filter(dev->mc_list);
+
+		outw(MULTICAST, ioaddr);
+	}
+	else
+		outw(0, ioaddr);
+}
+```
