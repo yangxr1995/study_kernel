@@ -72,7 +72,7 @@ struct softnet_data
 };
 ```
 
-每个CPU由各自的softnet_data，在net_dev_init初始化
+每个CPU有各自的softnet_data，在net_dev_init初始化
 ```c
 static int __init net_dev_init(void)
 
@@ -110,7 +110,7 @@ Linux提供了两种机制：
 除了描述设备的net_device外，还需要napi_struct
 
 2. 实现 poll函数
-驱动程序要实现自己的poll函数，来轮询自己的设备，将网络数据帧复制到内核空间socket buffer，在移动到CPU输入队列
+驱动程序要实现自己的poll函数，来轮询自己的设备，将网络数据帧复制到内核空间socket buffer，再移动到CPU输入队列
 
 3. 对接受中断处理函数进行修改
 执行中断处理程序后，不是调用 netif_rx 将socket buffer放到 CPU 输入队列，而是调用netif_rx_schedule
@@ -142,7 +142,7 @@ netif_rx_schedule的逻辑如下
 
 ## netif_rx
 netif_rx是常规网络设备驱动程序在接受中断中调用，用于将输入数据帧放入CPU输入队列中。随后标记软件中断处理后续上层数据帧给TCP/IP协议栈功能。
-netif_rx在一下场合被调用：
+netif_rx在以下场合被调用：
 * 网络设备驱动程序接受中断执行时
 * 处理CPU掉线事件的回调函数dev_cpu_callback
 * loopback设备的接受数据帧函数
@@ -151,7 +151,748 @@ dev_cpu_callback函数是网络子系统注册到CPU事件通知链的函数，�
 
 常规情况下，netif_rx在设备中断程序中被调用，但有例外，对于loopback设备，不在中断程序，因为loopback是虚拟设备，所以开始执行 netif_rx时要关闭本地CPU中断，等netif_rx执行完成后再开启中断。 (因为如果 netif_rx 在中断服务程序中执行时，中断默认是屏蔽的，而loopback没有中断，导致netif_rx必须先禁止中断，避免被打断)
 
-netif_rx可以在不同CPU上同时运行，运行每个CPU有自己softnet_data
+netif_rx可以在不同CPU上同时运行，因为每个CPU有自己softnet_data.
 
 
+### netif_rx 的工作流程
+netif_rx的主要任务：
+* 设置skbuff某些属性，如接受数据帧的时间
+* 将接受的数据帧放入CPU的私有输入队列，通过标记软中断通知内核数据帧已经到达
+* 更新CPU的接受统计信息
+![](./pic/24.jpg)
 
+```c
+// skb : 接受的数据帧
+// 返回值 : 成功将数据帧放入CPU输入队列，返回 NET_RX_SUCCESS
+            扔掉数据帧，返回 NET_RX_DROP
+int netif_rx(struct sk_buff *skb)
+{
+	struct softnet_data *queue;
+	unsigned long flags;
+
+	// 如果数据帧是netpoll需要的，则上层协议栈不处理，直接扔掉
+	// netpoll的功能是为了让内核在整个网络和IO子系统都失效的情况
+	// 下也能收发数据帧，用于远程网络控制终端和通过网络远程调试
+	// 内核
+	if (netpoll_rx(skb))
+		return NET_RX_DROP;
+
+	// 标记数据帧入栈时间
+	if (!skb->tstamp.tv64)
+		net_timestamp(skb);
+
+	// 把当前中断开关状态保存到flags，并关闭中断
+	local_irq_save(flags);
+	// 获得CPU的 softnet_data
+	queue = &__get_cpu_var(softnet_data);
+
+	__get_cpu_var(netdev_rx_stat).total++;
+	// 如果输入队列没有满
+	if (queue->input_pkt_queue.qlen <= netdev_max_backlog) {
+		if (queue->input_pkt_queue.qlen) {
+			// 如果输入队列不为空
+enqueue:
+			// 将skb加入输入队列
+			__skb_queue_tail(&queue->input_pkt_queue, skb);
+			// 恢复中断状态
+			local_irq_restore(flags);
+			return NET_RX_SUCCESS;
+		}
+
+		// 如果输入队列为空
+
+		// 将 backlog  加入 poll_list，并标记软中断 NET_RX_SOFTIRQ
+		// backlog.poll = process_backlog;
+		// 在中断下半段时执行 net_rx_action 会遍历poll_list，执行poll,
+		// 其中 process_backlog ，负责将CPU输入队列的数据帧推送给上层协议
+
+		// 硬件中断只做最紧急的工作，将数据帧放到CPU输入队列
+		// 中断下半部负责数据帧的处理，即推送给上层协议
+		napi_schedule(&queue->backlog);
+			list_add_tail(&n->poll_list, &__get_cpu_var(softnet_data).poll_list);
+			__raise_softirq_irqoff(NET_RX_SOFTIRQ);
+
+		// 跳到进队列
+		goto enqueue;
+	}
+
+	// 如果输入队列满了，则丢弃数据帧
+	__get_cpu_var(netdev_rx_stat).dropped++;
+	local_irq_restore(flags);
+
+	kfree_skb(skb);
+	return NET_RX_DROP;
+}
+```
+
+## 网络接受软中断
+接受数据帧的硬件中断会设置 NET_RX_SOFTIRQ 软中断，软中断处理程序为 net_rx_action，该函数的任务是推送数据帧给上层协议，
+被推送的数据帧来源两个地方：
+* 不支持的NAPI时，net_rx_action从CPU输入队列 softnet_data->input_pkt_queue 中获得数据帧，推送给上层协议
+* 支持NAPI时，net_rx_action遍历poll_list ，执行 napi_struct->poll 函数，驱动poll函数负责从硬件读取缓存的数据帧并直接推送给上层协议
+
+
+### net_rx_action 的工作流程
+![](./pic/25.jpg)
+net_rx_action 会展开poll_list链表，获取每个napi_struct，执行它的poll函数，直到：
+* poll_list无struct napi_struct
+* 处理的数据帧达到net_rx_action可处理的上限（budget）
+* net_rx_action执行的时间过长（2个tick，即jiffies + 2），此时释放CPU
+
+CPU的输入队列input_pkt_queue默认最多缓存1000个数据帧，
+net_rx_action工作在中断允许的状态，在net_rx_action执行时，可以源源不断加入新的数据包到input_pkt_queue，因此net_rx_action处理的数据帧可能大于1000个，所以需要限制net_rx_action的执行时长，避免影响其他任务执行。
+
+```c
+static void net_rx_action(struct softirq_action *h)
+{
+	// 获得CPU的poll_list
+	struct list_head *list = &__get_cpu_var(softnet_data).poll_list;
+	// 最大执行时长
+	unsigned long time_limit = jiffies + 2;
+	// 最多接受的数据包数量
+	int budget = netdev_budget;
+	void *have;
+
+	// 禁止中断
+	local_irq_disable();
+
+	// 展开poll_list
+	while (!list_empty(list)) {
+		struct napi_struct *n;
+		int work, weight;
+
+		// 如果budget耗尽，或运行时间过长，说明还有数据包待处理
+	 	// 标志NET_RX_SOFTIRQ，退出等待下次被调度。
+		if (unlikely(budget <= 0 || time_after(jiffies, time_limit)))
+			goto softnet_break;
+
+		// 打开中断
+		local_irq_enable();
+
+		// 获得napi_struct
+		n = list_entry(list->next, struct napi_struct, poll_list);
+
+		have = netpoll_poll_lock(n);
+
+		// weight为驱动poll函数最多能获得数据帧个数
+		weight = n->weight;
+
+		// 首先或调用 backlog.poll =  process_backlog,
+		// process_backlog会把input_pkt_queue的数据包
+		// 上传到上层协议栈
+		// 然后是其他驱动poll，读取数据帧，上传到上层协议栈
+		work = 0;
+		if (test_bit(NAPI_STATE_SCHED, &n->state))
+			work = n->poll(n, weight);
+
+		WARN_ON_ONCE(work > weight);
+
+		budget -= work;
+
+		local_irq_disable();
+
+		/* Drivers must not modify the NAPI state if they
+		 * consume the entire weight.  In such cases this code
+		 * still "owns" the NAPI instance and therefore can
+		 * move the instance around on the list at-will.
+		 */
+		// 如果poll处理的数据帧数量达到上限，并且设置了 NAPI_STATE_DISABLE，
+		// 清除 NAPI_STATE_SCHED， 将该实例移出poll_list，
+		// 否则移动到poll_list尾部
+		if (unlikely(work == weight)) {
+			if (unlikely(napi_disable_pending(n)))
+				return test_bit(NAPI_STATE_DISABLE, &n->state);
+
+				__napi_complete(n);
+					list_del(&n->poll_list);
+					clear_bit(NAPI_STATE_SCHED, &n->state);
+
+			else
+				list_move_tail(&n->poll_list, list);
+		}
+
+		netpoll_poll_unlock(have);
+	}
+	// 所有的数据包都接受完，直接退出
+out:
+	local_irq_enable();
+
+	return;
+
+softnet_break:
+	// 还有数据未接受，待下次被调度
+	__get_cpu_var(netdev_rx_stat).time_squeeze++;
+	__raise_softirq_irqoff(NET_RX_SOFTIRQ);
+	goto out;
+}
+```
+
+#### process_backlog
+不论驱动支不支持NAPI，backlog 都会添加到  poll_list 队列首部，所以NET_RX_SOFTIRQ中断下半部处理程序 net_rx_action 一定会调用process_backlog.
+process_backlog负责将input_pkt_queue的数据包上传给上层协议栈。
+```c
+// quota 是本次调用允许最多上传的数据包数量
+static int process_backlog(struct napi_struct *napi, int quota)
+{
+	int work = 0;
+	struct softnet_data *queue = &__get_cpu_var(softnet_data);
+	unsigned long start_time = jiffies;
+
+	napi->weight = weight_p;
+	// 取出input_pkt_queue的数据包调用 netif_receive_skb 将其上传给上层协议栈
+	// 最多上传 quota个数据包
+	do {
+		struct sk_buff *skb;
+
+		local_irq_disable();
+		skb = __skb_dequeue(&queue->input_pkt_queue);
+		if (!skb) {
+			// 移出poll_list队列，并清空NAPI_STATE_SCHED
+			__napi_complete(napi);
+				list_del(&n->poll_list);
+				clear_bit(NAPI_STATE_SCHED, &n->state);
+			local_irq_enable();
+			break;
+		}
+		local_irq_enable();
+
+		netif_receive_skb(skb);
+	} while (++work < quota && jiffies == start_time);
+
+	return work;
+}
+```
+## netif_receive_skb
+netif_receive_skb用于poll_list的napi_struct->poll函数使用，用于上传数据包给上层协议。
+
+netif_receive_skb主要有3个任务：
+* 给每个协议标签发送一个数据帧的复制
+* 给skb->protocol指定的网络层协议处理程序发送一个数据帧拷贝
+* 执行本层（数据链路层）的功能特点，如桥，VLAN
+
+skb->protocol通常在网卡驱动接受数据帧时设置，说明payload应该交给什么协议处理程序
+```c
+
+static void net_rx(struct net_device *dev)
+	...
+	skb = dev_alloc_skb(pkt_len + 2);
+	skb_reserve(skb, 2);	/* Align IP on 16 byte boundaries */
+	read_block(ioaddr, pkt_len, skb_put(skb,pkt_len), dev->if_port);
+	skb->protocol = eth_type_trans(skb, dev);
+	netif_rx(skb);
+	...
+```
+
+### netif_receive_skb的工作流程
+![](./pic/26.jpg)
+
+```c
+int netif_receive_skb(struct sk_buff *skb)
+{
+	struct packet_type *ptype, *pt_prev;
+	struct net_device *orig_dev;
+	struct net_device *null_or_orig;
+	int ret = NET_RX_DROP;
+	__be16 type;
+
+	// 如果VLAN要处理数据帧，交给VLAN处理
+	if (skb->vlan_tci && vlan_hwaccel_do_receive(skb))
+		return NET_RX_SUCCESS;
+
+	// 如果netpoll要处理数据帧，交给netpoll处理
+	if (netpoll_receive_skb(skb))
+		return NET_RX_DROP;
+
+	if (!skb->tstamp.tv64)
+		net_timestamp(skb);
+
+	if (!skb->iif)
+		skb->iif = skb->dev->ifindex;
+
+	// 处理数据帧与网络设备组的特性
+	// 所谓网络设备组就是将一组网络接口当成一个使用，
+	// 当网络设备组收到数据包，在数据包交给IP层处理前，
+	// 需要将对接受数据帧的设备的引用改成对主设备的引用。
+	// 网络设备组可用于实现高可用
+	null_or_orig = NULL;
+	orig_dev = skb->dev;
+	if (orig_dev->master) {
+		if (skb_bond_should_drop(skb))
+			null_or_orig = orig_dev; /* deliver only exact match */
+		else
+			skb->dev = orig_dev->master;
+	}
+
+	// 更新统计信息，初始化skb IP层 传输层协议头指针
+	__get_cpu_var(netdev_rx_stat).total++;
+
+	skb_reset_network_header(skb);
+	skb_reset_transport_header(skb);
+	skb->mac_len = skb->network_header - skb->mac_header;
+
+	pt_prev = NULL;
+
+	rcu_read_lock();
+
+#ifdef CONFIG_NET_CLS_ACT
+	if (skb->tc_verd & TC_NCLS) {
+		skb->tc_verd = CLR_TC_NCLS(skb->tc_verd);
+		goto ncls;
+	}
+#endif
+
+	// 给所有嗅探器发送一个数据帧的拷贝
+	list_for_each_entry_rcu(ptype, &ptype_all, list) {
+		if (ptype->dev == null_or_orig || ptype->dev == skb->dev ||
+		    ptype->dev == orig_dev) {
+			if (pt_prev)
+				ret = deliver_skb(skb, pt_prev, orig_dev);
+			pt_prev = ptype;
+		}
+	}
+
+	// 如果配置了输入数据帧过滤特性，由 handle_ing决定如何对数据帧进一步处理
+	// 以往流量控制系统只用于实现数据帧输出的 QoS功能，现在用户可以为输入数据帧设置过滤器
+#ifdef CONFIG_NET_CLS_ACT
+	skb = handle_ing(skb, &pt_prev, &ret, orig_dev);
+	if (!skb)
+		goto out;
+ncls:
+#endif
+
+	// 处理桥和macvlan特性
+	skb = handle_bridge(skb, &pt_prev, &ret, orig_dev);
+	if (!skb)
+		goto out;
+	skb = handle_macvlan(skb, &pt_prev, &ret, orig_dev);
+	if (!skb)
+		goto out;
+
+	// 将数据帧发送给网络层所有注册了的协议实例的接受程序
+	type = skb->protocol;
+	list_for_each_entry_rcu(ptype,
+			&ptype_base[ntohs(type) & PTYPE_HASH_MASK], list) {
+		if (ptype->type == type &&
+		    (ptype->dev == null_or_orig || ptype->dev == skb->dev ||
+		     ptype->dev == orig_dev)) {
+			if (pt_prev)
+				ret = deliver_skb(skb, pt_prev, orig_dev);
+			pt_prev = ptype;
+		}
+	}
+
+	if (pt_prev) {
+		ret = pt_prev->func(skb, skb->dev, pt_prev, orig_dev);
+	} else {
+		kfree_skb(skb);
+		/* Jamal, now you will not able to escape explaining
+		 * me how you were going to use this. :-)
+		 */
+		ret = NET_RX_DROP;
+	}
+
+out:
+	rcu_read_unlock();
+	return ret;
+}
+```
+
+### 数据链路层和网络层的接口
+结合网络设备驱动程序和 netif_rx/netif_rx_schedule 和 net_rx_action 完成了对数据链路层的处理，并使用 netif_receive_skb 将数据包由数据链路层推向网络层。
+
+在Linux环境中TCP/IP协议栈每层都可以有多个协议，数据包可以有一个协议接受，也可以发给同一层的多个协议。另外Linux还支持多个协议栈。
+
+#### 输入数据帧的解析
+数据链路层要推送数据帧，就必须知道数据帧在网络层的协议。
+在驱动程序的net_rx，很容易解析数据链路层头信息，设置skb->protocol字段，这个字段就指明了上层协议的类型。
+
+![](./pic/27.jpg)
+
+根据skb->protocol就知道调用哪个上层协议的接口函数
+
+![](./pic/28.jpg)
+
+#### packet_type
+为了上下层协议代码的解耦合，Linux定义了一个中间层packet_type用于协议标识符和协议接口程序之间的关系，并将其按照一定数据结构组织。
+```c
+struct packet_type {
+	// 协议标识符
+	__be16			type;	/* This is really htons(ether_type). */
+	// 只有从哪个设备接受的数据帧才处理
+	// 如果dev 为空，则任意来源的数据帧都处理
+	struct net_device	*dev;	/* NULL is wildcarded here	     */
+	// 接受处理程序
+	int			(*func) (struct sk_buff *,
+					 struct net_device *,
+					 struct packet_type *,
+					 struct net_device *);
+	struct sk_buff		*(*gso_segment)(struct sk_buff *skb,
+						int features);
+	int			(*gso_send_check)(struct sk_buff *skb);
+	struct sk_buff		**(*gro_receive)(struct sk_buff **head,
+					       struct sk_buff *skb);
+	int			(*gro_complete)(struct sk_buff *skb);
+	// 指向接受处理程序的私有数据
+	void			*af_packet_priv;
+	// 将packet_type按照链表组织
+	struct list_head	list;
+};
+```
+
+要实现L2到L3层的接口，L3层必须定义并注册一个packet_type
+```c
+// IPv4协议
+static struct packet_type ip_packet_type = {
+	.type = __constant_htons(ETH_P_IP),
+	.func = ip_rcv,
+	.gso_send_check = inet_gso_send_check,
+	.gso_segment = inet_gso_segment,
+	.gro_receive = inet_gro_receive,
+	.gro_complete = inet_gro_complete,
+};
+
+// ARP协议
+static struct packet_type arp_packet_type = {
+	.type =	__constant_htons(ETH_P_ARP),
+	.func =	arp_rcv,
+};
+
+...
+
+```
+
+内核定义了一个 struct list_head ptype_all链表，用于网络工具和探测器接受数据帧，还定义了 struct list_head ptype_base[PTYPE_HASH_SIZE]只接受与协议标识符匹配的数据帧。
+
+使用 dev_add_pack ， 和 dev_remove_pack 增删协议。
+
+例如IPv4协议，在inet_init注册ip_packet_type
+```c
+
+static int __init inet_init(void)
+	...
+	dev_add_pack(&ip_packet_type);
+	...
+```
+
+# 输出数据帧的处理
+
+## 发送过程的控制
+网络设备完成实例创建，初始化，注册并打开设备后，网络设备就能正常运行收发数据了， 但还需允许/禁止网络设备发送队列来控制内核的发送数据包，因为网络设备发送缓存区如果满了，需要禁止网络设备发送队列，以通知内核不进行数据包发送，否则会发送失败。
+网络设备发送队列的禁止/允许由net_device->state状态位 \_\_QUEUE_STATE_XOFF位来描述，内核实现了一系列API来操作，检查该状态位。
+
+```c
+// 允许发送过程
+static inline void netif_start_queue(struct net_device *dev);
+
+// 禁止发送过程
+static inline int netif_queue_stopped(const struct net_device *dev)
+
+// 重启发送过程
+static inline void netif_wake_queue(struct net_device *dev)
+```
+在网络设备open时，除了分配资源，初始化net_device外，还会调用netif_start_queue允许发送，当驱动意识到设备输出缓存不足时，调用netif_queue_stopped通知内核禁止发送，这样可以避免失败发送导致的资源浪费。
+
+例如CS8900A驱动，开始发送前先禁止发送，
+```c
+static int net_send_packet(struct sk_buff *skb, struct net_device *dev)
+	spin_lock_irq(&lp->lock);
+	netif_stop_queue(dev);
+	...
+```
+当中断处理时，发现上次发送成功时，再重启发送队列
+```c
+static irqreturn_t net_interrupt(int irq, void *dev_id)
+
+	...
+
+	while ((status = readword(dev->base_addr, ISQ_PORT))) {
+		if (net_debug > 4)printk("%s: event=%04x\n", dev->name, status);
+		handled = 1;
+		switch(status & ISQ_EVENT_MASK) {
+		case ISQ_RECEIVER_EVENT:
+			...
+
+		case ISQ_TRANSMITTER_EVENT:
+			lp->stats.tx_packets++;
+			netif_wake_queue(dev);	/* Inform upper layers. */
+			...
+```
+## 设备输出队列Qdisc的调度
+对于输入数据包，驱动可以调用 netif_rx/netif_rx_schedule 将数据包放到 input_pkt_queue 或 将设备放到 poll_list，在 NET_RX_SOFTIRQ 处理程序net_rx_action被调度时完成数据帧处理和推送上层协议。
+
+对于输出数据帧，也有dev_queue_xmit函数，将上层协议发送来的数据帧放到网络设备的发送队列（针对有发送队列的设备），随后流量控制系统按照内核配置的队列管理策略，将网络设备发送队列中的数据帧依次发送出去。发送时，从发送队列获取一个数据帧，将数据帧发送给设备驱动程序的dev->netdev_ops->ndo_start_xmit
+
+dev_queue_xmit 可能因为各种原因执行失败，
+1. 网络发送队列被禁止
+2. 获取发送队列并发访问锁失败 (应该发送而发送失败)
+对于第2种失败情况，内核实现了\_\_netif_schedule来重新调度网络设备发送数据帧，它将网络设备放到CPU发送队列 softnet_data->output_queue ，随后标记软件中断 NET_TX_SOFTIRQ，当软中断处理程序 net_tx_action 被调度时，CPU输出队列 output_queue 中的设备会重新被调度来发送数据帧。
+
+```c
+// 将设备加入CPU输出队列
+// 并标记软中断NET_TX_SOFTIRQ，待软中断处理函数 发送数据包
+void __netif_schedule(struct Qdisc *q)
+{
+	// 如果网络设备已经在ouput_queue队列中，则直接返回，返回参加调度
+	if (!test_and_set_bit(__QDISC_STATE_SCHED, &q->state))
+		__netif_reschedule(q);
+}
+
+static inline void __netif_reschedule(struct Qdisc *q)
+{
+	struct softnet_data *sd;
+	unsigned long flags;
+
+	local_irq_save(flags);
+	sd = &__get_cpu_var(softnet_data);
+	q->next_sched = sd->output_queue;
+	sd->output_queue = q;
+	raise_softirq_irqoff(NET_TX_SOFTIRQ);
+	local_irq_restore(flags);
+}
+```
+
+另外 netif_wake_queue 相当于调用了 netif_start_queue 和 \_\_netif_schedule.
+因为驱动程序负责允许/禁止发送过程，上层内核负责设备的调度，所以netif_wake_queue通常给驱动程序使用，\_\_netif_schedule 给上层内核使用。
+
+驱动程序会在一下情况调用 netif_wake_queue
+网络设备驱动使用 watchdog来恢复挂起的发送过程。 net_device->tx_timeout 通常先重启网络设备，这时可能有待发送的数据帧，所以驱动程序应启动发送队列，并调度设备(设置NET_TX_SOFTIRQ)，将设备放入CPU输出队列。
+
+```c
+static inline void netif_wake_queue(struct net_device *dev)
+{
+	netif_tx_wake_queue(netdev_get_tx_queue(dev, 0));
+}
+
+static inline void netif_tx_wake_queue(struct netdev_queue *dev_queue)
+{
+#ifdef CONFIG_NETPOLL_TRAP
+	if (netpoll_trap()) {
+		clear_bit(__QUEUE_STATE_XOFF, &dev_queue->state);
+		return;
+	}
+#endif
+	if (test_and_clear_bit(__QUEUE_STATE_XOFF, &dev_queue->state))
+		__netif_schedule(dev_queue->qdisc);
+}
+```
+
+## 队列策略接口
+网络设备都使用队列来调度管理输出数据帧的流量，内核可以使用队列策略来安排哪个数据帧先发送，队列策略属于流量控制子系统的内容，这里只介绍有发送队列的网络设备驱动程序和数据链路层之间的主要接口和调度队列的方法。
+
+当有一个设备被调度来发送数据帧时，下一个要发送的数据帧由qdisc_run来选择，
+```c
+
+static inline void qdisc_run(struct Qdisc *q)
+{
+	// 过滤掉输出队列被停止的网络设备
+	if (!test_and_set_bit(__QDISC_STATE_RUNNING, &q->state))
+		__qdisc_run(q);
+}
+
+void __qdisc_run(struct Qdisc *q)
+{
+	unsigned long start_time = jiffies;
+
+	while (qdisc_restart(q)) {
+		if (need_resched() || jiffies != start_time) {
+			__netif_schedule(q);
+			break;
+		}
+	}
+
+	clear_bit(__QDISC_STATE_RUNNING, &q->state);
+}
+
+static inline int qdisc_restart(struct Qdisc *q)
+{
+	struct netdev_queue *txq;
+	int ret = NETDEV_TX_BUSY;
+	struct net_device *dev;
+	spinlock_t *root_lock;
+	struct sk_buff *skb;
+
+	// 从设备输出队列中获取一个 skb
+	if (unlikely((skb = dequeue_skb(q)) == NULL))
+			return skb = q->dequeue(q);
+		return 0;
+
+	root_lock = qdisc_lock(q);
+
+	/* And release qdisc */
+	spin_unlock(root_lock);
+
+	// 从设备输出队列中获取网络设备
+	dev = qdisc_dev(q);
+	// 获得输出队列
+	txq = netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
+
+	HARD_TX_LOCK(dev, txq, smp_processor_id());
+	// 如果输出队列没有停止或者冻结，则调用 dev_hard_start_xmit发送数据帧
+	if (!netif_tx_queue_stopped(txq) &&
+	    !netif_tx_queue_frozen(txq))
+		ret = dev_hard_start_xmit(skb, dev, txq);
+	HARD_TX_UNLOCK(dev, txq);
+
+	spin_lock(root_lock);
+
+	switch (ret) {
+	case NETDEV_TX_OK:
+		// 发送成功，这时socket buffer没有释放，将在 NET_TX_SOFTIRQ处理
+		// 函数中释放所有 socket buffer ，这样效率更高
+		ret = qdisc_qlen(q);
+		break;
+
+	case NETDEV_TX_LOCKED:
+		/* Driver try lock failed */
+		// 驱动程序已经被锁定
+		ret = handle_dev_cpu_collision(skb, txq, q);
+		break;
+
+	default:
+		// 驱动程序发现硬件没有足够的缓存发送数据帧，
+		// 通常驱动程序已经调用了 netif_stop_queue
+		// 将数据帧重新放回输出队列
+		if (unlikely (ret != NETDEV_TX_BUSY && net_ratelimit()))
+			printk(KERN_WARNING "BUG %s code %d qlen %d\n",
+			       dev->name, ret, q->q.qlen);
+
+		ret = dev_requeue_skb(skb, q);
+		break;
+	}
+
+	if (ret && (netif_tx_queue_stopped(txq) ||
+		    netif_tx_queue_frozen(txq)))
+		ret = 0;
+
+	return ret;
+}
+```
+
+## dev_queue_xmit
+dev_queue_xmit是网络层执行发送操作和链路层网络设备驱动之间接口。
+dev_queue_xmit可以通过两个途径来调用网络设备驱动函数的发送函数ndo_start_xmit
+* 流量控制接口：通过qdisc_run 函数执行
+* 直接调用ndo_start_xmit：用于不使用流量控制的情况
+
+当dev_queue_xmit发送数据帧时，数据包的已经准备完整（包括输出网络设备，下一条IP地址，MAC地址等），由网络层初始化这些。
+
+dev_queue_xmit的输入参数是skb,
+skb->dev是输出设备，skb->data是负载数据地址，skb->len是负载长度
+其主要功能如下：
+* 查看数据帧是否被分片，如果是，查看网络设备是否支持 scattr/gatter DMA功能，能直接处理数据片。如果不能，则将数据片组成一个完整的数据帧
+* 除非设备能完成L4的数据校验和计算，否则确定传输层完成了数据帧的校验和计算
+* 选择要发送的数据帧（因为由skb队列，所以由sk_buff指针指向的对象可能不是当前就能发送的数据帧
+
+```c
+int dev_queue_xmit(struct sk_buff *skb)
+{
+	struct net_device *dev = skb->dev;
+	struct netdev_queue *txq;
+	struct Qdisc *q;
+	int rc = -ENOMEM;
+
+	/* GSO will handle the following emulations directly. */
+	if (netif_needs_gso(dev, skb))
+		goto gso;
+
+	// 如果负载被分片且硬件不支持 scattr/gatter，则组装分片成完成一个数据包
+	if (skb_shinfo(skb)->frag_list &&
+	    !(dev->features & NETIF_F_FRAGLIST) &&
+	    __skb_linearize(skb) /*组装数据包*/)
+		goto out_kfree_skb;
+
+	// 如果被分片的区域在高端内存，也需要函数完成组装
+	if (skb_shinfo(skb)->nr_frags &&
+	    (!(dev->features & NETIF_F_SG) || illegal_highdma(dev, skb)) &&
+	    __skb_linearize(skb))
+		goto out_kfree_skb;
+
+	// 传输层校验和计算可有硬件或软件完成，若硬件不支持则会通过 dev->features 通知
+	// 软件使用 skb_checksum_help 完成传输层校验和计算
+
+	// 如果数据包还没有计算校验和且硬件不支持计算校验和，就计算校验和
+	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+		skb_set_transport_header(skb, skb->csum_start -
+					      skb_headroom(skb));
+		if (!dev_can_checksum(dev, skb) && skb_checksum_help(skb))
+			goto out_kfree_skb;
+	}
+
+	// 当校验和计算完成，数据包就可以交给网络设备发送
+
+gso:
+	/* Disable soft irqs for various locks below. Also
+	 * stops preemption for RCU.
+	 */
+	rcu_read_lock_bh();
+
+	txq = dev_pick_tx(dev, skb);
+	q = rcu_dereference(txq->qdisc);
+
+#ifdef CONFIG_NET_CLS_ACT
+	skb->tc_verd = SET_TC_AT(skb->tc_verd,AT_EGRESS);
+#endif
+	// 如果有队列
+	if (q->enqueue) {
+		// 若使用队列，则将数据包放入队列	
+		// 调用 qdisc_run 发送数据包
+		// 需要注意由于发送策略，实际先发送的数据包不一定是这里加入的数据包
+		spinlock_t *root_lock = qdisc_lock(q);
+
+		spin_lock(root_lock);
+
+		// 测试队列是否处于激活状态，如果是则发送，否则丢弃数据包
+		if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &q->state))) {
+			kfree_skb(skb);
+			rc = NET_XMIT_DROP;
+		} else {
+			rc = qdisc_enqueue_root(skb, q);
+			qdisc_run(q);
+		}
+		spin_unlock(root_lock);
+
+		goto out;
+	}
+
+	// 有的设备没有队列，如loopback，对于这样的设备有数据包待发送时，
+	// 会立即发送，接受端也会立即接受，如果错误就直接丢弃，没有第二次机会。
+	// 而有队列的设备而言，发送错误会重新加入队列，等待下次发送
+	// 如果没有队列，则直接调用 dev_hard_start_xmit发送数据包
+	if (dev->flags & IFF_UP) {
+		int cpu = smp_processor_id(); /* ok because BHs are off */
+
+		if (txq->xmit_lock_owner != cpu) {
+
+			HARD_TX_LOCK(dev, txq, cpu);
+
+			if (!netif_tx_queue_stopped(txq)) {
+				rc = 0;
+				if (!dev_hard_start_xmit(skb, dev, txq)) {
+					HARD_TX_UNLOCK(dev, txq);
+					goto out;
+				}
+			}
+			HARD_TX_UNLOCK(dev, txq);
+			if (net_ratelimit())
+				printk(KERN_CRIT "Virtual device %s asks to "
+				       "queue packet!\n", dev->name);
+		} else {
+			if (net_ratelimit())
+				printk(KERN_CRIT "Dead loop on virtual device "
+				       "%s, fix it urgently!\n", dev->name);
+		}
+	}
+
+	rc = -ENETDOWN;
+	rcu_read_unlock_bh();
+
+out_kfree_skb:
+	kfree_skb(skb);
+	return rc;
+out:
+	rcu_read_unlock_bh();
+	return rc;
+}
+```
+有队列发送和无队列发送的对比
+![](./pic/29.jpg)
