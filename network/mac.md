@@ -625,14 +625,14 @@ static irqreturn_t net_interrupt(int irq, void *dev_id)
 dev_queue_xmit 可能因为各种原因执行失败，
 1. 网络发送队列被禁止
 2. 获取发送队列并发访问锁失败 (应该发送而发送失败)
-对于第2种失败情况，内核实现了\_\_netif_schedule来重新调度网络设备发送数据帧，它将网络设备放到CPU发送队列 softnet_data->output_queue ，随后标记软件中断 NET_TX_SOFTIRQ，当软中断处理程序 net_tx_action 被调度时，CPU输出队列 output_queue 中的设备会重新被调度来发送数据帧。
+对于第2种失败情况，内核实现了\_\_netif_schedule来重新调度网络设备发送数据帧，它将网络设备输出队列放到CPU发送队列 softnet_data->output_queue ，随后标记软件中断 NET_TX_SOFTIRQ，当软中断处理程序 net_tx_action 被调度时，CPU输出队列 output_queue 中的设备发送队列会重新被调度来发送数据帧。
 
 ```c
-// 将设备加入CPU输出队列
+// 将设备发送队列加入CPU输出队列
 // 并标记软中断NET_TX_SOFTIRQ，待软中断处理函数 发送数据包
 void __netif_schedule(struct Qdisc *q)
 {
-	// 如果网络设备已经在ouput_queue队列中，则直接返回，返回参加调度
+	// 如果网络设备发送队列已经在ouput_queue队列中，则直接返回，返回参加调度
 	if (!test_and_set_bit(__QDISC_STATE_SCHED, &q->state))
 		__netif_reschedule(q);
 }
@@ -654,8 +654,8 @@ static inline void __netif_reschedule(struct Qdisc *q)
 另外 netif_wake_queue 相当于调用了 netif_start_queue 和 \_\_netif_schedule.
 因为驱动程序负责允许/禁止发送过程，上层内核负责设备的调度，所以netif_wake_queue通常给驱动程序使用，\_\_netif_schedule 给上层内核使用。
 
-驱动程序会在一下情况调用 netif_wake_queue
-网络设备驱动使用 watchdog来恢复挂起的发送过程。 net_device->tx_timeout 通常先重启网络设备，这时可能有待发送的数据帧，所以驱动程序应启动发送队列，并调度设备(设置NET_TX_SOFTIRQ)，将设备放入CPU输出队列。
+驱动程序会在以下情况调用 netif_wake_queue
+网络设备驱动使用 watchdog来恢复挂起的发送过程。 net_device->tx_timeout 通常先重启网络设备，这时可能有待发送的数据帧，所以驱动程序应启动发送队列，并调度设备(设置NET_TX_SOFTIRQ)，将设备发送队列放入CPU输出队列。
 
 ```c
 static inline void netif_wake_queue(struct net_device *dev)
@@ -679,12 +679,13 @@ static inline void netif_tx_wake_queue(struct netdev_queue *dev_queue)
 ## 队列策略接口
 网络设备都使用队列来调度管理输出数据帧的流量，内核可以使用队列策略来安排哪个数据帧先发送，队列策略属于流量控制子系统的内容，这里只介绍有发送队列的网络设备驱动程序和数据链路层之间的主要接口和调度队列的方法。
 
-当有一个设备被调度来发送数据帧时，下一个要发送的数据帧由qdisc_run来选择，
+当有一个设备发送队列被调度来发送数据帧时，下一个要发送的数据帧由qdisc_run来选择，
 ```c
 
 static inline void qdisc_run(struct Qdisc *q)
 {
-	// 过滤掉输出队列被停止的网络设备
+	// 过滤掉正在发送中的设备输出队列
+	// 标记输出队列为正在发送中
 	if (!test_and_set_bit(__QDISC_STATE_RUNNING, &q->state))
 		__qdisc_run(q);
 }
@@ -693,13 +694,21 @@ void __qdisc_run(struct Qdisc *q)
 {
 	unsigned long start_time = jiffies;
 
+	// 发送数据帧
+	// 直到队列为空，或者时间消耗完，或者驱动输出队列停止
 	while (qdisc_restart(q)) {
 		if (need_resched() || jiffies != start_time) {
-			__netif_schedule(q);
+			__netif_schedule(q); // 将设备输出队列重新加入CPU输出队列，
+			                     // 并标记软中断等待下次net_tx_action中调用 qdisc_run 
+								 // 继续发送该设备输出队列的数据帧
+				if (!test_and_set_bit(__QDISC_STATE_SCHED, &q->state))
+					q->next_sched = sd->output_queue;
+					sd->output_queue = q;
 			break;
 		}
 	}
 
+	// 删除对输出队列正在发送中的标记
 	clear_bit(__QDISC_STATE_RUNNING, &q->state);
 }
 
@@ -760,6 +769,7 @@ static inline int qdisc_restart(struct Qdisc *q)
 		break;
 	}
 
+	// 如果发送成功了，但是驱动通知发送队列停止了，则ret=0通知上层函数应该退出
 	if (ret && (netif_tx_queue_stopped(txq) ||
 		    netif_tx_queue_frozen(txq)))
 		ret = 0;
@@ -781,7 +791,7 @@ skb->dev是输出设备，skb->data是负载数据地址，skb->len是负载长�
 其主要功能如下：
 * 查看数据帧是否被分片，如果是，查看网络设备是否支持 scattr/gatter DMA功能，能直接处理数据片。如果不能，则将数据片组成一个完整的数据帧
 * 除非设备能完成L4的数据校验和计算，否则确定传输层完成了数据帧的校验和计算
-* 选择要发送的数据帧（因为由skb队列，所以由sk_buff指针指向的对象可能不是当前就能发送的数据帧
+* 选择要发送的数据帧（因为有skb队列，所以由sk_buff指针指向的对象可能不是当前就能发送的数据帧）
 
 ```c
 int dev_queue_xmit(struct sk_buff *skb)
@@ -826,6 +836,7 @@ gso:
 	 */
 	rcu_read_lock_bh();
 
+	// 获得设备输出队列
 	txq = dev_pick_tx(dev, skb);
 	q = rcu_dereference(txq->qdisc);
 
@@ -846,7 +857,9 @@ gso:
 			kfree_skb(skb);
 			rc = NET_XMIT_DROP;
 		} else {
+			// 如果设备输出队列是激活状态，则将数据包放入队列
 			rc = qdisc_enqueue_root(skb, q);
+			// 尽量将设备输出队列所有数据包发送完
 			qdisc_run(q);
 		}
 		spin_unlock(root_lock);
@@ -865,12 +878,16 @@ gso:
 
 			HARD_TX_LOCK(dev, txq, cpu);
 
+			// 设备发送队列是否满了
 			if (!netif_tx_queue_stopped(txq)) {
+				// 若可以发送，则调用dev_hard_start_xmit进行发送
 				rc = 0;
 				if (!dev_hard_start_xmit(skb, dev, txq)) {
+					// 如果发送成功，跳转到out，在net_tx_action中统一释放skb内存
 					HARD_TX_UNLOCK(dev, txq);
 					goto out;
 				}
+				// 如果发送失败，在此函数释放内存
 			}
 			HARD_TX_UNLOCK(dev, txq);
 			if (net_ratelimit())
@@ -890,9 +907,180 @@ out_kfree_skb:
 	kfree_skb(skb);
 	return rc;
 out:
+	// 对于成功发送数据包，在net_tx_action 统一释放socket buffer 内存
 	rcu_read_unlock_bh();
 	return rc;
 }
 ```
 有队列发送和无队列发送的对比
+* 有发送队列时，调用 q->queue 先将数据包放到设备的输出队列，再调用 qdisc_run由流控系统决定先发送包的顺序，尽可能将输出队列所有包发送完，qdisc_run间接调用 hard_start_xmit 发送数据包，如果发送错误，则将包重新加入输出队列，并标记软中断，待软中断中再次发送。
+* 如果没有发送队列，直接调用 hard_start_xmit 发送数据包，如果发送错误就扔掉。
+* 不论是否有发送队列，只要数据包发送成功，就在将数据包加入 CPU 的completion_queue ，在输出软中断net_tx_action中统一释放socket buffer
 ![](./pic/29.jpg)
+
+## 发送软件中断
+net_rx_action 是网络接受软件中断处理程序，由驱动程序硬件中断处理程序标记触发（少数特殊情况由内核自己触发）
+net_tx_action 在以下两个情况触发：
+* 当设备允许发送时，由netif_wake_queue 触发，这时net_tx_action发送待发送的的数据包
+* 当发送结束时，网络驱动通知内核相关缓存区可以释放时，由dev_kfree_skb_irq触发。这时net_tx_action回收发送成功的socket buffer的内存空间
+
+释放已完成发送的socket buffer的内存放到软件中断net_tx_action中，是因为发送数据包的驱动运行在中断现场，而中断处理程序需要尽可能的快，而释放内存比较耗时。所以将释放内存交给net_tx_action.
+驱动程序调用 dev_kfree_skb_irq 将要释放的socket buffer放到CPU completion_queue
+net_tx_action 调用 dev_kfree_skb 将 socket buffer空间释放
+
+```c
+static void net_tx_action(struct softirq_action *h)
+{
+	struct softnet_data *sd = &__get_cpu_var(softnet_data);
+
+	// 如果有需要释放的 socket buffer
+	if (sd->completion_queue) {
+		struct sk_buff *clist;
+
+		// 在中断关闭情况下取出completion_queue，再打开中断
+		// 并清零sd->completion_queue，这样net_tx_action
+		// 可以被中断打断，并加入新的skb到 CPU completion_queue
+		local_irq_disable();
+		clist = sd->completion_queue;
+		sd->completion_queue = NULL;
+		local_irq_enable();
+
+		// 释放所有skb
+		while (clist) {
+			struct sk_buff *skb = clist;
+			clist = clist->next;
+
+			WARN_ON(atomic_read(&skb->users));
+			__kfree_skb(skb);
+		}
+	}
+
+	// 如果CPU 设备发送队列不为空
+	if (sd->output_queue) {
+		struct Qdisc *head;
+
+		// 原因同上
+		local_irq_disable();
+		head = sd->output_queue;
+		sd->output_queue = NULL;
+		local_irq_enable();
+
+		while (head) {
+			// 获得一个设备的输出队列
+			struct Qdisc *q = head;
+			spinlock_t *root_lock;
+
+			// head指向下一个节点
+			head = head->next_sched;
+
+			root_lock = qdisc_lock(q);
+			if (spin_trylock(root_lock)) {
+				// 如果获得锁成功
+				smp_mb__before_clear_bit();
+				clear_bit(__QDISC_STATE_SCHED,
+					  &q->state);
+				// 尝试发送该设备输出队列的所有数据包
+				// 如果发送失败或重新加入设备输出队列，继续发送
+				// 如果运行时间超时，会将设备输出队列重新
+				// 加入CPU output_queue
+				qdisc_run(q);
+				spin_unlock(root_lock);
+			} else {
+				if (!test_bit(__QDISC_STATE_DEACTIVATED,
+					      &q->state)) {
+					// 如果设备发送队列是激活状态，但是
+					// 获得锁失败，重新将设备发送队列加入
+					// CPU output_queue，并标记软中断
+					__netif_reschedule(q);
+				} else {
+					// 如果设备输出队列不是激活状态
+					// 则不将队列重新调度，设备输出队列将
+					// 离开CPU output_queue
+					smp_mb__before_clear_bit();
+					clear_bit(__QDISC_STATE_SCHED,
+						  &q->state);
+				}
+			}
+		}
+	}
+}
+```
+
+# 释放socket buffer
+内核提供了一些API用于在中断或非中断条件下释放socket buffer
+```c
+// 用于中断和非中断
+void dev_kfree_skb_any(struct sk_buff *skb)
+{
+	if (in_irq() || irqs_disabled())
+		dev_kfree_skb_irq(skb);
+	else
+		dev_kfree_skb(skb);
+}
+
+// 用于中断，只是将skb 加入CPU 的 completion_queue
+// 并标记NET_TX_SOFTIRQ，在net_tx_action中执行真实释放
+void dev_kfree_skb_irq(struct sk_buff *skb)
+{
+	if (atomic_dec_and_test(&skb->users)) {
+		struct softnet_data *sd;
+		unsigned long flags;
+
+		local_irq_save(flags);
+		sd = &__get_cpu_var(softnet_data);
+		skb->next = sd->completion_queue;
+		sd->completion_queue = skb;
+		raise_softirq_irqoff(NET_TX_SOFTIRQ);
+		local_irq_restore(flags);
+	}
+}
+
+#define dev_kfree_skb(a)	kfree_skb(a)
+
+// 非中断环境，如果skb还有用户则之减少 skb->users
+// 如果没有用户，则执行真实释放
+void kfree_skb(struct sk_buff *skb)
+{
+	if (unlikely(!skb))
+		return;
+	if (likely(atomic_read(&skb->users) == 1))
+		smp_rmb();
+	else if (likely(!atomic_dec_and_test(&skb->users)))
+		return;
+	__kfree_skb(skb);
+}
+
+void __kfree_skb(struct sk_buff *skb)
+{
+	skb_release_all(skb);
+	kfree_skbmem(skb);
+}
+```
+
+# watchdog
+某些条件下，数据包的发送过程可以被驱动关闭，内核认为发送过程的关闭应该是临时的，所以一段时间后发送过程若没有被打开，内核就认为设备发生了故障，要重启设备。这个检查和故障处理由 watchdog 实现 。
+
+net_device 如下用于实现 watchdog 的域
+```c
+struct net_device {
+	...
+
+	// 每次设备驱动后发送的最后一个数据包的时间戳
+	unsigned long		trans_start;	/* Time (in jiffies) of last Tx	*/
+
+	// 由流量控制启动的时钟，时钟超时后执行 dev_watchdog 函数
+	struct timer_list	watchdog_timer;
+
+	// 时钟应等待的时间，由驱动程序初始化，该值设置为0时，watchdog_timer 不启动
+	int			watchdog_timeo; /* used by dev_watchdog() */
+
+	// 由驱动实现的函数，在watchdog_timeo超时时，内核调用dev_watchdog, dev_watchdog调用 tx_timeout
+	// tx_timeout通常会重启设备，并调用 netif_wake_queue 开启发送过程，并将本设备发送队列加入CPU output_queue，并标记软中断 NET_TX_SOFTIRQ，net_tx_action 会重新发送本设备输出队列的数据包
+	void			(*tx_timeout) (struct net_device *dev);
+
+	...
+};
+```
+
+# 总结
+![](./pic/30.jpg)
