@@ -665,11 +665,11 @@ ip_local_deliver_finish中 socket buffer的变化
 ```c
 struct ipcm_cookie
 {
-	// 输出数据包的目标IP
+	// 输出网络设备的IP地址
 	__be32			addr;
-	// 输出数据包的设备索引号
+	// 输出设备索引号
 	int			oif;
-	// 指向存放IP选项数据结构ip_options的指针
+	// IP选项
 	struct ip_options	*opt;
 };
 ```
