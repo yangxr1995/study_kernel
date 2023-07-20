@@ -50,9 +50,11 @@ struct tcphdr {
 	__be16	window; // 当我做接收方时还剩余多少缓存空间用于接受数据
 	__sum16	check; // 包含TCP协议头和数据所作的检验和
 	__be16	urg_ptr; // 指向重要数据的最后一个字节的地址
+
 };
 
 ```
+TCP支持长度可变的选项，追加在tcphdr后
 
 ## TCP的控制缓存
 socket buffer用于存放负载数据，控制缓存存放用户控制管理数据包的信息
@@ -1314,19 +1316,28 @@ new_segment:
 
 			/* Where to copy to? */
 			if (skb_tailroom(skb) > 0) {
+			// skb tailroom 空间，将数据尽可能拷贝到skb 的 tailroom
 				/* We have some space in skb head. Superb! */
 				if (copy > skb_tailroom(skb))
 					copy = skb_tailroom(skb);
 				if ((err = skb_add_data(skb, from, copy)) != 0)
 					goto do_fault;
 			} else {
+
+				// 如果主skb没有tailroom，则将数据追加到
+				// 最后一个frags, skb_shinfo(skb)->frags[i - 1] 
+
+				// 如果最后一个 frags 不能用于合并，则新
+				// 建一个frags，加入 skb_shinfo(skb)->frags[] 数组。
+
 				int merge = 0;
-				int i = skb_shinfo(skb)->nr_frags;
+				int i = skb_shinfo(skb)->nr_frags; // 获得frags数量，为了定位最后的frag
 				struct page *page = TCP_PAGE(sk);
 				int off = TCP_OFF(sk);
 
 				if (skb_can_coalesce(skb, i, page, off) &&
 				    off != PAGE_SIZE) {
+					// 能够将数据合并到最后一个 frags
 					/* We can extend the last page
 					 * fragment. */
 					merge = 1;
@@ -1337,31 +1348,43 @@ new_segment:
 					 * do this because interface is non-SG,
 					 * or because all the page slots are
 					 * busy. */
+					// 不能合并到最后一个frags，且本 socket buffer 的 frags
+					// 数量已经到达最大 MAX_SKB_FRAGS，所以也不能分配新frags
+					// 并且设备不支持 SG
+					// 那么分配新的socket buffer，加入输出队列
 					tcp_mark_push(tp, skb);
 					goto new_segment;
 				} else if (page) {
 					if (off == PAGE_SIZE) {
+						// 如果当前page没有剩余空间
+						// 准备增加frags
 						put_page(page);
 						TCP_PAGE(sk) = page = NULL;
 						off = 0;
 					}
+					// 不能合并但page没有使用完, 继续使用此page
 				} else
+					// 不能合并但可以增加frags，设置新frags的offset为0
 					off = 0;
 
+				// 计算使用frag剩余空间还能拷贝的数据
 				if (copy > PAGE_SIZE - off)
 					copy = PAGE_SIZE - off;
 
+				// 如果sock没有足够的发送缓存，则等待
 				if (!sk_wmem_schedule(sk, copy))
 					goto wait_for_memory;
 
 				if (!page) {
 					/* Allocate new cache page. */
+					// 如果page已经使用完了，或没有page，则从伙伴系统分配page
 					if (!(page = sk_stream_alloc_page(sk)))
 						goto wait_for_memory;
 				}
 
 				/* Time to copy data. We are close to
 				 * the end! */
+				// 将用户发送数据复制到 page
 				err = skb_copy_to_page(sk, from, skb, page,
 						       off, copy);
 				if (err) {
@@ -1377,13 +1400,20 @@ new_segment:
 
 				/* Update the skb. */
 				if (merge) {
+					// 如果可以合并，前面拷贝数据到page时，实际上是拷贝到了
+					// 最后一个frag的page，所以增加frag的size
 					skb_shinfo(skb)->frags[i - 1].size +=
 									copy;
 				} else {
+					// 如果不能合并，前面拷贝到的 page 与 frag无关
+					// 将page追加到frags数组
 					skb_fill_page_desc(skb, i, page, off, copy);
 					if (TCP_PAGE(sk)) {
 						get_page(page);
 					} else if (off + copy < PAGE_SIZE) {
+						// 如果该page没有使用完，将 
+						// sk->sk_sndmsg_page = page
+						// 方便下次迅速找到有剩余空间的page
 						get_page(page);
 						TCP_PAGE(sk) = page;
 					}
@@ -1395,6 +1425,7 @@ new_segment:
 			if (!copied)
 				TCP_SKB_CB(skb)->flags &= ~TCPCB_FLAG_PSH;
 
+			// 增加TCP序号
 			tp->write_seq += copy;
 			TCP_SKB_CB(skb)->end_seq += copy;
 			skb_shinfo(skb)->gso_segs = 0;
@@ -1407,11 +1438,15 @@ new_segment:
 			if (skb->len < size_goal || (flags & MSG_OOB))
 				continue;
 
+			// 根据TCP窗口决定发送数据的数量
 			if (forced_push(tp)) {
+				// 如果要立即发送数据段，
 				tcp_mark_push(tp, skb);
+				// 将套接字发送队列上的数据段全部发送
+				// 这时即使socket buffer只有少量数据也被发送
 				__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);
 			} else if (skb == tcp_send_head(sk))
-				tcp_push_one(sk, mss_now);
+				tcp_push_one(sk, mss_now); // 发送一个数据段
 			continue;
 
 wait_for_sndbuf:
@@ -1455,3 +1490,573 @@ out_err:
 	return err;
 }
 ```
+
+## TCP数据段的输出
+从TCP协议实例向IP层传输时，除了来自用户空间的数据包外，还有大量由TCP协议层产生的数据包，如：
+* 重传数据包
+* 探测路由最大传输单元
+* RST数据包
+* SYN数据包
+* ACK数据包
+* 0窗口探测数据包 等
+
+这些数据包通过不同函数创建，和用户发送数据包，一起通过 tcp_transmit_skb 向IP层传送。
+
+如 
+tcp_sendmsg -> 
+  tcp_push_one/\_\_tcp_push_pending_frames -> 
+    tcp_write_xmit ->
+	  tcp_transmit_skb
+
+tcp_transmit_skb的功能：
+* 创建TCP协议头
+* 将数据段传递给IP层
+
+构造TCP协议头，需要以下重要信息： 
+* inet: 包含了AF_INET地址族SOCK_STREAM 类套接字的所有信息
+* tp : 包含了TCP配置和连接大部分信息
+* tcb : 包含了用于构造TCP协议头的各项标志
+* th : 指向TCP协议头数据结构
+* icsk : inet连接控制套接字
+
+```c
+static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
+			    gfp_t gfp_mask)
+{
+	const struct inet_connection_sock *icsk = inet_csk(sk);
+	struct inet_sock *inet;
+	struct tcp_sock *tp;
+	struct tcp_skb_cb *tcb;
+	struct tcp_out_options opts;
+	unsigned tcp_options_size, tcp_header_size;
+	struct tcp_md5sig_key *md5;
+	__u8 *md5_hash_location;
+	struct tcphdr *th;
+	int err;
+
+	BUG_ON(!skb || !tcp_skb_pcount(skb));
+
+	/* If congestion control is doing timestamping, we must
+	 * take such a timestamp before we potentially clone/copy.
+	 */
+	if (icsk->icsk_ca_ops->flags & TCP_CONG_RTT_STAMP)
+		__net_timestamp(skb);
+
+	// skb被其他进程使用，需要克隆
+	if (likely(clone_it)) {
+		if (unlikely(skb_cloned(skb)))
+			skb = pskb_copy(skb, gfp_mask);
+		else
+			skb = skb_clone(skb, gfp_mask);
+		if (unlikely(!skb))
+			return -ENOBUFS;
+	}
+
+	inet = inet_sk(sk);
+	tp = tcp_sk(sk);
+	tcb = TCP_SKB_CB(skb);
+	memset(&opts, 0, sizeof(opts));
+
+	// skb是SYN类型，则调用 tcp_syn_options 构建SYN选项
+	// 否则使用 tcp_established_options ，构造常规选项
+	if (unlikely(tcb->flags & TCPCB_FLAG_SYN))
+		tcp_options_size = tcp_syn_options(sk, skb, &opts, &md5);
+	else
+		tcp_options_size = tcp_established_options(sk, skb, &opts,
+							   &md5);
+	tcp_header_size = tcp_options_size + sizeof(struct tcphdr);
+
+	// 拥塞控制
+	if (tcp_packets_in_flight(tp) == 0)
+		tcp_ca_event(sk, CA_EVENT_TX_START);
+
+	// 为TCP协议头分配空间
+	skb_push(skb, tcp_header_size);
+	skb_reset_transport_header(skb);
+	skb_set_owner_w(skb, sk);
+
+	// 构造TCP协议头 ，并计算校验和
+	th = tcp_hdr(skb);
+	th->source		= inet->sport;
+	th->dest		= inet->dport;
+	th->seq			= htonl(tcb->seq);
+	th->ack_seq		= htonl(tp->rcv_nxt);
+	*(((__be16 *)th) + 6)	= htons(((tcp_header_size >> 2) << 12) |
+					tcb->flags);
+
+	if (unlikely(tcb->flags & TCPCB_FLAG_SYN)) {
+		/* RFC1323: The window in SYN & SYN/ACK segments
+		 * is never scaled.
+		 */
+		th->window	= htons(min(tp->rcv_wnd, 65535U));
+	} else {
+		th->window	= htons(tcp_select_window(sk));
+	}
+	th->check		= 0;
+	th->urg_ptr		= 0;
+
+	/* The urg_mode check is necessary during a below snd_una win probe */
+	if (unlikely(tcp_urg_mode(tp) &&
+		     between(tp->snd_up, tcb->seq + 1, tcb->seq + 0xFFFF))) {
+		th->urg_ptr		= htons(tp->snd_up - tcb->seq);
+		th->urg			= 1;
+	}
+
+	tcp_options_write((__be32 *)(th + 1), tp, &opts, &md5_hash_location);
+	if (likely((tcb->flags & TCPCB_FLAG_SYN) == 0))
+		TCP_ECN_send(sk, skb, tcp_header_size);
+
+	icsk->icsk_af_ops->send_check(sk, skb->len, skb);
+
+	if (likely(tcb->flags & TCPCB_FLAG_ACK))
+		tcp_event_ack_sent(sk, tcp_skb_pcount(skb));
+
+	if (skb->len != tcp_header_size)
+		tcp_event_data_sent(tp, skb, sk);
+
+	// 更新统计数据
+	if (after(tcb->end_seq, tp->snd_nxt) || tcb->seq == tcb->end_seq)
+		TCP_INC_STATS(sock_net(sk), TCP_MIB_OUTSEGS);
+
+	// 发送数据段到IP层
+	err = icsk->icsk_af_ops->queue_xmit(skb, 0);
+	if (likely(err <= 0))
+		return err;
+
+	tcp_enter_cwr(sk, 1);
+
+	return net_xmit_eval(err);
+}
+```
+# TCP状态管理
+![](./pic/50.jpg)
+
+![](./pic/51.jpg)
+
+TCP状态保存在 sock->state ，当sock处于不同状态时，对数据包的处理不一样。
+整个状态可以分为三个阶段：
+* 建立连接
+* 数据传输
+* 断开连接
+
+管理连接状态机的重要函数 tcp_rcv_state_process , 
+它根据收到信息切换TCP连接状态，但在连接还没有建立时，
+TIME_WAIT是收到数据包的唯一状态。
+
+## 建立连接
+建立连接阶段处理以下状态:
+* LISTEN : 被动打开，等待SYN
+* SYN_SENT : 主动打开，发送SYN后，等待ACK
+* SYN_RECV : 被动打开，收到SYN后，并回复SYN + ACK，等待ACK
+* ESTABLISHED : 连接已建立，建立连接阶段结束
+
+当用户调用connect时，内核执行 tcp_v4_connect
+![](./pic/52.jpg)
+tcp_v4_connect 主要功能：
+* 创建一个有SYN标志的请求包，并发送出去
+* 将TCP状态从CLOSED切换到SYN_SENT
+* 初始化TCP部分选项，如数据包序列号，窗口大小，MSS，套接字超时等
+
+```c
+int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+{
+	struct inet_sock *inet = inet_sk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct sockaddr_in *usin = (struct sockaddr_in *)uaddr;
+	struct rtable *rt;
+	__be32 daddr /*目标IP*/, nexthop /*网关IP (如果有)*/;
+	int tmp;
+	int err;
+
+	if (addr_len < sizeof(struct sockaddr_in))
+		return -EINVAL;
+
+	if (usin->sin_family != AF_INET)
+		return -EAFNOSUPPORT;
+
+	// 如果设置源路由选项，用第一个IP地址做网关地址
+	// 如果没有设置，则用目标地址做网关地址
+	nexthop = daddr = usin->sin_addr.s_addr;
+	if (inet->opt && inet->opt->srr) {
+		if (!daddr)
+			return -EINVAL;
+		nexthop = inet->opt->faddr;
+	}
+
+	// 查询到网关地址的路由
+	tmp = ip_route_connect(&rt, nexthop, inet->saddr,
+			       RT_CONN_FLAGS(sk), sk->sk_bound_dev_if,
+			       IPPROTO_TCP,
+			       inet->sport, usin->sin_port, sk, 1);
+	if (tmp < 0) {
+		if (tmp == -ENETUNREACH)
+			IP_INC_STATS_BH(sock_net(sk), IPSTATS_MIB_OUTNOROUTES);
+		return tmp;
+	}
+
+	// 网关地址必须是单播
+	if (rt->rt_flags & (RTCF_MULTICAST | RTCF_BROADCAST)) {
+		ip_rt_put(rt);
+		return -ENETUNREACH;
+	}
+
+	// 若没有设置源路由IP选项，则记录路由
+	if (!inet->opt || !inet->opt->srr)
+		daddr = rt->rt_dst;
+
+	// 若没有绑定套接字源地址，则用路由项设置源地址
+	if (!inet->saddr)
+		inet->saddr = rt->rt_src;
+	inet->rcv_saddr = inet->saddr;
+
+	if (tp->rx_opt.ts_recent_stamp && inet->daddr != daddr) {
+		/* Reset inherited state */
+		tp->rx_opt.ts_recent	   = 0;
+		tp->rx_opt.ts_recent_stamp = 0;
+		tp->write_seq		   = 0;
+	}
+
+	if (tcp_death_row.sysctl_tw_recycle &&
+	    !tp->rx_opt.ts_recent_stamp && rt->rt_dst == daddr) {
+		struct inet_peer *peer = rt_get_peer(rt);
+		/*
+		 * VJ's idea. We save last timestamp seen from
+		 * the destination in peer table, when entering state
+		 * TIME-WAIT * and initialize rx_opt.ts_recent from it,
+		 * when trying new connection.
+		 */
+		if (peer != NULL &&
+		    peer->tcp_ts_stamp + TCP_PAWS_MSL >= get_seconds()) {
+			tp->rx_opt.ts_recent_stamp = peer->tcp_ts_stamp;
+			tp->rx_opt.ts_recent = peer->tcp_ts;
+		}
+	}
+
+	// 设置目标端口，目标地址
+	inet->dport = usin->sin_port;
+	inet->daddr = daddr;
+
+	inet_csk(sk)->icsk_ext_hdr_len = 0;
+	if (inet->opt)
+		inet_csk(sk)->icsk_ext_hdr_len = inet->opt->optlen;
+
+	tp->rx_opt.mss_clamp = 536;
+
+	/* Socket identity is still unknown (sport may be zero).
+	 * However we set state to SYN-SENT and not releasing socket
+	 * lock select source port, enter ourselves into the hash tables and
+	 * complete initialization after this.
+	 */
+	// 切换状态为 TCP_SYN_SENT
+	tcp_set_state(sk, TCP_SYN_SENT);
+
+	// 将套接字放入TCP连接管理哈希表 
+	// 此时 sport 可能为0，inet_hash_connect会分配
+	// 一个随机的端口设置sk->sport
+	// 这样当建立连接后，接受数据包时，通过数据段的
+	// 目的端口查询哈希表可以找到接受套接字
+	err = inet_hash_connect(&tcp_death_row, sk);
+	if (err)
+		goto failure;
+
+	// 由于sport可能改变，重新查询路由
+	err = ip_route_newports(&rt, IPPROTO_TCP,
+				inet->sport, inet->dport, sk);
+	if (err)
+		goto failure;
+
+	/* OK, now commit destination to socket.  */
+	sk->sk_gso_type = SKB_GSO_TCPV4;
+
+	// 将路由保存到套接字，sk->sk_dst_cache = dst;
+	// 如果目标主机是外网主机，则dst保存了网关信息 
+	// 如果目标主机是内网主机，则dst保存了目标主机信息
+	sk_setup_caps(sk, &rt->u.dst);
+
+	// 初始化TCP数据段序列号
+	if (!tp->write_seq)
+		tp->write_seq = secure_tcp_sequence_number(inet->saddr,
+							   inet->daddr,
+							   inet->sport,
+							   usin->sin_port);
+
+	inet->id = tp->write_seq ^ jiffies;
+
+	// 完成连接工作
+	err = tcp_connect(sk);
+	rt = NULL;
+	if (err)
+		goto failure;
+
+	return 0;
+
+failure:
+	tcp_set_state(sk, TCP_CLOSE);
+	ip_rt_put(rt);
+	sk->sk_route_caps = 0;
+	inet->dport = 0;
+	return err;
+}
+```
+
+## 连接状态管理
+连接初始化后，状态的管理由 tcp_rcv_state_process完成，
+
+TCP收到数据包后，必须查看数据段协议头，区分是负载数据还是包含控制信息
+SYN,FIN,RST,ACK等，根据数据段类型，调用 tcp_rcv_state_process 确定TCP
+的连接状态应如何切换, 数据包应如何处理。
+
+大部分状态的切换和处理都在 tcp_rcv_state_process，除了 ESTABLISHED和TIME_WAIT
+
+```c
+// 返回 0 正常接受数据包, 或丢弃数据包不回复
+// 返回 1 错误，交给上级处理，通常是回复RST
+int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+			  struct tcphdr *th, unsigned len)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	int queued = 0;
+	int res;
+
+	tp->rx_opt.saw_tstamp = 0;
+
+	// 按照套接字不同状态对数据段进行处理
+	switch (sk->sk_state) {
+	case TCP_CLOSE:
+		// 套接字已关闭，丢弃包，不回复
+		goto discard;
+
+	case TCP_LISTEN:
+		// 被动打开，等待SYN
+
+		// 收到ACK，回复RST
+		if (th->ack)
+			return 1;
+
+		// 收到RST，丢弃
+		if (th->rst)
+			goto discard;
+
+		// 收到SYN，处理握手
+		if (th->syn) {
+			if (icsk->icsk_af_ops->conn_request(sk, skb) < 0)
+				return 1;
+
+			/* Now we have several options: In theory there is
+			 * nothing else in the frame. KA9Q has an option to
+			 * send data with the syn, BSD accepts data with the
+			 * syn up to the [to be] advertised window and
+			 * Solaris 2.1 gives you a protocol error. For now
+			 * we just ignore it, that fits the spec precisely
+			 * and avoids incompatibilities. It would be nice in
+			 * future to drop through and process the data.
+			 *
+			 * Now that TTCP is starting to be used we ought to
+			 * queue this data.
+			 * But, this leaves one open to an easy denial of
+			 * service attack, and SYN cookies can't defend
+			 * against this problem. So, we drop the data
+			 * in the interest of security over speed unless
+			 * it's still in use.
+			 */
+			kfree_skb(skb);
+			return 0;
+		}
+		// 其他都丢弃，不回复
+		goto discard;
+
+	case TCP_SYN_SENT:
+		// 主动打开，发送了SYN，等待 SYN + ACK
+
+		// 对数据段进行合法性检查和校验，如果数据段设置了ACK，
+		// 则切换状态为 ESTABLISHED
+		queued = tcp_rcv_synsent_state_process(sk, skb, th, len);
+		if (queued >= 0)
+			return queued;
+
+		/* Do step6 onward by hand. */
+		tcp_urg(sk, skb, th);
+		__kfree_skb(skb);
+		tcp_data_snd_check(sk);
+		return 0;
+	}
+
+	// 下面的状况可能是
+	// SYN_RECV ESTABLISHED CLOSE_WAIT FIN_WAITn TIME_WAIT
+
+	// 对数据包进行有效性检查
+	res = tcp_validate_incoming(sk, skb, th, 0);
+	if (res <= 0)
+		return -res;
+
+	/* step 5: check the ACK field */
+	if (th->ack) {
+		int acceptable = tcp_ack(sk, skb, FLAG_SLOWPATH);
+
+		switch (sk->sk_state) {
+		case TCP_SYN_RECV:
+			// 套接字是被动打开，收到了SYN，并回复SYN，ACK，等待ACK
+			// 这时收到了ACK，将状态切换为 ESTABLISHED
+			if (acceptable) {
+				tp->copied_seq = tp->rcv_nxt;
+				smp_mb();
+				tcp_set_state(sk, TCP_ESTABLISHED);
+				sk->sk_state_change(sk);
+
+				/* Note, that this wakeup is only for marginal
+				 * crossed SYN case. Passively open sockets
+				 * are not waked up, because sk->sk_sleep ==
+				 * NULL and sk->sk_socket == NULL.
+				 */
+				if (sk->sk_socket)
+					sk_wake_async(sk,
+						      SOCK_WAKE_IO, POLL_OUT);
+
+				tp->snd_una = TCP_SKB_CB(skb)->ack_seq;
+				tp->snd_wnd = ntohs(th->window) <<
+					      tp->rx_opt.snd_wscale;
+				tcp_init_wl(tp, TCP_SKB_CB(skb)->ack_seq,
+					    TCP_SKB_CB(skb)->seq);
+
+				/* tcp_ack considers this ACK as duplicate
+				 * and does not calculate rtt.
+				 * Fix it at least with timestamps.
+				 */
+				if (tp->rx_opt.saw_tstamp &&
+				    tp->rx_opt.rcv_tsecr && !tp->srtt)
+					tcp_ack_saw_tstamp(sk, 0);
+
+				if (tp->rx_opt.tstamp_ok)
+					tp->advmss -= TCPOLEN_TSTAMP_ALIGNED;
+
+				/* Make sure socket is routed, for
+				 * correct metrics.
+				 */
+				icsk->icsk_af_ops->rebuild_header(sk);
+
+				tcp_init_metrics(sk);
+
+				tcp_init_congestion_control(sk);
+
+				/* Prevent spurious tcp_cwnd_restart() on
+				 * first data packet.
+				 */
+				tp->lsndtime = tcp_time_stamp;
+
+				tcp_mtup_init(sk);
+				tcp_initialize_rcv_mss(sk);
+				tcp_init_buffer_space(sk);
+				tcp_fast_path_on(tp);
+			} else {
+				return 1;
+			}
+			break;
+
+		case TCP_FIN_WAIT1:
+			// TCP_FIN_WAIT1 收到ACK，切换为TCP_FIN_WAIT2
+			if (tp->snd_una == tp->write_seq) {
+				tcp_set_state(sk, TCP_FIN_WAIT2);
+				sk->sk_shutdown |= SEND_SHUTDOWN;
+				dst_confirm(sk->sk_dst_cache);
+
+				if (!sock_flag(sk, SOCK_DEAD))
+					/* Wake up lingering close() */
+					sk->sk_state_change(sk);
+				else {
+					int tmo;
+
+					if (tp->linger2 < 0 ||
+					    (TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq &&
+					     after(TCP_SKB_CB(skb)->end_seq - th->fin, tp->rcv_nxt))) {
+						tcp_done(sk);
+						NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPABORTONDATA);
+						return 1;
+					}
+
+					tmo = tcp_fin_time(sk);
+					if (tmo > TCP_TIMEWAIT_LEN) {
+						inet_csk_reset_keepalive_timer(sk, tmo - TCP_TIMEWAIT_LEN);
+					} else if (th->fin || sock_owned_by_user(sk)) {
+						/* Bad case. We could lose such FIN otherwise.
+						 * It is not a big problem, but it looks confusing
+						 * and not so rare event. We still can lose it now,
+						 * if it spins in bh_lock_sock(), but it is really
+						 * marginal case.
+						 */
+						inet_csk_reset_keepalive_timer(sk, tmo);
+					} else {
+						tcp_time_wait(sk, TCP_FIN_WAIT2, tmo);
+						goto discard;
+					}
+				}
+			}
+			break;
+
+		case TCP_CLOSING:
+			if (tp->snd_una == tp->write_seq) {
+				tcp_time_wait(sk, TCP_TIME_WAIT, 0);
+				goto discard;
+			}
+			break;
+
+		case TCP_LAST_ACK:
+			if (tp->snd_una == tp->write_seq) {
+				tcp_update_metrics(sk);
+				tcp_done(sk);
+				goto discard;
+			}
+			break;
+		}
+	} else
+		goto discard;
+
+	/* step 6: check the URG bit */
+	tcp_urg(sk, skb, th);
+
+	/* step 7: process the segment text */
+	switch (sk->sk_state) {
+	case TCP_CLOSE_WAIT:
+	case TCP_CLOSING:
+	case TCP_LAST_ACK:
+		if (!before(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
+			break;
+	case TCP_FIN_WAIT1:
+	case TCP_FIN_WAIT2:
+		/* RFC 793 says to queue data in these states,
+		 * RFC 1122 says we MUST send a reset.
+		 * BSD 4.4 also does reset.
+		 */
+		if (sk->sk_shutdown & RCV_SHUTDOWN) {
+			if (TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq &&
+			    after(TCP_SKB_CB(skb)->end_seq - th->fin, tp->rcv_nxt)) {
+				NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPABORTONDATA);
+				tcp_reset(sk);
+				return 1;
+			}
+		}
+		/* Fall through */
+	case TCP_ESTABLISHED:
+		tcp_data_queue(sk, skb);
+		queued = 1;
+		break;
+	}
+
+	/* tcp_data could move socket to TIME-WAIT */
+	if (sk->sk_state != TCP_CLOSE) {
+		tcp_data_snd_check(sk);
+		tcp_ack_snd_check(sk);
+	}
+
+	if (!queued) {
+discard:
+		__kfree_skb(skb);
+	}
+	return 0;
+}
+```
+
+
+
+
+
