@@ -20,7 +20,7 @@ struct udphdr {
 ```
 
 UDP控制缓冲区
-sk_buff结构中有一个控制缓存区，同协议栈存放私有数据，
+sk_buff结构中有一个控制缓存区，让协议栈存放私有数据，
 UDP有自己控制缓存，用于指明UDP协议实例进行校验和的方式等信息
 
 访问udp_skb_cb，通过宏 udp_skb_cb(skb)
@@ -106,7 +106,7 @@ UDP和套接字接口由 struct proto数据结构描述。
 由于UDP是无连接套接字，所以它对连接的管理和状态管理比TCP简单很多。
 从udp_lib_close 到 udp_destroy_sock 这5个函数用于管理套接字连接。
 udp_sendmsg , udp_recvmsg 实现UDP套接字上数据包的发送和接受
-在UDP接受期间，必须确定接受到的数据包应该发送给哪个套接字，以便套接字将数据包放入套接字接受队列，随后用户读取。
+在UDP接受期间，必须确定接受到的数据包应该发送给哪个套接字，以便将数据包放入套接字接受队列，随后用户读取。
 为了实现接受数据包和套接字的匹配，UDP上打开的所有套接字由 udp_lib_hash函数注册到 struct sock_hash[UDP_HTABLE_SIZE]哈希链表中，端口号是查询哈希链表的hash值，在释放套接字时，调用 udp_lib_unhash, 将套接字结构从UDP 哈希链表中移出。
 
 注册接口
@@ -284,15 +284,20 @@ int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	__be16 dport;
 	u8  tos;
 	int err, is_udplite = IS_UDPLITE(sk);
+	// 是否需要阻塞等待更多数据，构成一个包发送，还是收到数据就发送，这样就会发送多个包
 	int corkreq = up->corkflag || msg->msg_flags&MSG_MORE;
+	// UDP没有分段，使用IP层的分片，以满足MTU
 	int (*getfrag)(void *, char *, int, int, int, struct sk_buff *);
 
 	// 检查用户数据是否非法
+	// udphdr->len 为16bit，支持最大长度 0xFFFF
 	if (len > 0xFFFF)
 		return -EMSGSIZE;
+	// MSG_OOB是唯一TCP支持，但UDP不支持的flag
 	if (msg->msg_flags&MSG_OOB)	/* Mirror BSD error message compatibility */
 		return -EOPNOTSUPP;
 
+	// IP层选项
 	ipc.opt = NULL;
 
 	// 查看是否有待发送的数据
@@ -345,7 +350,7 @@ int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	// 保存输出设备的索引号
 	ipc.oif = sk->sk_bound_dev_if;
 	if (msg->msg_controllen) {
-		// 处理控制信息
+		// 处理控制信息，如IP选项
 		err = ip_cmsg_send(sock_net(sk), msg, &ipc);
 		if (err)
 			return err;
@@ -387,11 +392,11 @@ int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		connected = 0;
 	}
 
-	// 如果已经缓存了路由，检查路由是否有效
+	// 如果已经缓存了路由，检查路由是否有效，并获得sock缓存的路由
 	if (connected)
 		rt = (struct rtable*)sk_dst_check(sk, 0);
 
-	// 如果路由无效或没有获得, 则查询路由
+	// 如果缓存的路由无效或没有获得, 则查询路由
 	if (rt == NULL) {
 		struct flowi fl = { .oif = ipc.oif,
 				    .nl_u = { .ip4_u =
@@ -417,7 +422,7 @@ int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		if ((rt->rt_flags & RTCF_BROADCAST) &&
 		    !sock_flag(sk, SOCK_BROADCAST))
 			goto out;
-		if (connected) // 如果调用过connect，则需要缓存路由
+		if (connected) // 如果调用过connect，则需要更新缓存路由
 			sk_dst_set(sk, dst_clone(&rt->u.dst));
 	}
 
@@ -461,7 +466,7 @@ do_append_data:
 	// 如果错误则释放缓存数据
 	if (err)
 		udp_flush_pending_frames(sk);
-	// 如果没有错误构造UDP协议头并发送数据
+	// 如果没有错误并且不需要等待更多数据, 构造UDP协议头并发送数据
 	else if (!corkreq)
 		err = udp_push_pending_frames(sk); 
 	else if (unlikely(skb_queue_empty(&sk->sk_write_queue)))
@@ -1123,3 +1128,11 @@ out_noerr:
 	goto out;
 }
 ```
+
+# 总结
+![](./pic/53.jpg)
+udp_sendmsg 用户发送数据包
+	ip_route_output_flow 查询路由
+	ip_append_data 将要发送的报文交给IP层进行分割，并缓存
+	udp_push_pending_frames 将分割好了的数据封装UDP协议头，发送给IP模块
+
