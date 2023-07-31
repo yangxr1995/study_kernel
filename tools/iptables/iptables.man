@@ -1,0 +1,263 @@
+NAME
+       iptables/ip6tables — administration tool for IPv4/IPv6 packet filtering and NAT
+
+SYNOPSIS
+       iptables [-t table] {-A|-C|-D} chain rule-specification
+
+       ip6tables [-t table] {-A|-C|-D} chain rule-specification
+
+       iptables [-t table] -I chain [rulenum] rule-specification
+
+       iptables [-t table] -R chain rulenum rule-specification
+
+       iptables [-t table] -D chain rulenum
+
+       iptables [-t table] -S [chain [rulenum]]
+
+       iptables [-t table] {-F|-L|-Z} [chain [rulenum]] [options...]
+
+       iptables [-t table] -N chain
+
+       iptables [-t table] -X [chain]
+
+       iptables [-t table] -P chain target
+
+       iptables [-t table] -E old-chain-name new-chain-name
+
+       rule-specification = [matches...] [target]
+
+       match = -m matchname [per-match-options]
+
+       target = -j targetname [per-target-options]
+
+OPTIONS
+       The options that are recognized by iptables and ip6tables can be divided into several different groups.
+
+   COMMANDS
+	   下面选项用于指定要执行的操作
+
+       -A, --append chain rule-specification
+		   将一个或多个规则追加到所选链的末尾。 当源和/或目标名称解析为多个地址时，将为每个可能的地址组合添加一个规则。
+
+
+       -C, --check chain rule-specification
+	   		用于验证某规则是否存在，而不会对规则进行修改
+			iptables -C <chain_name> <rule-specification>
+			例如，要检查名为INPUT链中是否存在一个允许来自IP地址192.168.0.1的TCP流量到端口80的规则，可以使用如下命令
+			iptables -C INPUT -s 192.168.0.1 -p tcp --dport 80 -j ACCEPT
+			如果规则存在，命令不会输出任何内容，并返回状态码0.否则输出错误消息，并返回状态码非零。
+
+       -D, --delete chain rule-specification
+       -D, --delete chain rulenum
+	   		删除一个已存在的规则
+			iptables -D <chain_name> <rule-specification>
+			iptables -D INPUT -s 192.168.0.1 -p tcp --dport 80 -j ACCEPT
+			如果规则存在并删除成功，不会输出任何信息，失败输出错误消息
+
+
+       -I, --insert chain [rulenum] rule-specification
+	   		用于在指定链的开头插入一个新的规则。
+			iptables -I <chain_name> <rule_number> <rule-specification>
+			在INPUT链开头插入一个规则
+			iptables -I INPUT 1 -s 192.168.0.1 -p tcp --dport 80 -j ACCEPT
+			注意，使用 iptables -L --line-numbers 查看带有行号的规则列表
+
+       -R, --replace chain rulenum rule-specification
+	   		用于修改现有规则，无需先删除再添加
+			iptables -R <chain_name> <rule_number> <rule-specification>
+			修改INPUT链第3条规则
+			iptables -R INPUT 3 -s 192.168.0.1 -p tcp --dport 80 -j ACCEPT
+			注意，使用 iptables -L --line-numbers 查看带有行号的规则列表
+
+       -L, --list [chain]
+			查看现有规则	
+			iptables -L [chain_name]
+			chain_name参数指定要列出的特定链，如果没有则默认显示所有链
+
+			iptables -L INPUT
+
+			默认情况下，iptables -L命令会对IP地址和端口号进行反向域名解析，如果希望显示IP，可以添加-n选项
+			iptables -L -n
+
+			使用-v选项可以显示每个规则的数据包和字节计数
+			iptables -L -v
+
+       -S, --list-rules [chain]
+	   		以脚本格式输出当前防火墙规则，方便用于其他脚本
+			iptables -S [chain_name]
+			chain_name参数指定要列出的特定链，如果没有则默认显示所有链
+			
+			iptables -S INPUT
+
+       -F, --flush [chain]
+	   		清除指定链中的所有规则。将指定链恢复到默认空状态
+			iptables -F [chain_name]
+
+       -Z, --zero [chain [rulenum]]
+			将计数器归零，即重置规则的数据包和字节计数器。以重新开始计数。
+			iptables -Z [chain_name]
+			都常用于监视流量和性能统计
+
+       -N, --new-chain chain
+	   		用于创建自定义链。
+			iptables -N <chain_name>
+			创建一个名为MYCHAIN的链
+			iptables -N MYCHAIN
+			创建用户定义链后，可以再防火墙规则中引用该链，以更好的组织复杂的防火墙规则
+
+       -X, --delete-chain [chain]
+	   		用于删除用户定义链
+			iptables -X <chain_name>
+
+			iptables -X MYCHAIN
+			在删除用户定义链前，必须确保链中没有任何规则。否则删除操作失败。
+
+       -P, --policy chain target
+	   		设置默认策略。默认策略定义了当数据包不匹配任何规则时要采取的操作。
+			iptables -P <chain_name> <policy>
+			<policy> 可以是 ACCEPT, DROP, REJECT
+
+			iptables -P INPUT DROP
+
+       -E, --rename-chain old-chain new-chain
+              Rename the user specified chain to the user supplied name.  This is cosmetic, and has no effect on the structure of the table.
+
+
+   PARAMETERS
+       The following parameters make up a rule specification (as used in the add, delete, insert, replace and append commands).
+
+       -4, --ipv4
+	   		仅针对IPv4地址族
+			iptables -A INPUT -p tcp -s 192.168.0.1 -d 10.0.0.1 --dport 80 -j ACCEPT -4
+			默认情况下iptables处理所有地址族
+
+       -6, --ipv6
+
+       [!] -p, --protocol protocol
+	   		指定要匹配的协议类型
+			可以使用字符串指定协议类型，包括:tcp, udp, icmp, all
+			iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+			可以使用协议号指定其他类型，例如，协议号6表示TCP，协议号17表示UDP
+			iptables -A INPUT -p 17 --dport 80 -j ACCEPT
+			该规则，允许UDP流量目标端口53，执行接受操作
+
+       [!] -s, --source address[/mask][,...]
+	   		指定源IP地址或IP地址范围
+			iptables -A INPUT -s 192.168.0.1 -j ACCEPT
+			单个地址， -s 192.168.0.1
+			地址范围， -s 192.168.0.0/24
+
+       [!] -d, --destination address[/mask][,...]
+	   		
+
+       -m, --match match
+	   		指定要使用的扩展模块。扩展模块提供额外的功能和匹配条件。
+			iptables -A INPUT -p tcp -m tcp --dport 80 -j ACCEPT
+			-m tcp 指定使用TCP扩展模块
+			常用的扩展模块
+			tcp : TCP相关条件和操作
+			udp : UDP相关条件和操作
+			icmp : ICMP相关条件和操作
+			state : 根据连接状态进行匹配，如NEW ESTABLISHED, RELATED..
+
+			详细看 man iptables-extensions
+
+       -j, --jump target
+	   		指定要执行的操作
+			可以指定的操作：
+			ACCEPT : 接受数据包
+			DROP : 丢弃，不给予任何响应
+			REJECT : 拒绝数据包，并发送给对方拒绝通知
+			LOG : 记录数据包相关信息到系统日志
+			RETURN : 结束当前链中的规则处理，并返回上一级链
+			自定义目标 : 通常与自定义链结合使用
+
+       -g, --goto chain
+              This  specifies  that  the  processing should continue in a user specified chain. Unlike the --jump option return will not continue processing in this chain but
+              instead in the chain that called us via --jump.
+
+       [!] -i, --in-interface name
+	   		以数据包进入的接口作为匹配条件
+			iptables -A INPUT -i eth0 -j ACCEPT
+			单个接口：-i eth0
+			多个接口：-i eth0,eth1，表示数据包进入接口可以是eth0或eth1
+
+       [!] -o, --out-interface name
+	   		以数据包出口接口为匹配条件
+			iptables -A INPUT -o eth0 -j ACCEPT
+			单个接口：-o eth0
+			多个接口：-o eth0,eth1，表示数据包出口接口可以是eth0或eth1
+
+
+       [!] -f, --fragment
+	   		用于匹配数据包中的标记（flag），具体来说，用于匹配TCP的标记位
+			iptables -A INPUT -p tcp --tcp-flags FIN,SYN,RST,ACk,FIN -j DROP 
+			?
+
+       -c, --set-counters packets bytes
+			用于查询或重置规则的计数器。
+			iptables -L INPUT -c -n -v -x
+			-c 显示计数器
+			-n 显示IP地址和端口号
+			-v 详细信息
+			-x 显示精确的计数器
+
+   OTHER OPTIONS
+       The following additional options can be specified:
+
+       -w, --wait [seconds]
+              Wait  for  the  xtables  lock.   To  prevent multiple instances of the program from running concurrently, an attempt will be made to obtain an exclusive lock at
+              launch.  By default, the program will exit if the lock cannot be obtained.  This option will make the program wait (indefinitely or for optional seconds)  until
+              the exclusive lock can be obtained.
+
+       -n, --numeric
+	   		显示IP和端口号
+
+       -x, --exact
+              Expand numbers.  Display the exact value of the packet and byte counters, instead of only the rounded number in K's (multiples of 1000) M's (multiples of 1000K)
+              or G's (multiples of 1000M).  This option is only relevant for the -L command.
+
+       --line-numbers
+              When listing rules, add line numbers to the beginning of each rule, corresponding to that rule's position in the chain.
+
+       --modprobe=command
+              When adding or inserting rules into a chain, use command to load any necessary modules (targets, match extensions, etc).
+
+iptables-save
+	用于将当前规则保存到文件
+
+	iptables-save > iptables-rules.txt
+
+	iptables-restore < iptables-rules.txt
+
+iptables-apply
+	用于测试和应用iptables规则，以确保新规则不会导致失去对服务器的连接
+	其工作方式如下：
+	1. 将当前规则保存到临时文件
+	2. 将新规则应用到iptables
+	3. 每隔一段时间（默认为30秒）等待用户确认是否应该保存新规则
+	4. 如果用户确认新规则有效，它将从临时文件中加载新规则到永久的iptables配置
+	5. 如果新规则没有被确认，或等待时间超过预定时间，它将自动恢复之前的规则，以确保不会失去对服务器的连接
+
+	iptables-apply -t 30 /etc/iptables/rules.v4
+	使用用于 /etc/iptables/rules.v4 的规则
+
+
+自定义链的使用示例
+	有如下需求：
+		1. 允许所有与已建立连接的相关的数据包
+		2. 允许来自特定IP地址的数据包
+		3. 阻止所有其他数据包
+
+	# 创建自定义链
+	iptables -N ALLOWED
+	iptables -N DENIED
+
+	# 在自定义链添加规则
+	iptables -A ALLOWED -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+	iptables -A ALLOWED -s 192.168.0.1 -j ACCEPT
+	iptables -A DENIED -j DROP
+
+	# 在INPUT链引用自定义链
+	iptables -A INPUT -j ALLOWED	
+	iptables -A INPUT -j DENIED
