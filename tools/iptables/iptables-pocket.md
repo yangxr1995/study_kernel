@@ -107,10 +107,173 @@ Packet managling
 改变数据包的头部或payload
 
 NAT
-有SNAT DNAT
+NAT是一类packet managling, 涉及修改源目的地址端口，有SNAT DNAT
+SNAT涉及修改源地址和端口
+DNAT涉及修改目的地址和端口
 
 Masquerading
 Masquerading 是特殊的SNAT。
+普通的SNAT是静态的，如果地址改变，则需要重新配置SNAT。
+Masquerading能保证获取当前IP地址，确保显示包来自哪里
 
+Port Forwarding
+Port Forwarding 是DNAT的一类，用于让一个主机(如防火墙)做其他主机的代理。
+防火墙接受外网主机发给他的包，修改包的目的地址和端口然后转发给内网主机。
+另外，内网主机发送的回复报文给外网主机的包，被防火墙使用SNAT修改源地址和端口并转发，以显示他们来自防火墙。
+
+端口转发常用于提供公共访问的网络服务（如web email等），通过不需要公网IP的主机。
+
+Load balancing
+Load balancing 涉及分发连接给一组服务，以便达到更高的吞吐量。
+一种实现load balancing的简单方法是使用 Port Forwarding 以便目的地址被选择在一个循环列表可使用的目的地址。
+
+# 配置iptables
+配置iptables的步骤因发行商而不同。
+这里以红帽提供的信息
+
+
+## 配置项
+内核的网络和iptables行为可以被一些伪文件监控和控制。
+/etc/sysctl.conf  
+包含设置 /proc/sys 目录的配置，在boot时被使用。如 /proc/sys/net/ipv4/ip_forward 可以被设置为1在boot时通过添加一项 net.ipv4.ip_forward = 1 到此文件
+
+/proc/net/ip_conntrack
+转储 connection tracking 结构体的内容，如果你读取此文件
+
+/proc/sys/net/ipv4/ip_conntrack_max
+控制 Connection tracking table 的大小在内核中，默认值时基于你电脑的总的RAM计算。你可能需要增加它如果你得到 "ip_conntrack: table full, dropping packet" 的报错在你的日志文件。也可以该条目在/etc/sysctl.conf
+
+/proc/sys/net/ipv4/ip_forward
+你需要设置它为1让主机作为网关工作（转发数据包）
+
+## 编译内核
+iptables 配置可以被找到使用名为 CONFIG_IP_NF_\*
+下面配置项必须被选择
+CONFIG_PACKET 使用网络接口直接通信
+CONFIG_NETFILTER 内核支持基本的iptables
+CONFIG_IP_NF_CONNTRACK 需要NAT和 Masquerading
+CONFIG_IP_NF_FILTER 添加filter 表
+CONFIG_IP_NF_IPTABLES 支持基本的用户层 iptables 工具
+CONFIG_IP_NF_MANGLE 添加mangle表
+CONFIG_IP_NF_NAT 添加nat表
+
+警告：你可能被诱惑打开 CONFIG_NET_FASTROUTE ，因为fast routing 听起来对防火墙相当有魅力。别这样做，fast routing会绕过netfilter's hook
+
+## Connection Tracking
+iptables 关联报文根据他们属于的逻辑连接。甚至能处理某些UDP通信，即使UDP是无连接的.
+为了做到这点，它追踪连接贯穿他们的生命周期，并且追踪信息在整个 conntrack 匹配扩展都是可以获得的。
+conntrack 分配了一些连接状态为每个连接。
+
+ESTABLISHED 连接已经看到双向数据包 也可以看 SEEN_REPLY 状态
+INVALID 数据包不属于任何conntrack
+NEW 数据包触发一个新的conntrack，或者数据包是一个connection的一部分，相关conntrack还没有看到双向数据包
+RELATED 数据包触发一个新conntrack, 但是连接和一个已存在连接相关（如数据连接对一个FTP）
+
+conntrack 维护三个状态信息和相关的每个连接，
+状态码被实现在 conntrack 的 match extension ( --ctstatus 选项)
+ASSURED 对于TCP连接，表明TCP连接启动已经完成，对于UDP连接，表示它看上去像 UDP stream to the kernel
+EXPECTED 表示连接被期待
+SEEN_REPLY 表示数据包已经在两个方向，看 ESTABLISHED 状态
+
+iptables 连接状态逻辑允许补丁模块，以帮助识别新的连接（和已存在连接相关的连接）。你需要使用这些补丁如果你想多连接协议工作正确。
+
+ip_conntrack_amanda Amanda备份协议
+ip_conntrack_ftp FTP协议
+ip_conntrack_irc IRC协议
+ip_conntrack_tftp tftp协议
+
+## Accounting
+内核自动追踪数据包和字节计数对每个规则，这些信息可以被用于做统计网络使用情况。
+如，如果你添加下面四个规则到一个网关主机。（假设两个网络接口：eth0 用于内网，eth1用于外网），内核追踪数据包和字节交换对外网。
+```shell
+iptables -A FORWARD -i eth1
+iptables -A FORWARD -o eth1
+iptables -A INPUT -i eth1
+iptables -A OUTPUT -o eth1
+```
+允许这些命令后， iptables -L -v 显示（注意 INPUT 和 OUPUT的计数，非零计数表示一些流量已经遍历chains。
+
+![](./pic/7.jpg)
+
+## NAT
+NAT 修改数据包的地址和端口，当他们经过主机。
+
+警告：NAT需要 conntrack 
+
+iptables NAT 逻辑允许插件模块帮助处理在正在交换的数据中嵌入地址的协议的数据包, 没事使用帮助模块时，数据包的IP层可以进行NAT，但是数据包应用层部分数据仍然使用pre-NAT的地址。
+
+NAT helper modules
+ip_nat_amanda
+ip_nat_ftp
+ip_nat_irc
+ip_nat_snmp_basic
+ip_nat_tftp
+
+如果你希望某些报文通过绕过NAT，你可以写规则数据包你感兴趣的，并且跳转到ACCEPT，你需要有这种规则在你的NAT规则前
+iptables -t nat -i eth1 ... -j ACCEPT
+
+### source NAT 和 Masquerading
+充当网关的主机使用SNAT（伴随着 conntrack） 重写数据包以连接外网和内网。出去的数据包的源地址被替代成网关连接外网的静态IP地址。当外网主机响应，它会设置目标IP地址为网关的外网地址，网关会截获这些数据包，改变他们的目标地址成正确的内网主机，并且转发给他们。
+
+因为SNAT包含修改源地址和端口在他们离开kenrel，他会被执行在POSTROUTING链 nat 表
+
+
+有两种方法完成SNAT，
+SNAT target用于解决网关使用静态IP地址
+MASQUERADE target 用于解决网络使用动态IP地址。
+
+MASQUERADE提供额外的逻辑处理网络接口关闭并使用不同的地址恢复。额外的开销会被涉及，所以如果你使用静态IP，你应该使用SNAT
+
+iptables -t nat -A POSTROUTING -o eth1 -j SNAT
+iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE
+
+### DNAT
+DNAT暴露指定的服务在内网到外网.只要一个端口只被一个主机使用。
+网关主机重定向连接到指定的端口到配置的内部主机，并且安排恢复的流量恢复原始的地址在外部网络
+
+因为DNAT包含修改目标地址和端口，在数据包路由前，被它执行在 PREROUTING 链 nat 表
+
+例如，转发inbound连接来自网段的80端口到内部web服务器运行在8080端口主机192.168.1.3，你可以使用这条规则
+iptables -t nat -A PREROUTING -i eth1 -p tcp --dport 80 -j DNAT --to-destination 192.168.1.3:8080
+
+### 透明代理
+transparent proxying 是一种方法用于截获指定的输出连接并且重定向他们到一个主机，此主机会代替原始目的主机而提供服务。
+这个计数运行你设置代理为了服务，不用配置每个主机在内网的。
+因为所有流量到外网的，会经过网关，给定端口上与外部世界的连接都会被透明代理。
+如果你有一个HTTP代理（如 squid）配置成运行一个透明代理在你的防火墙主机，并监听8888端口，你可以添加一个条规则用于重定向outbound 的 HTTP流量到 HTTP 代理
+iptable -t nat -A PREROUTING -i eth0 -p tcp --dport 80 -j REDIRECT --to-port 8888
+更复杂的规则可以实现透明代理到不同的主机
+
+
+REDIRECT和DNAT是iptables中用于端口转发的两个选项，它们的主要差别如下：
+
+REDIRECT：REDIRECT选项用于将流量重定向到本地的另一个端口。它通常用于将流量从一个端口重定向到另一个正在运行的服务或应用程序。REDIRECT选项只能在本地主机上使用，无法用于将流量重定向到其他主机。
+
+DNAT：DNAT选项用于将流量的目标IP地址和端口修改为另一个主机的IP地址和端口。它通常用于端口映射或负载均衡等场景。DNAT选项可以将流量重定向到本地主机上的服务，也可以将流量转发到其他主机上的服务。
+
+总结起来，REDIRECT用于将流量重定向到本地的另一个端口，而DNAT用于将流量的目标IP地址和端口修改为另一个主机的IP地址和端口。
+
+
+### 负载均衡
+你可以使用DNAT实现负债均衡。
+
+
+### 无状态和有状态防火墙
+防火墙是网关主机提供限制网络流量
+
+无状态防火墙使用简单的规则，这些规则不需要连接或其他状态跟踪。如匹配源地址和目的地址端口。
+有状态防火墙允许更高级的数据包处理，涉及连接跟踪和其他状态，如保持最近活跃的连接
+
+iptables 提供两种类型的防火墙规则
+
+### 网络工具
+有些网络工具用于排除故障在你的防火墙或其他网络功能。
+
+Nessus
+nmap
+ntop    网络流量探测
+ping 
+tcpdump
+traceroute
 
 
