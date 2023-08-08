@@ -314,7 +314,7 @@ int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		release_sock(sk);
 	}
 
-	// 没有待发送的数据包，则为新数据新构造一个数据包并发送
+	// 没有待发送的缓存的数据
 
 	// udp 长度为 用户数据len + udp协议头长度
 	ulen += sizeof(struct udphdr);
@@ -368,14 +368,14 @@ int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	// 如果设置源路由，则下一个站点从源路由的IP地址列表中获取
 	if (ipc.opt && ipc.opt->srr) {
 		if (!daddr)
-			// 如果设置源路由，则下一个站点从源路由的IP地址列表中获取
 			return -EINVAL;
+		// 如果设置源路由，则下一个站点从源路由的IP地址列表中获取
 		faddr = ipc.opt->faddr;
 		connected = 0;
 	}
 	tos = RT_TOS(inet->tos);
 
-	// 以下情况不需要路由
+	// connected为0，指不使用缓存的路由，也不缓存路由
 	if (sock_flag(sk, SOCK_LOCALROUTE) ||  /* 数据包在本地局域网传输 */
 	    (msg->msg_flags & MSG_DONTROUTE) || /* msg_flags指明不需要路由 */
 	    (ipc.opt && ipc.opt->is_strictroute)) { /* 设置严格路由 */
@@ -430,6 +430,7 @@ int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		goto do_confirm;
 back_from_confirm:
 
+	// 根据路由信息，设置源地址和目的地址
 	saddr = rt->rt_src;
 	if (!ipc.addr)
 		daddr = ipc.addr = rt->rt_dst;
@@ -459,14 +460,14 @@ do_append_data:
 	// 如果是轻UDP 使用 udplite_getfrag 从用户空间复制数据片
 	// 否则 用 ip_generic_getfrag
 	getfrag  =  is_udplite ?  udplite_getfrag : ip_generic_getfrag;
-	// 将数据交给IP层
+	// 将数据追加到IP层缓存，方便进行分片
 	err = ip_append_data(sk, getfrag, msg->msg_iov, ulen,
 			sizeof(struct udphdr), &ipc, &rt,
 			corkreq ? msg->msg_flags|MSG_MORE : msg->msg_flags);
 	// 如果错误则释放缓存数据
 	if (err)
 		udp_flush_pending_frames(sk);
-	// 如果没有错误并且不需要等待更多数据, 构造UDP协议头并发送数据
+	// 如果没有错误并且不需要等待更多数据, 为每个分片构造UDP协议头并发送数据
 	else if (!corkreq)
 		err = udp_push_pending_frames(sk); 
 	else if (unlikely(skb_queue_empty(&sk->sk_write_queue)))
