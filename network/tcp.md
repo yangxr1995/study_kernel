@@ -1464,6 +1464,7 @@ new_segment:
 wait_for_sndbuf:
 			set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
 wait_for_memory:
+			// 把NAGLE算法缓存的数据发送出去
 			if (copied)
 				tcp_push(sk, flags & ~MSG_MORE, mss_now, TCP_NAGLE_PUSH);
 
@@ -1500,6 +1501,118 @@ out_err:
 	TCP_CHECK_TIMER(sk);
 	release_sock(sk);
 	return err;
+}
+
+static inline void tcp_push(struct sock *sk, int flags, int mss_now,
+			    int nonagle)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	if (tcp_send_head(sk)) {
+		struct sk_buff *skb = tcp_write_queue_tail(sk);
+		if (!(flags & MSG_MORE) || forced_push(tp))
+			tcp_mark_push(tp, skb);
+		tcp_mark_urg(tp, flags, skb);
+		__tcp_push_pending_frames(sk, mss_now,
+					  (flags & MSG_MORE) ? TCP_NAGLE_CORK : nonagle);
+	}
+}
+
+void __tcp_push_pending_frames(struct sock *sk, unsigned int cur_mss,
+			       int nonagle)
+{
+	struct sk_buff *skb = tcp_send_head(sk);
+
+	if (!skb)
+		return;
+
+	if (unlikely(sk->sk_state == TCP_CLOSE))
+		return;
+
+	if (tcp_write_xmit(sk, cur_mss, nonagle, 0, GFP_ATOMIC))
+		tcp_check_probe_timer(sk);
+}
+
+static int tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+			  int push_one, gfp_t gfp)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct sk_buff *skb;
+	unsigned int tso_segs, sent_pkts;
+	int cwnd_quota;
+	int result;
+
+	sent_pkts = 0;
+
+	if (!push_one) {
+		/* Do MTU probing. */
+		result = tcp_mtu_probe(sk);
+		if (!result) {
+			return 0;
+		} else if (result > 0) {
+			sent_pkts = 1;
+		}
+	}
+
+	while ((skb = tcp_send_head(sk))) { // 获得要发送的skb 
+										// return sk->sk_send_head;
+		unsigned int limit;
+
+		tso_segs = tcp_init_tso_segs(sk, skb, mss_now);
+		BUG_ON(!tso_segs);
+
+		cwnd_quota = tcp_cwnd_test(tp, skb);
+		if (!cwnd_quota)
+			break;
+
+		if (unlikely(!tcp_snd_wnd_test(tp, skb, mss_now)))
+			break;
+
+		if (tso_segs == 1) {
+			if (unlikely(!tcp_nagle_test(tp, skb, mss_now,
+						     (tcp_skb_is_last(sk, skb) ?
+						      nonagle : TCP_NAGLE_PUSH))))
+				break;
+		} else {
+			if (!push_one && tcp_tso_should_defer(sk, skb))
+				break;
+		}
+
+		limit = mss_now;
+		if (tso_segs > 1 && !tcp_urg_mode(tp))
+			limit = tcp_mss_split_point(sk, skb, mss_now,
+						    cwnd_quota);
+
+		// 如果skb的数据长度大于MSS，则进行分片
+		if (skb->len > limit &&
+		    unlikely(tso_fragment(sk, skb, limit, mss_now)))
+			break;
+
+		TCP_SKB_CB(skb)->when = tcp_time_stamp;
+
+		// 发送数据
+		if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
+			break;
+
+		/* Advance the send_head.  This one is sent out.
+		 * This call will increment packets_out.
+		 */
+		// 指向下一个待发送的skb
+		tcp_event_new_data_sent(sk, skb);
+			sk->sk_send_head = tcp_write_queue_next(sk, skb);
+
+		tcp_minshall_update(tp, mss_now, skb);
+		sent_pkts++;
+
+		if (push_one)
+			break;
+	}
+
+	if (likely(sent_pkts)) {
+		tcp_cwnd_validate(sk);
+		return 0;
+	}
+	return !tp->packets_out && tcp_send_head(sk);
 }
 ```
 
@@ -1631,6 +1744,7 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 		TCP_INC_STATS(sock_net(sk), TCP_MIB_OUTSEGS);
 
 	// 发送数据段到IP层
+	// TCP初始化时，queue_xmit 指向 ip_queue_xmit 
 	err = icsk->icsk_af_ops->queue_xmit(skb, 0);
 	if (likely(err <= 0))
 		return err;
