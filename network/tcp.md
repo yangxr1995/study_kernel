@@ -56,6 +56,9 @@ struct tcphdr {
 ```
 TCP支持长度可变的选项，追加在tcphdr后
 
+主要看 tcp的序号，序号是随发送负载数据以字节为单位增加
+![](./pic/54.jpg)
+
 ## TCP的控制缓存
 socket buffer用于存放负载数据，控制缓存存放用户控制管理数据包的信息
 ```c
@@ -1248,11 +1251,11 @@ int tcp_sendmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg,
 	lock_sock(sk);
 	TCP_CHECK_TIMER(sk);
 
+	// 如果没有使用 MSG_DONTWAIT，则需要获得最长等待时间
 	flags = msg->msg_flags;
 	timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
 
-	/* Wait for a connection to finish. */
-	// 如果不是TCPF_ESTABLISHED 或 TCPF_CLOSE_WAIT 状态，则需要等待连接建立
+	// 如果握手没有完成，则需要等待连接建立
 	if ((1 << sk->sk_state) & ~(TCPF_ESTABLISHED | TCPF_CLOSE_WAIT))
 		if ((err = sk_stream_wait_connect(sk, &timeo)) != 0)
 			goto out_err;
@@ -1260,41 +1263,45 @@ int tcp_sendmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg,
 	/* This should be in poll */
 	clear_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
 
+	// 获得MSS, tcp最大分段
 	mss_now = tcp_current_mss(sk, !(flags&MSG_OOB));
 	size_goal = tp->xmit_size_goal;
 
-	/* Ok commence sending. */
-	iovlen = msg->msg_iovlen;
-	iov = msg->msg_iov;
+	// 获得待发送的用户数据
+	iovlen = msg->msg_iovlen; // 数据块数量
+	iov = msg->msg_iov; // 地址
 	copied = 0;
 
+	// 如果连接已经关闭，则报错 EPIPE
 	err = -EPIPE;
 	if (sk->sk_err || (sk->sk_shutdown & SEND_SHUTDOWN))
 		goto do_error;
 
-	// 遍历每个数据块 
+	// 遍历每个待发送的数据块 
 	while (--iovlen >= 0) {
-		int seglen = iov->iov_len; // 该数据块的数据长度
-		unsigned char __user *from = iov->iov_base; //  基地址
+		int seglen = iov->iov_len; // 取得一个数据块的长度
+		unsigned char __user *from = iov->iov_base; //  数据块的基地址
 
 		iov++;
 
-		while (seglen > 0) {
+		while (seglen > 0) { // 如果该数据块有待发送数据
 			int copy;
 
-			skb = tcp_write_queue_tail(sk); // 获取发送队列的最后一个skb
+			// 获取发送队列的最后一个skb, 但不会将skb出队，
+			// 尝试在最后一个skb上追加数据
+			skb = tcp_write_queue_tail(sk); 
+					return skb_peek_tail(&sk->sk_write_queue);
 
 			if (!tcp_send_head(sk) || /*如果发送队列为空*/
-			    (copy = size_goal - skb->len) <= 0) { /*或者skb没有足够的空间*/
+			    (copy = size_goal - skb->len) <= 0) { /*skb没有足够的空间追加数据*/
 
 new_segment:
-				/* Allocate new segment. If the interface is SG,
-				 * allocate skb fitting to single page.
-				 */
+				// 查看当前sock发送缓存是否还有剩余
 				if (!sk_stream_memory_free(sk)) // 当前没有发送缓存
 				                                // sk->sk_wmem_queued(发送队列数据总大小) < sk->sk_sndbuf(该套接字发送缓冲区总大小);
 					goto wait_for_sndbuf; // 等待有空闲发送缓存
 
+				//  分配新的TCP段
 				skb = sk_stream_alloc_skb(sk, select_size(sk),
 						sk->sk_allocation); // 分配skb
 				if (!skb) // 缓存不够，分配失败
@@ -1306,18 +1313,21 @@ new_segment:
 
 				// 将skb添加到sock的发送队列
 				skb_entail(sk, skb);
+					sk->sk_wmem_queued += skb->truesize;
+					__skb_queue_tail(&sk->sk_write_queue, skb);
+
 				copy = size_goal;
 			}
 
-			/* Try to append data to the end of skb. */
+			// 现在获得一个skb可以追加数据, 进行追加数据
+
 			// 如果要拷贝的数量copy，大于用户给的数量seglen
 			if (copy > seglen)
 				copy = seglen;
 
 			/* Where to copy to? */
 			if (skb_tailroom(skb) > 0) {
-			// skb tailroom 空间，将数据尽可能拷贝到skb 的 tailroom
-				/* We have some space in skb head. Superb! */
+				// skb 有 tailroom 空间，将数据尽可能拷贝到skb 的 tailroom
 				if (copy > skb_tailroom(skb))
 					copy = skb_tailroom(skb);
 				if ((err = skb_add_data(skb, from, copy)) != 0)
@@ -1425,22 +1435,24 @@ new_segment:
 			if (!copied)
 				TCP_SKB_CB(skb)->flags &= ~TCPCB_FLAG_PSH;
 
-			// 增加TCP序号
+			// 增加TCP序号，可以看出TCP序号的增长是以字节为单位的
 			tp->write_seq += copy;
 			TCP_SKB_CB(skb)->end_seq += copy;
 			skb_shinfo(skb)->gso_segs = 0;
 
 			from += copy;
 			copied += copy;
+			// 如果用户数据发送完了就退出
 			if ((seglen -= copy) == 0 && iovlen == 0)
 				goto out;
 
+			// 如果skb携带的数据量还没有达到 size_goal 目标数量量，则继续追加数据
+			// 或者存在带外数据，带外数据是很紧急的，所以继续追加数据
 			if (skb->len < size_goal || (flags & MSG_OOB))
 				continue;
 
 			// 根据TCP窗口决定发送数据的数量
-			if (forced_push(tp)) {
-				// 如果要立即发送数据段，
+			if (forced_push(tp)) { // 如果要立即发送数据段，
 				tcp_mark_push(tp, skb);
 				// 将套接字发送队列上的数据段全部发送
 				// 这时即使socket buffer只有少量数据也被发送
@@ -1782,7 +1794,7 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 
 	inet->id = tp->write_seq ^ jiffies;
 
-	// 完成连接工作
+	// 发送SYN
 	err = tcp_connect(sk);
 	rt = NULL;
 	if (err)
@@ -1796,6 +1808,50 @@ failure:
 	sk->sk_route_caps = 0;
 	inet->dport = 0;
 	return err;
+}
+
+int tcp_connect(struct sock ＊sk)
+{     
+	struct tcp_opt ＊tp = tcp_sk(sk);
+	struct sk_buff ＊buff;
+
+	//为建立连接进行初始化
+	tcp_connect_init(sk);
+	//分配一个套接字缓冲区，用于发送连接请求
+	buff = alloc_skb(MAX_TCP_HEADER + 15, sk->sk_allocation);
+	if (unlikely(buff == NULL))
+		return -ENOBUFS;
+
+	//预留TCP头部空间
+	skb_reserve(buff, MAX_TCP_HEADER);
+	//为马上要发送的连接请求包设置SYN标志，并记录在套接字缓冲区中
+	TCP_SKB_CB(buff)->flags = TCPCB_FLAG_SYN;
+	//设置连接请求包的TCP协议信息
+	TCP_ECN_send_syn(sk, tp, buff);
+	TCP_SKB_CB(buff)->sacked = 0;
+	buff->csum = 0;
+	TCP_SKB_CB(buff)->seq = tp->write_seq++;
+	TCP_SKB_CB(buff)->end_seq = tp->write_seq;
+	tp->snd_nxt = tp->write_seq;
+	tp->pushed_seq = tp->write_seq;
+
+	//对Vegas版的TCP拥塞控制进行初始化
+	tcp_vegas_init(tp);
+	TCP_SKB_CB(buff)->when = tcp_time_stamp;
+	tp->retrans_stamp = TCP_SKB_CB(buff)->when;
+
+	//把套接字缓冲区插入套接字的发送队列中
+	__skb_queue_tail(&sk->sk_write_queue, buff);
+	sk_charge_skb(sk, buff);
+	tp->packets_out++;
+
+	//发送套接字缓冲区中的数据
+	tcp_transmit_skb(sk, skb_clone(buff, GFP_KERNEL));
+	TCP_INC_STATS(TCP_MIB_ACTIVEOPENS);
+
+	//复位连接请求包的超时定时器
+	tcp_reset_xmit_timer(sk, TCP_TIME_RETRANS, tp->rto);
+	return 0;
 }
 ```
 

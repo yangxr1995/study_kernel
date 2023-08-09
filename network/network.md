@@ -939,8 +939,9 @@ int __sys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen)
 要理解下面的内容，先要知道路由表有255张，除了下面一定有的两张表外，用户可以自定义表
 ```c
  系统有一定有两张表，
- tb_id == 255 是 MAIN 表，这个表由系统维护，用户不应该修改
+ tb_id == 255 是 local 表，这个表由系统维护，用户不应该修改
 / # ip route show table 255
+/ # ip route show table  local
 broadcast 127.0.0.0 dev lo scope link  src 127.0.0.1
 local 127.0.0.0/8 dev lo scope host  src 127.0.0.1
 local 127.0.0.1 dev lo scope host  src 127.0.0.1
@@ -949,22 +950,39 @@ broadcast 192.168.3.0 dev eth0 scope link  src 192.168.3.10
 local 192.168.3.10 dev eth0 scope host  src 192.168.3.10
 broadcast 192.168.3.255 dev eth0 scope link  src 192.168.3.10
 / #
- tb_id == 254 是 LOCAL表，由用户设置，不如 ip route 命令添加
+ tb_id == 254 是 main表，由用户设置，如 ip route 命令添加
 / # ip route show table 254
+/ # ip route show table main 
 default via 192.168.3.10 dev eth0 scope link
 192.168.3.0/24 dev eth0 scope link  src 192.168.3.10
 192.168.3.12 via 192.168.3.10 dev eth0
 ```
+如何查看当前有哪些路由表呢？
+```c
+ip route show table all
+这会把所有的路由条目显示，并且每个条目都带有自己属于那张表
+local 192.168.3.2 dev ens33 table local proto kernel scope host src 192.168.3.2
+broadcast 192.168.3.255 dev ens33 table local proto kernel scope link src 192.168.3.2
+local 192.168.4.128 dev ens38 table local proto kernel scope host src 192.168.4.128
+broadcast 192.168.4.255 dev ens38 table local proto kernel scope link src 192.168.4.128
+```
+
 那么路由时应该选择那张路由表呢？
 由路由规则决定.
 如
 ```c
+# 指定一个优先级为100的规则，数值越小，优先级越高
+ip rule add priority 100  from 192.168.1.10 table 10
+
+# 不指定优先级时，会被赋予较高优先级，
 # 数据包的来源端 IP 是 192.168.1.10，就参考路由表 10
 ip rule add from 192.168.1.10 table 10
 # 如果来源端 IP 为 192.168.2.0/24 网段的 IP，就参考路由表 20
 ip rule add from 192.168.2.0/24 table 20
 
-# 查看策略表，系统默认会创建三个策略
+# 查看策略表，系统默认会创建三个策略, 可以看到走local表的优先级最高，local表中为内网路由条目
+# 走main表的规则很低，main表中通常有外网路由条目
+# 如果使用 ip rule add 不带 priority 添加一条规则，则优先级会高于 main 的 32766
 / # ip rule
 0:      from all lookup local
 32766:  from all lookup main
@@ -1018,6 +1036,26 @@ Local:
               /32 link BROADCAST
               /24 link UNICAST
            |-- 192.168.3.10
+```
+
+通过 ip rule , ip route  和 iptables 结合可以实现精准的分流
+如
+```shell
+# 将TCP协议、目标端口为80的数据包标记为10，可以使用以下命令：
+# --set-mark 不会修改数据包,但会给 skb 做标记
+iptables -t mangle -A PREROUTING -i eth0 -p tcp --dport 80 -j MARK --set-mark 10
+
+# 对没有标记 10 的数据包使用 3333表进行路由
+ip -4 rule add not fwmark 10 table 3333
+
+# 在3333路由表添加一项，所有数据走wg0设备
+ip -4 route add 0.0.0.0/0 dev wg0 table 3333 
+
+# 使用策略路由的好处是，删除路由策略和路由项非常简单
+ip -4 route flush table 3333
+
+# 删除路由策略
+ip -4 rule delete table 3333
 ```
 
 ### IP 层对bind 的检查
