@@ -507,11 +507,12 @@ process:
 	// 获得锁，准备处理数据段
 	bh_lock_sock_nested(sk);
 	ret = 0;
-	// 如果套接字有相关用户进程，则将数据段加入 prequeue
-	// 否则将数据段加入 sock->backlog
+
+	// 如果sock没有进程在使用，则使用 tcp_v4_do_rcv 将skb加入 prequeue
+	// 如果sock正在被加锁使用，则将skb加入 backlog
 	if (!sock_owned_by_user(sk)) {
 #ifdef CONFIG_NET_DMA
-	// 如果支持DMA，以DMA方式完成设备缓存区和用户缓存区之间的传递
+		// 如果支持DMA，以DMA方式完成设备缓存区和用户缓存区之间的传递
 		struct tcp_sock *tp = tcp_sk(sk);
 		if (!tp->ucopy.dma_chan && tp->ucopy.pinned_list)
 			tp->ucopy.dma_chan = dma_find_channel(DMA_MEMCPY);
@@ -520,8 +521,9 @@ process:
 		else
 #endif
 		{
-		// 如果数据段成功加入 prequeue, 按fast path 处理
-		// 失败，则用slow path处理
+			// 如果有进程正阻塞等待此sock的数据, 则尝试将pkt加入prequeue
+			// 如果成功加入prequeue，则会在用户进程上下文处理数据，称为fast path
+			// 若失败，则用tcp_v4_do_rcv
 			if (!tcp_prequeue(sk, skb))
 			ret = tcp_v4_do_rcv(sk, skb);
 		}
@@ -760,6 +762,40 @@ discard:
 csum_err:
 	TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_INERRS);
 	goto discard;
+}
+
+
+ 当sock状态为 ESTABLISHED ， tcp_v4_do_rcv 调用 tcp_rcv_established 接受skb
+ tcp_rcv_established提供 fast path 和 Slow path两种方式接受
+ 除了如下情况，均采用fast path
+ 1. 到来的数据包告诉对方接受窗口为0
+ 2. 到来的数据发生乱序
+ 3. 没有剩余空间接受数据
+ 4. 数据包有无效的标志，窗口值和头部长度
+ 5. 同时进行双向数据传输
+ 6. TCP选项无效
+
+int tcp_rcv_established(struct sock ＊sk, struct sk_buff ＊skb, struct tcphdr
+＊th, unsigned len)
+{
+	struct tcp_opt ＊tp = tcp_sk(sk);
+	tp->saw_tstamp = 0;
+	……
+	//处理有ACK标志的数据包
+	tcp_ack(sk, skb, 0);
+	……
+	//发出ACK包，确认接收的情况
+	tcp_data_snd_check(sk);
+	……
+	//把TCP头部从套接字缓冲区中取出
+	__skb_pull(skb,tcp_header_len);
+	//把存放应用程序数据的缓冲区插入套接字接收队列中
+	__skb_queue_tail(&sk->sk_receive_queue, skb);
+	……
+slow_path:
+	//从套接字缓冲区中去掉TCP头部，插入套接字队列中
+	tcp_data_queue(sk, skb);
+	……
 }
 ```
 
