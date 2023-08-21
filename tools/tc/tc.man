@@ -1,0 +1,523 @@
+TC(8)                                                                      Linux                                                                      TC(8)
+
+NAME
+       tc - show / manipulate traffic control settings
+
+SYNOPSIS
+       tc [ OPTIONS ] qdisc [ add | change | replace | link | delete ] dev DEV [ parent qdisc-id | root ] [ handle qdisc-id ] [ ingress_block BLOCK_INDEX ]
+       [ egress_block BLOCK_INDEX ] qdisc [ qdisc specific parameters ]
+
+       tc [ OPTIONS ] class [ add | change | replace | delete ] dev DEV parent qdisc-id [ classid class-id ] qdisc [ qdisc specific parameters ]
+
+       tc [ OPTIONS ] filter [ add | change | replace | delete | get ] dev DEV [ parent qdisc-id | root ] [ handle filter-id ] protocol protocol prio  pri‐
+       ority filtertype [ filtertype specific parameters ] flowid flow-id
+
+       tc  [ OPTIONS ] filter [ add | change | replace | delete | get ] block BLOCK_INDEX [ handle filter-id ] protocol protocol prio priority filtertype [
+       filtertype specific parameters ] flowid flow-id
+
+       tc [ OPTIONS ] chain [ add | delete | get ] dev DEV [ parent qdisc-id | root ] filtertype [ filtertype specific parameters ]
+
+       tc [ OPTIONS ] chain [ add | delete | get ] block BLOCK_INDEX filtertype [ filtertype specific parameters ]
+
+       tc [ OPTIONS ] [ FORMAT ] qdisc { show | list } [ dev DEV ] [ root | ingress | handle QHANDLE | parent CLASSID ] [ invisible ]
+
+       tc [ OPTIONS ] [ FORMAT ] class show dev DEV
+
+       tc [ OPTIONS ] filter show dev DEV
+
+       tc [ OPTIONS ] filter show block BLOCK_INDEX
+
+       tc [ OPTIONS ] chain show dev DEV
+
+       tc [ OPTIONS ] chain show block BLOCK_INDEX
+
+       tc [ OPTIONS ] monitor [ file FILENAME ]
+
+        OPTIONS := { [ -force ] -b[atch] [ filename ] | [ -n[etns] name ] | [ -N[umeric] ] | [ -nm | -nam[es] ] | [ { -cf | -c[onf] }  [  filename  ]  ]  [
+       -t[imestamp] ] | [ -t[short] | [ -o[neline] ] }
+
+        FORMAT := { -s[tatistics] | -d[etails] | -r[aw] | -i[ec] | -g[raph] | -j[json] | -p[retty] | -col[or] }
+
+DESCRIPTION
+       Tc is used to configure Traffic Control in the Linux kernel. Traffic Control consists of the following:
+
+       SHAPING
+              When  traffic  is  shaped,  its rate of transmission is under control. Shaping may be more than lowering the available bandwidth - it is also
+              used to smooth out bursts in traffic for better network behaviour. Shaping occurs on egress.
+
+       SCHEDULING
+              By scheduling the transmission of packets it is possible to improve interactivity for traffic that needs it while  still  guaranteeing  band‐
+              width to bulk transfers. Reordering is also called prioritizing, and happens only on egress.
+
+       POLICING
+              Whereas shaping deals with transmission of traffic, policing pertains to traffic arriving. Policing thus occurs on ingress.
+
+       DROPPING
+              Traffic exceeding a set bandwidth may also be dropped forthwith, both on ingress and on egress.
+
+       Processing of traffic is controlled by three kinds of objects: qdiscs, classes and filters.
+
+QDISCS
+		qdisc是"queueing discipline"（队列调度）的缩写，它对于理解流量控制是基本的。每当内核需要将一个数据包发送到一个接口时，它会被排队到为该接口配置的qdisc中。紧接着，内核会尽可能多地从qdisc中获取数据包，并将它们交给网络适配器驱动程序。
+
+		一个简单的QDISC是"pfifo"，它完全不进行任何处理，只是一个纯粹的先进先出队列。然而，当网络接口暂时无法处理流量时，它会存储流量。
+
+CLASSES
+		一些qdisc可以包含类（classes），而这些类又包含进一步的qdiscs。流量可以被排队到内部的任何一个qdisc中，这些qdisc位于类中。当内核尝试从这样的类别化（classful）qdisc中出队一个数据包时，它可以来自任何一个类别。例如，一个qdisc可以通过在其他类别之前尝试从特定类别中出队来优先处理某些类型的流量。
+       Some qdiscs can contain classes, which contain further qdiscs - traffic may then be enqueued in any of  the  inner  qdiscs,  which  are  within  the
+       classes.   When the kernel tries to dequeue a packet from such a classful qdisc it can come from any of the classes. A qdisc may for example priori‐
+       tize certain kinds of traffic by trying to dequeue from certain classes before others.
+
+FILTERS
+		过滤器（filter）被类别化（classful）qdisc用于确定数据包将被排队到哪个类别中。当流量到达一个具有子类的类别时，它需要进行分类。可以采用各种方法来进行分类，其中之一就是使用过滤器。所有附加到该类别的过滤器都会被调用，直到其中一个返回一个判断结果。如果没有做出判断结果，可能还会有其他的标准可用。这在每个qdisc中可能会有所不同。
+
+       A filter is used by a classful qdisc to determine in which class a packet will be enqueued. Whenever traffic arrives at a class with subclasses,  it
+       needs  to be classified. Various methods may be employed to do so, one of these are the filters. All filters attached to the class are called, until
+       one of them returns with a verdict. If no verdict was made, other criteria may be available. This differs per qdisc.
+
+		需要注意的是，过滤器存在于qdisc中，它们并不掌握发生的情况。也就是说，过滤器只是用于决定数据包的分类，而不是控制整个流量控制过程。
+       It is important to notice that filters reside within qdiscs - they are not masters of what happens.
+
+       The available filters are:
+
+       basic  Filter packets based on an ematch expression. See tc-ematch(8) for details.
+
+       bpf    Filter packets using (e)BPF, see tc-bpf(8) for details.
+
+       cgroup Filter packets based on the control group of their process. See tc-cgroup(8) for details.
+
+       flow, flower
+              Flow-based classifiers, filtering packets based on their flow (identified by selectable keys). See tc-flow(8) and tc-flower(8) for details.
+
+       fw     Filter based on fwmark. Directly maps fwmark value to traffic class. See tc-fw(8).
+
+       route  Filter packets based on routing table. See tc-route(8) for details.
+
+       rsvp   Match Resource Reservation Protocol (RSVP) packets.
+
+       tcindex
+              Filter packets based on traffic control index. See tc-tcindex(8).
+
+       u32    Generic filtering on arbitrary packet data, assisted by syntax to abstract common operations. See tc-u32(8) for details.
+
+       matchall
+              Traffic control filter that matches every packet. See tc-matchall(8) for details.
+
+QEVENTS
+		在qdisc中，当发生某些有趣的事件时，可以调用用户配置的操作。每个qevent可以是未使用的，也可以附加一个block。然后，可以使用"tc block BLOCK_IDX"语法将过滤器附加到该block上。当与附加点相关联的qevent发生时，将执行该block。例如，根据所使用的qdisc和相关的qevent，可以丢弃或延迟数据包等。
+       Qdiscs may invoke user-configured actions when certain interesting events take place in the qdisc. Each qevent can either be unused, or can  have  a
+       block  attached  to it. To this block are then attached filters using the "tc block BLOCK_IDX" syntax. The block is executed when the qevent associ‐
+       ated with the attachment point takes place. For example, packet could be dropped, or delayed, etc., depending on the qdisc and the qevent  in  ques‐
+       tion.
+
+       For example:
+
+              tc qdisc add dev eth0 root handle 1: red limit 500K avpkt 1K \
+                 qevent early_drop block 10
+              tc filter add block 10 matchall action mirred egress mirror dev eth1
+			  上述示例中，创建了一个名为eth0的网络设备上的根qdisc，并使用red队列调度算法。设置了一个名为early_drop的qevent，并将其与索引为10的block关联。然后，使用matchall过滤器将一个动作（mirred egress mirror）添加到block 10中，该动作将数据包镜像到eth1设备。
+
+CLASSLESS QDISCS
+       The classless qdiscs are:
+	   无类别qdiscs
+
+       choke  CHOKe  (CHOose  and Keep for responsive flows, CHOose and Kill for unresponsive flows) is a classless qdisc designed to both identify and pe‐
+              nalize flows that monopolize the queue. CHOKe is a variation of RED, and the configuration is similar to RED.
+			  CHOKe是一种无类别的qdisc，旨在识别和惩罚垄断队列的流量。它是RED的一种变体，其配置与RED相似。
+
+       codel  CoDel (pronounced "coddle") is an adaptive "no-knobs" active queue management algorithm (AQM) scheme that was developed to address the short‐
+              comings of RED and its variants.
+			  CoDel是一种自适应的“无旋钮”主动队列管理算法（AQM），旨在解决RED及其变种的缺点。
+
+       [p|b]fifo
+              Simplest usable qdisc, pure First In, First Out behaviour. Limited in packets or in bytes.
+			  最简单可用的qdisc，按照先进先出（FIFO）的原则进行排队。可以限制数据包数量或字节数。
+
+       fq     Fair Queue Scheduler realises TCP pacing and scales to millions of concurrent flows per qdisc.
+			  fq实现了TCP pacing，并且能够处理数百万个并发流量。
+
+       fq_codel
+              Fair Queuing Controlled Delay is queuing discipline that combines Fair Queuing with the CoDel AQM scheme. FQ_Codel uses a stochastic model to
+              classify incoming packets into different flows and is used to provide a fair share of the bandwidth to all the flows using  the  queue.  Each
+              such flow is managed by the CoDel queuing discipline. Reordering within a flow is avoided since Codel internally uses a FIFO queue.
+			  Fair Queuing Controlled Delay（FQ_Codel）是将公平队列（Fair Queuing）与CoDel AQM方案结合起来的队列调度算法。FQ_Codel使用随机模型将传入的数据包分类为不同的流量，并用于为所有流量提供公平的带宽共享。每个流量由CoDel队列调度算法管理。在流量内部不进行重新排序，因为Codel内部使用FIFO队列。
+
+       fq_pie FQ-PIE  (Flow  Queuing  with  Proportional  Integral controller Enhanced) is a queuing discipline that combines Flow Queuing with the PIE AQM
+              scheme. FQ-PIE uses a Jenkins hash function to classify incoming packets into different flows and is used to provide  a  fair  share  of  the
+              bandwidth to all the flows using the qdisc. Each such flow is managed by the PIE algorithm.
+			  Flow Queuing with Proportional Integral controller Enhanced（FQ-PIE）是将流量队列（Flow Queuing）与PIE AQM方案结合起来的队列调度算法。FQ-PIE使用Jenkins哈希函数将传入的数据包分类为不同的流量，并用于为所有流量提供公平的带宽共享。每个流量由PIE算法管理。
+
+       gred   Generalized Random Early Detection combines multiple RED queues in order to achieve multiple drop priorities. This is required to realize As‐
+              sured Forwarding (RFC 2597).
+			  Generalized Random Early Detection（GRED）将多个RED队列组合在一起，以实现多个丢弃优先级。这对于实现Assured Forwarding（RFC 2597）是必需的。
+
+       hhf    Heavy-Hitter Filter differentiates between small flows and the opposite, heavy-hitters. The goal is to catch the heavy-hitters and move  them
+              to a separate queue with less priority so that bulk traffic does not affect the latency of critical traffic.
+			  Heavy-Hitter Filter（HHF）区分小流量和重要流量（heavy-hitters）。其目标是捕获重要流量并将其移动到具有较低优先级的单独队列中，以确保大量流量不会影响关键流量的延迟。
+
+       ingress
+              This is a special qdisc as it applies to incoming traffic on an interface, allowing for it to be filtered and policed.
+			  这是一个特殊的qdisc，适用于接口上的传入流量，允许对其进行过滤和控制。
+
+       mqprio The  Multiqueue Priority Qdisc is a simple queuing discipline that allows mapping traffic flows to hardware queue ranges using priorities and
+              a configurable priority to traffic class mapping. A traffic class in this context is a set of contiguous qdisc classes which map 1:1 to a set
+              of hardware exposed queues.
+			  Multiqueue Priority Qdisc（多队列优先级队列调度）是一种简单的队列调度算法，允许使用优先级和可配置的优先级到流量类别映射将流量流映射到硬件队列范围。在这种情况下，流量类别是一组连续的qdisc类别，与一组暴露的硬件队列一一对应。
+
+       multiq Multiqueue  is a qdisc optimized for devices with multiple Tx queues. It has been added for hardware that wishes to avoid head-of-line block‐
+              ing.  It will cycle though the bands and verify that the hardware queue associated with the band is not stopped prior to dequeuing a packet.
+			  Multiqueue是一种针对具有多个发送队列的设备进行优化的qdisc。它适用于希望避免头部阻塞的硬件。在出队数据包之前，它会循环遍历各个队列，并验证与队列相关联的硬件队列是否已停止。
+
+       netem  Network Emulator is an enhancement of the Linux traffic control facilities that allow to add delay, packet loss, duplication and  more  other
+              characteristics to packets outgoing from a selected network interface.
+			  Network Emulator是Linux流量控制功能的增强版本，允许向从所选网络接口发送的数据包添加延迟、丢包、重复等特性。
+
+       pfifo_fast
+              Standard  qdisc for 'Advanced Router' enabled kernels. Consists of a three-band queue which honors Type of Service flags, as well as the pri‐
+              ority that may be assigned to a packet.
+			  pfifo_fast是启用了“高级路由器”功能的标准qdisc。它由一个三级队列组成，可以遵守服务类型标志（Type of Service flags），以及可分配给数据包的优先级。
+
+       pie    Proportional Integral controller-Enhanced (PIE) is a control theoretic active queue management scheme. It is based on the proportional  inte‐
+              gral controller but aims to control delay.
+			  Proportional Integral controller-Enhanced（PIE）是一种基于控制论的主动队列管理方案。它基于比例积分控制器，旨在控制延迟。
+
+       red    Random  Early  Detection simulates physical congestion by randomly dropping packets when nearing configured bandwidth allocation. Well suited
+              to very large bandwidth applications.
+			  Random Early Detection（RED）通过在接近配置的带宽分配时随机丢弃数据包来模拟物理拥塞。非常适用于非常大的带宽应用。
+
+       rr     Round-Robin qdisc with support for multiqueue network devices. Removed from Linux since kernel version 2.6.27.
+			  Round-Robin是一种支持多队列网络设备的qdisc。自Linux内核版本2.6.27起已被移除。
+
+       sfb    Stochastic Fair Blue is a classless qdisc to manage congestion based on packet loss and link utilization history while trying to prevent non-
+              responsive flows (i.e. flows that do not react to congestion marking or dropped packets) from impacting performance of responsive flows.  Un‐
+              like RED, where the marking probability has to be configured, BLUE tries to determine the ideal marking probability automatically.
+			  Stochastic Fair Blue（SFB）是一种无类别的qdisc，根据数据包丢失和链路利用率历史来管理拥塞，同时试图防止对性能有影响的非响应流量（即不对拥塞标记或丢弃的流量）。与需要配置标记概率的RED不同，BLUE试图自动确定理想的标记概率。
+
+       sfq    Stochastic Fairness Queueing reorders queued traffic so each 'session' gets to send a packet in turn.
+			  Stochastic Fairness Queueing（SFQ）对排队的流量进行重新排序，以便每个“会话”轮流发送一个数据包。它使用随机模型将数据包分类为不同的会话，并确保每个会话以公平的方式共享带宽。SFQ可以帮助提高多个会话之间的公平性，并减少“头部阻塞”（head-of-line blocking）的影响。
+
+       tbf    The Token Bucket Filter is suited for slowing traffic down to a precisely configured rate. Scales well to large bandwidths.
+			  Token Bucket Filter（TBF）适用于将流量限制到精确配置的速率。它使用令牌桶算法来控制发送数据包的速率。令牌桶中的令牌会以固定速率生成，每个数据包需要消耗一个或多个令牌才能被发送。TBF适用于需要精确控制流量速率的场景，并且在大带宽环境下表现良好。
+
+CONFIGURING CLASSLESS QDISCS
+       In the absence of classful qdiscs, classless qdiscs can only be attached at the root of a device. Full syntax:
+	   在没有类别（classful）qdisc的情况下，只能将无类别（classless）qdisc附加到设备的根部。以下是完整的语法：
+
+	   添加无类别qdisc：
+       tc qdisc add dev DEV root QDISC QDISC-PARAMETERS
+			dev DEV：指定要配置的设备的名称。
+			root：表示要附加qdisc的位置是设备的根部。
+			QDISC：指定要使用的qdisc的类型（例如：fq_codel、fq_pie、red等）。
+			QDISC-PARAMETERS：根据所选的qdisc类型提供相应的参数和选项。
+
+       To remove, issue
+
+       tc qdisc del dev DEV root
+
+       The pfifo_fast qdisc is the automatic default in the absence of a configured qdisc.
+	   在没有配置qdisc的情况下，pfifo_fast qdisc将自动成为默认设置。
+
+CLASSFUL QDISCS
+       The classful qdiscs are:
+
+       ATM    Map flows to virtual circuits of an underlying asynchronous transfer mode device.
+	   		  ATM（Asynchronous Transfer Mode）将流量映射到底层异步传输模式设备的虚拟电路。它用于在ATM网络中进行流量管理和调度。
+
+       CBQ    Class Based Queueing implements a rich linksharing hierarchy of classes.  It contains shaping elements as well as prioritizing  capabilities.
+              Shaping  is performed using link idle time calculations based on average packet size and underlying link bandwidth. The latter may be ill-de‐
+              fined for some interfaces.
+			  CBQ（Class Based Queueing）实现了一个丰富的链路共享层次结构。它包含了形状化元素和优先级能力。CBQ使用基于平均数据包大小和底层链路带宽的链路空闲时间计算来进行形状化。它可以用于按照特定流量使用不同设置的RED qdisc。
+
+       DRR    The Deficit Round Robin Scheduler is a more flexible replacement for Stochastic Fairness Queuing. Unlike SFQ, there are no built-in queues --
+              you need to add classes and then set up filters to classify packets accordingly.  This can be useful e.g. for using RED qdiscs with different
+              settings for particular traffic. There is no default class -- if a packet cannot be classified, it is dropped.
+			  DRR（Deficit Round Robin Scheduler）是Stochastic Fairness Queuing的更灵活的替代方案。与SFQ不同，DRR没有内置队列，您需要添加类别并设置过滤器来对数据包进行分类。这对于使用具有不同设置的RED qdisc处理特定流量非常有用。DRR没有默认类别，如果一个数据包无法分类，它将被丢弃。
+
+       DSMARK Classify packets based on TOS field, change TOS field of packets based on classification.
+	   		  DSMARK根据TOS字段对数据包进行分类，并根据分类更改数据包的TOS字段。
+
+       ETS    The ETS qdisc is a queuing discipline that merges functionality of PRIO and DRR qdiscs in one scheduler. ETS makes it easy to configure a set
+              of strict and bandwidth-sharing bands to implement the transmission selection described in 802.1Qaz.
+			  ETS（Enhanced Transmission Selection）qdisc是一个队列调度器，将PRIO和DRR qdisc的功能合并在一个调度器中。ETS使得配置一组严格和带宽共享的带宽成为可能，以实现802.1Qaz中描述的传输选择。
+
+       HFSC   Hierarchical Fair Service Curve guarantees precise bandwidth and delay allocation for leaf classes and allocates excess bandwidth fairly. Un‐
+              like HTB, it makes use of packet dropping to achieve low delays which interactive sessions benefit from.
+			  HFSC（Hierarchical Fair Service Curve）保证为叶子类别提供精确的带宽和延迟分配，并公平分配多余的带宽。与HTB不同，它通过丢弃数据包来实现低延迟，这对于交互式会话非常有益。
+
+       HTB    The Hierarchy Token Bucket implements a rich linksharing hierarchy of classes with an emphasis on conforming to existing practices.  HTB  fa‐
+              cilitates  guaranteeing  bandwidth  to classes, while also allowing specification of upper limits to inter-class sharing. It contains shaping
+              elements, based on TBF and can prioritize classes.
+			  HTB（Hierarchy Token Bucket）实现了一个丰富的链路共享层次结构，强调符合现有实践。HTB可以保证为类别提供带宽，同时允许对类别之间的共享进行上限的规定。它包含了基于TBF的形状化元素，并可以对类别进行优先级设置。
+
+       PRIO   The PRIO qdisc is a non-shaping container for a configurable number of classes which are dequeued in order. This allows for easy  prioritiza‐
+              tion  of  traffic,  where  lower classes are only able to send if higher ones have no packets available. To facilitate configuration, Type Of
+              Service bits are honored by default.
+			  PRIO qdisc是一个非形状化的容器，可配置多个类别，按顺序进行出队。这使得流量的优先级设置变得简单，较低优先级的类别只有在高优先级类别没有数据包可用时才能发送。为了方便配置，默认情况下会遵守服务类型（Type Of Service）位。
+
+       QFQ    Quick Fair Queueing is an O(1) scheduler that provides near-optimal guarantees, and is the first to achieve that goal with  a  constant  cost
+              also  with  respect to the number of groups and the packet length. The QFQ algorithm has no loops, and uses very simple instructions and data
+              structures that lend themselves very well to a hardware implementation.
+			  QFQ（Quick Fair Queueing）是一种O(1)调度器，提供接近最优的保证，并且是第一个以恒定成本实现该目标的调度器，不受组数和数据包长度的影响。QFQ算法没有循环，并且使用非常简单的指令和数据结构，非常适合硬件实现。
+
+THEORY OF OPERATION
+       Classes form a tree, where each class has a single parent.  A class may have multiple children. Some qdiscs allow for runtime  addition  of  classes
+       (CBQ, HTB) while others (PRIO) are created with a static number of children.
+	   类别形成一个树状结构，每个类别都有一个父类别，一个类别可以有多个子类别。一些qdisc允许在运行时添加类别（如CBQ、HTB），而其他一些qdisc（如PRIO）在创建时就确定了固定数量的子类别。
+
+       Qdiscs which allow dynamic addition of classes can have zero or more subclasses to which traffic may be enqueued.
+	   允许动态添加类别的qdisc可以有零个或多个子类别，流量可以被排队到这些子类别中。
+
+       Furthermore,  each class contains a leaf qdisc which by default has pfifo behaviour, although another qdisc can be attached in place. This qdisc may
+       again contain classes, but each class can have only one leaf qdisc.
+	   此外，每个类别包含一个叶子qdisc，默认情况下具有pfifo行为，但也可以连接其他qdisc。这个qdisc可能又包含类别，但每个类别只能有一个叶子qdisc。
+
+       When a packet enters a classful qdisc it can be classified to one of the classes within. Three criteria are available, although not all qdiscs  will
+       use all three:
+	   当数据包进入类别qdisc时，它可以被分类到其中一个类别。有三个分类标准可用，尽管并不是所有的qdisc都会使用这三个标准：
+
+       tc filters
+              If  tc  filters  are  attached  to  a  class, they are consulted first for relevant instructions. Filters can match on all fields of a packet
+              header, as well as on the firewall mark applied by iptables.
+			  tc过滤器：如果在类别上附加了tc过滤器，它们将首先被查询以获取相关的指令。过滤器可以匹配数据包头的所有字段，以及iptables应用的防火墙标记。
+
+       Type of Service
+              Some qdiscs have built in rules for classifying packets based on the TOS field.
+			  服务类型（Type of Service）：一些qdisc具有基于TOS字段对数据包进行分类的内置规则。
+
+       skb->priority
+              Userspace programs can encode a class-id in the 'skb->priority' field using the SO_PRIORITY option.
+			  skb->priority：用户空间程序可以使用SO_PRIORITY选项，在'skb->priority'字段中编码类别ID。
+
+       Each node within the tree can have its own filters but higher level filters may also point directly to lower classes.
+	   树中的每个节点都可以有自己的过滤器，但更高级别的过滤器也可以直接指向较低的类别。
+
+
+       If classification did not succeed, packets are enqueued to the leaf qdisc attached to that class. Check qdisc specific manpages  for  details,  how‐
+       ever.
+	   如果无法进行分类，数据包将被排队到连接到该类别的叶子qdisc上。请查阅特定qdisc的手册以获取详细信息。
+
+NAMING
+       All qdiscs, classes and filters have IDs, which can either be specified or be automatically assigned.
+	   所有的qdisc、类别和过滤器都有ID，可以手动指定或自动分配
+
+       IDs  consist of a major number and a minor number, separated by a colon - major:minor.  Both major and minor are hexadecimal numbers and are limited
+       to 16 bits. There are two special values: root is signified by major and minor of all ones, and unspecified is all zeros.
+	   ID由一个主号和一个次号组成，用冒号分隔 - 主号:次号。主号和次号都是十六进制数，限制为16位。有两个特殊值：主号和次号都为全1表示根（root），全0表示未指定（unspecified）。
+
+       QDISCS A qdisc, which potentially can have children, gets assigned a major number, called a 'handle', leaving the minor number  namespace  available
+              for classes. The handle is expressed as '10:'.  It is customary to explicitly assign a handle to qdiscs expected to have children.
+			  一个可以有子类别的qdisc会被分配一个主号，称为“handle”，次号命名空间保留给类别。该handle表示为“10:”。通常会显式地为预计有子类别的qdisc分配一个handle。
+
+       CLASSES
+              Classes  residing under a qdisc share their qdisc major number, but each have a separate minor number called a 'classid' that has no relation
+              to their parent classes, only to their parent qdisc. The same naming custom as for qdiscs applies.
+			  位于一个qdisc下的类别共享其qdisc的主号，但每个类别都有一个独立的次号，称为“classid”，它与其父类别无关，只与其父qdisc有关。与qdisc相同的命名习惯适用于类别。
+
+       FILTERS
+              Filters have a three part ID, which is only needed when using a hashed filter hierarchy.
+			  过滤器有一个三部分的ID，只在使用哈希过滤器层次结构时才需要。
+
+PARAMETERS
+       The following parameters are widely used in TC. For other parameters, see the man pages for individual qdiscs.
+
+       RATES  Bandwidths or rates.  These parameters accept a floating point number, possibly followed by either a unit (both SI and IEC units  supported),
+              or  a  float  followed by a '%' character to specify the rate as a percentage of the device's speed (e.g. 5%, 99.5%). Warning: specifying the
+              rate as a percentage means a fraction of the current speed; if the speed changes, the value will not be recalculated.
+			  带宽或速率。这些参数接受一个浮点数，可能后面跟着一个单位（支持SI和IEC单位），或者一个浮点数后面跟着 '%' 字符，以将速率指定为设备速度的百分比（例如5%，99.5%）。注意：将速率指定为百分比意味着当前速度的一部分；如果速度发生变化，该值将不会重新计算。
+
+              bit or a bare number
+                     Bits per second
+
+              kbit   Kilobits per second
+
+              mbit   Megabits per second
+
+              gbit   Gigabits per second
+
+              tbit   Terabits per second
+
+              bps    Bytes per second
+
+              kbps   Kilobytes per second
+
+              mbps   Megabytes per second
+
+              gbps   Gigabytes per second
+
+              tbps   Terabytes per second
+
+              To specify in IEC units, replace the SI prefix (k-, m-, g-, t-) with IEC prefix (ki-, mi-, gi- and ti-) respectively.
+
+              TC store rates as a 32-bit unsigned integer in bps internally, so we can specify a max rate of 4294967295 bps.
+
+       TIMES  Length of time. Can be specified as a floating point number followed by an optional unit:
+
+              s, sec or secs
+                     Whole seconds
+
+              ms, msec or msecs
+                     Milliseconds
+
+              us, usec, usecs or a bare number
+                     Microseconds.
+
+              TC defined its own time unit (equal to microsecond) and stores time values as 32-bit unsigned integer, thus we can specify a max  time  value
+              of 4294967295 usecs.
+
+       SIZES  Amounts of data. Can be specified as a floating point number followed by an optional unit:
+
+              b or a bare number
+                     Bytes.
+
+              kbit   Kilobits
+
+              kb or k
+                     Kilobytes
+
+              mbit   Megabits
+
+              mb or m
+                     Megabytes
+
+              gbit   Gigabits
+
+              gb or g
+                     Gigabytes
+
+              TC stores sizes internally as 32-bit unsigned integer in byte, so we can specify a max size of 4294967295 bytes.
+
+       VALUES Other  values without a unit.  These parameters are interpreted as decimal by default, but you can indicate TC to interpret them as octal and
+              hexadecimal by adding a '0' or '0x' prefix respectively.
+
+TC COMMANDS
+       The following commands are available for qdiscs, classes and filter:
+
+       add    Add a qdisc, class or filter to a node. For all entities, a parent must be passed, either by passing its ID or by attaching directly  to  the
+              root of a device.  When creating a qdisc or a filter, it can be named with the handle parameter. A class is named with the classid parameter.
+			  向节点添加一个qdisc、class或filter。对于所有实体，必须传递一个父节点，可以通过传递其ID或直接附加到设备的根节点来实现。在创建qdisc或filter时，可以使用handle参数为其命名。使用classid参数为class命名。
+
+       delete A qdisc can be deleted by specifying its handle, which may also be 'root'. All subclasses and their leaf qdiscs are automatically deleted, as
+              well as any filters attached to them.
+
+       change Some entities can be modified 'in place'. Shares the syntax of 'add', with the exception that the handle cannot be changed  and  neither  can
+              the parent. In other words, change cannot move a node.
+
+       replace
+              Performs a nearly atomic remove/add on an existing node id. If the node does not exist yet it is created.
+
+       get    Displays a single filter given the interface DEV, qdisc-id, priority, protocol and filter-id.
+
+       show   Displays all filters attached to the given interface. A valid parent ID must be passed.
+
+       link   Only available for qdiscs and performs a replace where the node must exist already.
+	 			仅适用于qdiscs，并在节点已经存在的情况下执行replace操作。  
+
+MONITOR
+       The tc utility can monitor events generated by the kernel such as adding/deleting qdiscs, filters or actions, or modifying existing ones.
+
+       The following command is available for monitor :
+
+       file   If  the file option is given, the tc does not listen to kernel events, but opens the given file and dumps its contents. The file has to be in
+              binary format and contain netlink messages.
+
+OPTIONS
+       -b, -b filename, -batch, -batch filename
+              read commands from provided file or standard input and invoke them.  First failure will cause termination of tc.
+
+       -force don't terminate tc on errors in batch mode.  If there were any errors during execution of the commands, the application return code  will  be
+              non zero.
+
+       -o, -oneline
+              output  each  record  on  a  single line, replacing line feeds with the '\' character. This is convenient when you want to count records with
+              wc(1) or to grep(1) the output.
+			  将每个记录输出为单行，将换行符替换为''字符。这在想要使用wc(1)计数记录或使用grep(1)搜索输出时很方便。
+
+       -n, -net, -netns <NETNS>
+              switches tc to the specified network namespace NETNS.  Actually it just simplifies executing of:
+
+              ip netns exec NETNS tc [ OPTIONS ] OBJECT { COMMAND | help }
+
+              to
+
+              tc -n[etns] NETNS [ OPTIONS ] OBJECT { COMMAND | help }
+
+       -N, -Numeric
+              Print the number of protocol, scope, dsfield, etc directly instead of converting it to human readable name.
+
+       -cf, -conf <FILENAME>
+              specifies path to the config file. This option is used in conjunction with other options (e.g.  -nm).
+
+       -t, -timestamp
+              When tc monitor runs, print timestamp before the event message in format:
+                 Timestamp: <Day> <Month> <DD> <hh:mm:ss> <YYYY> <usecs> usec
+
+       -ts, -tshort
+              When tc monitor runs, prints short timestamp before the event message in format:
+                 [<YYYY>-<MM>-<DD>T<hh:mm:ss>.<ms>]
+
+FORMAT
+       The show command has additional formatting options:
+
+       -s, -stats, -statistics
+              output more statistics about packet usage.
+
+       -d, -details
+              output more detailed information about rates and cell sizes.
+
+       -r, -raw
+              output raw hex values for handles.
+
+       -p, -pretty
+              for u32 filter, decode offset and mask values to equivalent filter commands based on TCP/IP.  In JSON output, add whitespace to improve read‐
+              ability.
+
+       -iec   print rates in IEC units (ie. 1K = 1024).
+
+       -g, -graph
+              shows  classes as ASCII graph. Prints generic stats info under each class if -s option was specified. Classes can be filtered only by dev op‐
+              tion.
+
+       -c[color][={always|auto|never}
+              Configure color output. If parameter is omitted or always, color output is enabled regardless of stdout state. If parameter is  auto,  stdout
+              is  checked  to be a terminal before enabling color output. If parameter is never, color output is disabled. If specified multiple times, the
+              last one takes precedence. This flag is ignored if -json is also given.
+
+       -j, -json
+              Display results in JSON format.
+
+       -nm, -name
+              resolve class name from /etc/iproute2/tc_cls file or from file specified by -cf option. This file is just a mapping of classid to class name:
+
+                 # Here is comment
+                 1:40   voip # Here is another comment
+                 1:50   web
+                 1:60   ftp
+                 1:2    home
+
+              tc will not fail if -nm was specified without -cf option but /etc/iproute2/tc_cls file does not exist, which makes it possible  to  pass  -nm
+              option for creating tc alias.
+
+       -br, -brief
+              Print  only essential data needed to identify the filter and action (handle, cookie, etc.) and stats. This option is currently only supported
+              by tc filter show and tc actions ls commands.
+
+EXAMPLES
+       tc -g class show dev eth0
+           Shows classes as ASCII graph on eth0 interface.
+
+       tc -g -s class show dev eth0
+           Shows classes as ASCII graph with stats info under each class.
+
+HISTORY
+       tc was written by Alexey N. Kuznetsov and added in Linux 2.2.
+
+SEE ALSO
+       tc-basic(8), tc-bfifo(8), tc-bpf(8), tc-cake(8), tc-cbq(8), tc-cgroup(8), tc-choke(8), tc-codel(8), tc-drr(8), tc-ematch(8), tc-ets(8),  tc-flow(8),
+       tc-flower(8),  tc-fq(8), tc-fq_codel(8), tc-fq_pie(8), tc-fw(8), tc-hfsc(7), tc-hfsc(8), tc-htb(8), tc-mqprio(8), tc-pfifo(8), tc-pfifo_fast(8), tc-
+       pie(8), tc-red(8), tc-route(8), tc-sfb(8), tc-sfq(8), tc-stab(8), tc-tbf(8), tc-tcindex(8), tc-u32(8),
+       User documentation at http://lartc.org/, but please direct bugreports and patches to: <netdev@vger.kernel.org>
+
+AUTHOR
+       Manpage maintained by bert hubert (ahu@ds9a.nl)
+
+iproute2                                                              16 December 2001                                                                TC(8)
