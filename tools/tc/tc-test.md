@@ -6,7 +6,7 @@ tc qdisc add dev eth0 root tbf rate 220kbit latency 50ms burst 1600
 
 # 创建了一个qdisc ，handle 名为 8001:
 # rate 为 token的生成速率
-# burst ：桶能存放多少token
+# burst ：桶能存放多少token，单位字节
 # latency : 等待获得token的数据包最长等待时间
 /root # ./tc qdisc show dev eth0
 qdisc tbf 8001: root refcnt 2 rate 220Kbit burst 1599b lat 50ms

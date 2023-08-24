@@ -718,3 +718,180 @@ enum nf_ip_hook_priorities {
 对于 ingress 流量，imq 会将自己注册为 NF_IP_PRI_MANGLE + 1 优先级，这意味包 经过 PREROUTING chain 之后就会直接进入 imq 设备后。
 对于 egress 流量，imq 使用 NF_IP_PRI_LAST，which honours the fact that packets dropped by the filter table won’t occupy bandwidth.
 
+# filter
+过滤器用于把数据包分类并放入相应子节点
+
+可用的分类器
+fw 根据netfiler对数据包标记进行分类
+u32 根据数据包各个字段进行匹配
+route 根据数据包的路由项进行分类
+...
+
+通用参数
+protocol 分类器接受的L3层协议，必要参数
+parent 分类附着在哪个句柄上
+prio 分类器的优先级。值越小优先级越高
+handle 对于不同过滤器，意义不同
+
+
+分类器 = 分类器描述 + 选择器 + 动作
+
+分类器描述：
+```shell
+tc filter add dev IF [protocol PROTO]
+                     [ (preference| priority) PRIO]
+					 [ parent CBQ ]
+```
+
+选择器用于与IP包匹配，一旦成功匹配就执行指定动作，如将数据包发送到特定的类队列
+
+## U32
+U32选择器基于哈希实现，有稳定的性能。
+定义了与数据包哪些字节进行匹配
+```shell
+tc filter add dev eth0 protocol ip parent 1:0 pref 1 u32 \
+	match u32 00100000 00ff0000 at 0 flowid 1:10
+```
+第一行为分类器描述
+u32 指定使用u32选择器
+match u32 00100000 00ff0000 at 0 flowid 1:10 相当于下面的伪代码
+```c
+	char *p = ((char *)iphdr + 0); // at 0 从IP头偏移0字节
+	u32 data = *(u32 *)p;          // u32 表示比较 32 bit长度的数据
+	if ((data & 0x00ff0000) ^ 0x00100000  == 0) // u32 00100000 00ff0000 后面为掩码，前面为比较数字
+		Forward_pkt(f_1_10);	   // 和目标值一样则转发给目标节点
+```
+所以将tos为 0x10的报文转发到 1:10
+
+
+```shell
+tc filter add dev eth0 protocol ip parent 1:0 pref 1 u32 \
+	match u32 00000016 0000ffff at nexthdr+0 flowid 1:10
+```
+match u32 00000016 0000ffff at nexthdr+0 flowid 1:10
+nexthdr+0 为L4层头偏移0字节
+所以将目标端口为 0x0016的报文转发到 1:10
+
+
+```shell
+tc filter add dev eth0 protocol ip parent 1:0 pref 1 u32 \
+	match u32 c0a80100 ffffff00 flowid 1:10
+```
+将目的IP为192.168.1.0/24的包转发到 1:10
+
+### 通用比较器
+```shell
+match [u32 | u16 | u8] pattern mask [at offet | nexthdr+offet]
+```
+
+```shell
+# 匹配TTL为64
+# tc filter add dev ppp14 parent 1:0 prio 10 u32 \
+ match u8 64 0xff at 8 \
+ flowid 1:4
+```
+### 特殊比较器
+```shell
+ match ip protocol 
+       ip tos
+	   tcp dport
+```
+
+```shell
+# 匹配带ACK位的TCP数据包
+# tc filter add dev ppp14 parent 1:0 prio 10 u32 \
+ match ip protocol 6 0xff \
+ match u8 0x10 0xff at nexthdr+13 \
+ flowid 1:3
+
+## 比较小于64字节的ACK包
+## match acks the hard way, 
+## IP protocol 6, 
+## IP header length 0x5(32 bit words), 
+## IP Total length 0x34 (ACK + 12 bytes of TCP options) 
+## TCP ack set (bit 5, offset 33) 
+# tc filter add dev ppp14 parent 1:0 protocol ip prio 10 u32 \
+ match ip protocol 6 0xff \
+ match u8 0x05 0x0f at 0 \
+ match u16 0x0000 0xffc0 at 2 \
+ match u8 0x10 0xff at 33 \
+ flowid 1:3
+
+# tc filter add dev ppp0 parent 1:0 prio 10 u32 \
+ match ip tos 0x10 0xff \
+ flowid 1:4
+
+# tc filter add dev ppp0 parent 1:0 prio 10 u32 \
+ match tcp dport 53 0xffff \
+ match ip protocol 0x6 0xff \
+ flowid 1:2
+```
+
+## 路由分类器
+```shell
+# tc filter add dev eth1 parent 1:0 protocol ip prio 100 route
+```
+当数据包到达这个节点时，就会查询路由表，如果匹配就会被发送到给定的类
+
+要最后完成，你还要添加一条适当的路由项
+这里的窍门就是基于目的或者源地址来定义“realm”。像这样
+```shell
+# ip route add Host/Network via Gateway dev Device realm RealmNumber
+# 例如，我们可以把目标网络 192.168.10.0 定义为 realm 10：
+ip route add 192.168.10.0/24 via 192.168.10.1 dev eth1 realm 10
+```
+我们再使用路由过滤器的时候，就可以用 realm 号码来表示网络或者主机了，并
+可以用来描述路由如何匹配过滤器：
+
+```shell
+tc filter add dev eth1 parent 1:0 protocol ip prio 100 \
+ route to 10 classid 1:10
+```
+这个规则说：凡是去往 192.168.10.0 子网的数据包匹配到类 1:10
+
+路由过滤器也可以用来匹配源策略路由。比如，一个 Linux 路由器的 eth2 上连接
+了一个子网
+```shell
+ip route add 192.168.2.0/24 dev eth2 realm 2 
+tc filter add dev eth1 parent 1:0 protocol ip prio 100 \
+ route from 2 classid 1:2
+```
+这个规则说：凡是来自 192.168.2.0 子网(realm 2)的数据包，匹配到 1:2。
+
+## 分类器和散列表
+当你定义很多 filter时（比如你有很多QoS的客户机），你会发现内核花费大量时间用于匹配规则。
+默认情况下，所有filter基于链表组织，链表按照Priority 排列。如果有1000个filter，可能要匹配1000次.
+
+如果使用哈希，比如使用256 bucket的哈希，则没有bucket平均4个filter，则最多匹配4次。
+
+比如你有1024个用户，他们被分配的IP范围是 1.2.0.0 - 1.2.3.255，你需要根据源IP将他们分到3个不同class 1:1 , 1:2, 1:3 ，则你可能需要写1024个规则，如
+```shell
+tc filter add dev eth1 parent 1:0 protocol ip prio 100 match ip src \
+.2.0.0 classid 1:1
+tc filter add dev eth1 parent 1:0 protocol ip prio 100 match ip src \
+.2.0.1 classid 1:1
+.
+tc filter add dev eth1 parent 1:0 protocol ip prio 100 match ip src \
+.2.3.254 classid 1:3
+tc filter add dev eth1 parent 1:0 protocol ip prio 100 match ip src \
+ 1.2.3.255 classid 1:2
+```
+现在用散列表实现，使用IP地址后半部分作为散列因子，建立256个散列项。
+```shell
+tc filter add dev eth1 parent 1:0 protocol ip prio 100 match ip src \
+.2.0.0 classid 1:1
+tc filter add dev eth1 parent 1:0 protocol ip prio 100 match ip src \
+.2.1.0 classid 1:1
+tc filter add dev eth1 parent 1:0 protocol ip prio 100 match ip src \
+.2.2.0 classid 1:3
+tc filter add dev eth1 parent 1:0 protocol ip prio 100 match ip src \
+ 1.2.3.0 classid 1:2
+```
+
+首先生成一个root的 filter，然后创建一个256项散列表
+```shell
+# tc filter add dev eth1 parent 1:0 prio 5 protocol ip u32
+# tc filter add dev eth1 parent 1:0 prio 5 handle 2: protocol ip u32 divisor 256
+```
+
+
