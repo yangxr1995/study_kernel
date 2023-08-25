@@ -357,6 +357,3 @@ default via 192.168.3.1 dev ens33 proto static metric 20100
 192.168.3.0/24 dev ens33 proto kernel scope link src 192.168.3.2 metric 100
 192.168.4.0/24 dev ens38 proto kernel scope link src 192.168.4.128 metric 101
 ```
-#### 流量分割
-![](./pic/57.jpg)
-
