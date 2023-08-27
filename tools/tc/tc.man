@@ -39,23 +39,21 @@ SYNOPSIS
         FORMAT := { -s[tatistics] | -d[etails] | -r[aw] | -i[ec] | -g[raph] | -j[json] | -p[retty] | -col[or] }
 
 DESCRIPTION
-       Tc is used to configure Traffic Control in the Linux kernel. Traffic Control consists of the following:
+	Tc用于配置Linux内核中的流量控制。流量控制包括以下内容：
 
-       SHAPING
-              When  traffic  is  shaped,  its rate of transmission is under control. Shaping may be more than lowering the available bandwidth - it is also
-              used to smooth out bursts in traffic for better network behaviour. Shaping occurs on egress.
+	形状控制（SHAPING）
+	当流量被形状控制时，其传输速率受到控制。形状控制不仅可以降低可用带宽，还可以平滑流量中的突发，以获得更好的网络行为。形状控制发生在出口。
 
-       SCHEDULING
-              By scheduling the transmission of packets it is possible to improve interactivity for traffic that needs it while  still  guaranteeing  band‐
-              width to bulk transfers. Reordering is also called prioritizing, and happens only on egress.
+	调度（SCHEDULING）
+	通过调度数据包的传输，可以改善需要互动性的流量的交互性，同时仍然保证大块传输的带宽。重新排序也称为优先级排序，仅在出口时发生。
 
-       POLICING
-              Whereas shaping deals with transmission of traffic, policing pertains to traffic arriving. Policing thus occurs on ingress.
+	监管（POLICING）
+	而形状控制处理的是流量的传出，监管则涉及到到达的流量。因此，监管发生在入口处。
 
-       DROPPING
-              Traffic exceeding a set bandwidth may also be dropped forthwith, both on ingress and on egress.
+	丢弃（DROPPING）
+	超过设定带宽的流量也可能立即被丢弃，无论是在入口还是出口。
 
-       Processing of traffic is controlled by three kinds of objects: qdiscs, classes and filters.
+	流量的处理由三种类型的对象控制：qdiscs（队列规则）、classes（类别）和filters（过滤器）。
 
 QDISCS
 		qdisc是"queueing discipline"（队列调度）的缩写，它对于理解流量控制是基本的。每当内核需要将一个数据包发送到一个接口时，它会被排队到为该接口配置的qdisc中。紧接着，内核会尽可能多地从qdisc中获取数据包，并将它们交给网络适配器驱动程序。
@@ -64,58 +62,42 @@ QDISCS
 
 CLASSES
 		一些qdisc可以包含类（classes），而这些类又包含进一步的qdiscs。流量可以被排队到内部的任何一个qdisc中，这些qdisc位于类中。当内核尝试从这样的类别化（classful）qdisc中出队一个数据包时，它可以来自任何一个类别。例如，一个qdisc可以通过在其他类别之前尝试从特定类别中出队来优先处理某些类型的流量。
-       Some qdiscs can contain classes, which contain further qdiscs - traffic may then be enqueued in any of  the  inner  qdiscs,  which  are  within  the
-       classes.   When the kernel tries to dequeue a packet from such a classful qdisc it can come from any of the classes. A qdisc may for example priori‐
-       tize certain kinds of traffic by trying to dequeue from certain classes before others.
 
 FILTERS
 		过滤器（filter）被类别化（classful）qdisc用于确定数据包将被排队到哪个类别中。当流量到达一个具有子类的类别时，它需要进行分类。可以采用各种方法来进行分类，其中之一就是使用过滤器。所有附加到该类别的过滤器都会被调用，直到其中一个返回一个判断结果。如果没有做出判断结果，可能还会有其他的标准可用。这在每个qdisc中可能会有所不同。
 
-       A filter is used by a classful qdisc to determine in which class a packet will be enqueued. Whenever traffic arrives at a class with subclasses,  it
-       needs  to be classified. Various methods may be employed to do so, one of these are the filters. All filters attached to the class are called, until
-       one of them returns with a verdict. If no verdict was made, other criteria may be available. This differs per qdisc.
+	需要注意的是，过滤器存在于qdisc中，它们并不掌握发生的情况。也就是说，过滤器只是用于决定数据包的分类，而不是控制整个流量控制过程。
 
-		需要注意的是，过滤器存在于qdisc中，它们并不掌握发生的情况。也就是说，过滤器只是用于决定数据包的分类，而不是控制整个流量控制过程。
-       It is important to notice that filters reside within qdiscs - they are not masters of what happens.
+	重要的是要注意，过滤器存在于qdiscs中，它们不控制发生的事情。
 
-       The available filters are:
+	可用的过滤器包括：
 
-       basic  Filter packets based on an ematch expression. See tc-ematch(8) for details.
+	basic：基于ematch表达式过滤数据包。有关详细信息，请参阅tc-ematch(8)。
 
-       bpf    Filter packets using (e)BPF, see tc-bpf(8) for details.
+	bpf：使用(e)BPF过滤数据包，请参阅tc-bpf(8)。
 
-       cgroup Filter packets based on the control group of their process. See tc-cgroup(8) for details.
+	cgroup：基于进程的控制组过滤数据包。有关详细信息，请参阅tc-cgroup(8)。
 
-       flow, flower
-              Flow-based classifiers, filtering packets based on their flow (identified by selectable keys). See tc-flow(8) and tc-flower(8) for details.
+	flow、flower：基于流量的分类器，根据流量（通过可选择的键标识）过滤数据包。有关详细信息，请参阅tc-flow(8)和tc-flower(8)。
 
-       fw     Filter based on fwmark. Directly maps fwmark value to traffic class. See tc-fw(8).
+	fw：基于fwmark过滤数据包。直接将fwmark值映射到流量类别。请参阅tc-fw(8)。
 
-       route  Filter packets based on routing table. See tc-route(8) for details.
+	route：基于路由表过滤数据包。有关详细信息，请参阅tc-route(8)。
 
-       rsvp   Match Resource Reservation Protocol (RSVP) packets.
+	rsvp：匹配资源预留协议（RSVP）数据包。
 
-       tcindex
-              Filter packets based on traffic control index. See tc-tcindex(8).
+	tcindex：基于流量控制索引过滤数据包。请参阅tc-tcindex(8)。
 
-       u32    Generic filtering on arbitrary packet data, assisted by syntax to abstract common operations. See tc-u32(8) for details.
+	u32：在任意数据包数据上进行通用过滤，辅助语法用于抽象常见操作。有关详细信息，请参阅tc-u32(8)。
 
-       matchall
-              Traffic control filter that matches every packet. See tc-matchall(8) for details.
-
+	matchall：匹配所有数据包的流量控制过滤器。有关详细信息，请参阅tc-matchall(8)。
 QEVENTS
-		在qdisc中，当发生某些有趣的事件时，可以调用用户配置的操作。每个qevent可以是未使用的，也可以附加一个block。然后，可以使用"tc block BLOCK_IDX"语法将过滤器附加到该block上。当与附加点相关联的qevent发生时，将执行该block。例如，根据所使用的qdisc和相关的qevent，可以丢弃或延迟数据包等。
-       Qdiscs may invoke user-configured actions when certain interesting events take place in the qdisc. Each qevent can either be unused, or can  have  a
-       block  attached  to it. To this block are then attached filters using the "tc block BLOCK_IDX" syntax. The block is executed when the qevent associ‐
-       ated with the attachment point takes place. For example, packet could be dropped, or delayed, etc., depending on the qdisc and the qevent  in  ques‐
-       tion.
+	在qdisc中，当发生某些有趣的事件时，可以调用用户配置的操作。每个qevent可以是未使用的，也可以附加一个block。然后，可以使用"tc block BLOCK_IDX"语法将过滤器附加到该block上。当与附加点相关联的qevent发生时，将执行该block。例如，根据所使用的qdisc和相关的qevent，可以丢弃或延迟数据包等。
 
-       For example:
-
-              tc qdisc add dev eth0 root handle 1: red limit 500K avpkt 1K \
-                 qevent early_drop block 10
-              tc filter add block 10 matchall action mirred egress mirror dev eth1
-			  上述示例中，创建了一个名为eth0的网络设备上的根qdisc，并使用red队列调度算法。设置了一个名为early_drop的qevent，并将其与索引为10的block关联。然后，使用matchall过滤器将一个动作（mirred egress mirror）添加到block 10中，该动作将数据包镜像到eth1设备。
+		  tc qdisc add dev eth0 root handle 1: red limit 500K avpkt 1K \
+			 qevent early_drop block 10
+		  tc filter add block 10 matchall action mirred egress mirror dev eth1
+		  上述示例中，创建了一个名为eth0的网络设备上的根qdisc，并使用red队列调度算法。设置了一个名为early_drop的qevent，并将其与索引为10的block关联。然后，使用matchall过滤器将一个动作（mirred egress mirror）添加到block 10中，该动作将数据包镜像到eth1设备。
 
 CLASSLESS QDISCS
        The classless qdiscs are:
