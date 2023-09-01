@@ -142,3 +142,7 @@ iptables -t nat -A POSTROUTING -s 10.8.0.0/255.255.255.0 -o eth0 -j MASQUERADE
 如果程序希望检查网线上所有报文，通常需要让网卡开启混淆模式，但这会加大CPU的负荷，
 某些程序可以直接访问网卡，可能是dpdk.
 
+# BR_NETFILTER
+使用此模块 netfilter 可以过滤网桥的数据包
+使用 /proc/sys/net/bridge/bridge-nf-call-iptables 控制释放开启过滤
+

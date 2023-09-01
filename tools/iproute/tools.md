@@ -241,7 +241,7 @@ root@u22:/# ip neigh show
 ```
 删除ARP项
 ```shell
-ip neigh delete <MAC> dev <dev_name>
+ip neigh delete <IP> dev <dev_name>
  ```
 
 ### 策略路由
