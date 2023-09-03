@@ -100,6 +100,8 @@ MMU根据页表进行地址转换，对于二级映射需要查询两次页表�
 
 ### MMU如何完成地址转换
 ![](./pic/58.jpg)
+
+
 TTBRx : arm寄存器，用于存储一级页表的基地址
 L1 索引 20 ... 31 bit 共12bit用于存储二级页表项在一级页表中的索引号
 L2 索引 12 ... 19 bit 共8bit 用于存储物理内存前缀在二级页表中的索引号
@@ -107,10 +109,174 @@ L2 索引 12 ... 19 bit 共8bit 用于存储物理内存前缀在二级页表中
 
 需要注意，地址转换为MMU硬件自动完成，软件只需要完成页表的初始化。
 
-## 1.2 Linux内存管理设计
+#### 为什么 huge page能减少tlb miss
+每次tlb miss的惩罚是很大的，一次tlb miss会导致两次访问内存（对于二级映射）。所以减少tlb miss是很有用的。
+使用 huge page 能减少tlb miss
 
+上图中根据页索引可以看出page 大小为4K，相当于把虚拟内存按4K大小分割，再使用 L1 , L2 索引寻址。
+如果使用 huge page，且 page的大小为2M，那么页索引部分能表示2M的空间，所以 L1, L2 部分变少。
+对于访问2M的内存，使用4K page，最坏情况 tlb miss 512 次
+使用2M page, 最坏情况 tlb miss 1 次
+
+## 1.2 Linux内存模块全景图
+![](./pic/59.jpg)
+* VMA : 用于管理用户进程的虚拟空间分配，注意内核的虚拟空间分配不使用VMA，由内核自己管理
+* 缺页中断 : 由于用户进程虚拟空间和物理空间是迟绑定的，所以当用户进程访问虚拟空间时，若并没有分配物理页，则触发缺页中断，进行分配物理页面
+* 匿名页面 : 匿名页面为进程的私有数据，没有关联文件，如 堆栈空间，mmap匿名映射的空间。由于是进程私有页面，不存在写回机制(所谓写回就是将数据写回到flash并释放内存)，但可以 swap 到flash
+* page cache : 关联文件，为进程共有数据，有写回。当内存不足时会写回并回收page
+* 页面回收：page管理会有水位，当水位较低时，暂停处理页面分配的申请，进行页面回收，回收的方式有 页面迁移，内存规则，OOM，当水位高时继续正常分配
+* slab : 用于内核测分配小物理内存块，由于内核有很多数据结构会大量分配，可以分配一个page将其分割为固定大小的内存块(相当于内存池)，大小为具体数据结构的大小，此page就专门用于分配对于数据结构的内存。
+* 伙伴系统：管理page分配
+* 页表管理：
+* 反向映射：根据page，找到关联的一个或多个vma，以找到进程记录该page的 pte，用于实现页面回收
+* KSM : 页面合并，合并内容相同的匿名页面，主要用于KVM，比如主机启动多个KVM，其中大量匿名页面数据一样，就可以合并成一个，以释放页面。
+* Huge page : 分配2M或1G的页，通常用于服务器，主要减少tlb miss
+* 页迁移：迁移可迁移的页面到内存节点
+* 内存规整：缓解内存碎片化
+* OOM : 当内存紧缺无法通过迁移和碎片化等常规方式解决时，杀掉占用内存多的进程，强制回收page
+
+## 1.3 虚拟空间和物理空间
+### 1.3.1 从内核进程看内存
+![](./pic/60.jpg)
+* 虚拟内存空间 : 由于CPU位数为32位，最大只有4GB寻址，所以虚拟内存空间固定为4GB，并且分割为内核空间和用户进程空间，分割比例可调节，默认为1:3
+* 内核进程和用户进程 : 内核进程只有一个，用户进程由很多个，而用户进程都有内核态，所以每个用户进程的页表都有内核页表，并且所有用户进程的页表只有用户进程虚拟空间对应的页表项不同，内核虚拟空间对应的页表项相同，也就是说当一个用户进程成内核态时，它就成了内核进程，并且和其他进入内核态的用户进程共享虚拟内存空间，相当于他们是不同的内核线程
+* 虚拟空间和页表 : 页表记录虚拟空间和物理空间的映射，4KB为单位（对于huge page是2MB或1GB），所以进程的虚拟空间大小决定了页表的总大小。
+* 虚拟空间的使用 : 要使用虚拟空间，必须先建立对应的页表，这样MMU才能转换地址成功。
+* 内核虚拟空间 : 内核必须要有使用所有物理内存的能力，但是虚拟空间不足，所以一部分虚拟空间必须为动态映射，所以内核的虚拟空间按照映射方式又分为线性映射区和高端映射区，通常线性映射区大小为760M。当物理内存足够小时，则没有高端映射区。
+* 内存分配和虚拟地址转换 : 物理内存和虚拟内存是线性映射关系，所以内核即使不通过内存分配器也可以直接使用虚拟内存，但是要实现page的管理，所以必须经过内存分配器分配page，建立映射，再使用虚拟内存。
+* 页表和线性映射区 : 虽然线性映射区的映射方式是简单的，但必须需要页表，因为CPU发出的地址信息都当作虚拟地址通过MMU进行转换，MMU不懂什么是线性映射，只知道查询TLB和页表，所以在开启MMU前需要建立页表，只是由于线性映射区的映射关系是静态的，所以页表可以预先建立
+* 页表和高端映射区 : 由于高端映射区使用动态映射，所以不能预先建立，在需要使用高端映射区时(vmalloc)才分配虚拟空间和物理空间（来自高端内存），并建立映射关系（也就是构建对于虚拟空间的页表）
+
+### 1.3.2 物理内存的管理
+![](./pic/61.jpg)
+* page : page数据结构描述一个物理页面的属性，注意page不记录物理页面的基地址
+* mem_map : 在内存初始化时，会分配一个数组mem_map，数组成员为page
+* pfn : 某个page在mem_map中的索引号
+* page得到物理页基地址的转换 : 由于page 和 物理内存页是线性映射关系，且页大小固定，所以知道 pfn 就可以知道相关page对应的物理页基地址
+```c
+#define	__phys_to_pfn(paddr)	((unsigned long)((paddr) >> PAGE_SHIFT))
+#define	__pfn_to_phys(pfn)	((phys_addr_t)(pfn) << PAGE_SHIFT)
+```
+在分配物理内存，建立映射关系时，需要获得页的物理地址 : 只需要从mem_map中分配未使用的page，进而得到pfn，进而得到物理地址
+* page的管理 : 对于物理内存空间，分为高端内存空间和低端内存空间，所以有各自的管理方式，用数据结构表示为zone，每个zone都有自己的伙伴系统，在zone初始化时将page加入伙伴系统，分配时从伙伴系统取出page，回收时将page放入伙伴系统
+
+### 1.3.3 从用户进程看内存
+![](./pic/62.jpg)
+虚拟空间的分区 : 编译器和操作系统将用户进程的虚拟空间进一步分区，不同的分区有不同的读写权限等。
+mmap : 当用户进程使用brk等系统调用分配内存时，实际只分配了VMA，并使用链式和红黑树组织VMA，mmap为所有VMA的句柄
+pgd : 记录进程的一级页表，在fork时复制父进程的一级页表内容，对于二级页表，内核虚拟地址对应的二级页表被所有进程共享，用户进程虚拟地址对应的二级页表在缺页映射时分配，并共享父进程的二级页表，但共享页表为只读权限
+VMA : 表示已分配的虚拟内存空间，不一定映射了物理空间
+缺页中断 : 使用虚拟内存按需映射物理内存。进程访问虚拟地址时，MMU发现没有对应页表，或只有读权限缺需要写(写时复制)，触发缺页中断。缺页中断进行查询是否分配了对应的VMA，没有则段错误。如果分配了VMA，则分配page或进行写时复制，并将新增映射关系写入页表。
+
+内核进程由于预先建立了页表（线性映射区），所以直接访问内存也不会触发缺页中断。换个角度看，内核一开始就将所有的虚拟内存（线性映射区）当成已分配状态，所以不需要虚拟空间管理，也就不需要VMA
+
+## 1.4 内存重要数据结构之间的关系
+![](./pic/63.jpg)
 
 # 2. 物理内存
+## 描述物理内存的数据结构
+### pgdata
+pgdata 为内存节点
+
+当linux包含多个内存节点时，涉及内存节点的管理
+有两种存储模型
+* UMA 均匀存储访问，任意CPU访问任意内存节点的优先级一样
+* NUMA 非均匀存储访问，CPU优先访问离自己近的内存节点
+在服务器场景下，UMA模型下CPU常常跑到离自己远的内存节点，当然有解决方法。但总之NUMA更适合服务器场景，也更复制。
+对于嵌入式场景，使用UMA。对于arm，通常只有一个pgdata.
+
+```c
+typedef struct pglist_data {
+
+	// 1. ZONE相关
+	// 自己的zone
+	struct zone node_zones[MAX_NR_ZONES];
+	// 本节点引用的所有zone，包括自己和其他pgdata的zone
+	struct zonelist node_zonelists[MAX_ZONELISTS];
+	// 自己zone的数量
+	int nr_zones; /* number of populated zones in this node */
+
+	// 2. 描述内存节点信息
+	unsigned long node_start_pfn;
+	unsigned long node_present_pages; /* total number of physical pages */
+	unsigned long node_spanned_pages; /* total size of physical page */
+	int node_id;
+
+	// 3. 页面回收相关
+	wait_queue_head_t kswapd_wait;
+	wait_queue_head_t pfmemalloc_wait;
+	struct task_struct *kswapd;
+	int kswapd_order;
+	enum zone_type kswapd_highest_zoneidx;
+	...
+
+} pg_data_t;
+
+
+// UMA节点, 可见只有一个内存节点
+extern struct pglist_data contig_page_data;
+#define NODE_DATA(nid)		(&contig_page_data)
+```
+
+### zone
+为什么要有zone？
+因为物理内存不同区域的管理方式不同，如高端内存被动态映射，低端内存被线性映射，建立映射的算法不同，时间不同，而且高端内存的映射会被释放，低端内存的映射一只保留。另外还有DMA。
+所以不同物理内存区域需要一个zone去描述。
+```c
+struct zone {
+	// 水位管理
+	unsigned long _watermark[NR_WMARK];
+	unsigned long watermark_boost;
+
+	struct pglist_data	*zone_pgdat;
+
+	// 伙伴系统的数组
+	struct free_area	free_area[MAX_ORDER];
+
+	...
+} ____cacheline_internodealigned_in_smp; // 让zone L1 cache对齐
+```
+- 水位管理 : 
+  - 高水位 : 正常分配页面
+  - 低水位 : 停止分配页面，进行页面回收
+  - 最低水位 : 停止分配页面，考虑OOM
+
+### page
+```c
+struct page {
+	unsigned long flags; // 重要标志位集合
+
+	union {
+		struct {	/* Page cache and anonymous pages */
+
+			struct list_head lru;
+			struct address_space *mapping; // 页面指向的地址空间
+			pgoff_t index;		// 对于文件映射，表示此page在文件中的偏移
+			                    // 对于匿名页面，表示基于虚拟地址0x0的偏移量
+
+		};
+		...
+	};
+
+	union {		/* This union is 4 bytes in size. */
+
+		atomic_t _mapcount;  // 页面被用户进程映射的数量, 也就是有多少个pte
+		...
+	};
+	atomic_t _refcount; // 内核中引用该页面的计数, 如果为0，表示应该释放
+
+	...
+};
+```
+
+#### page 和 其他数据结构的转换
+```c
+#define __pfn_to_page(pfn)	(mem_map + ((pfn) - ARCH_PFN_OFFSET))
+#define __page_to_pfn(page)	((unsigned long)((page) - mem_map) + \
+				 ARCH_PFN_OFFSET)
+```
+
+
 ## kernel如何知道可用的内存空间的地址范围？
 dts中描述了内存资源
 ```dts
@@ -127,9 +293,8 @@ early_init_dt_scan_memory
 	调用memblock_add 将 base size信息保存到 memblock.regions[0] 中
 ```
 
-所以内核如下获得可用的物理地址范围
+所以内核根据dts描述的硬件信息获得可用的物理地址范围
  dts --> memblock.regions[0]
-
 
 ## 物理内存的映射——内核的页表
 linux使用虚拟地址，在汇编部分建立了零时的段表，
@@ -417,6 +582,7 @@ static inline unsigned long __phys_to_virt(phys_addr_t x)
 内核知道物理内存的地址范围和各种zone的布局后，page就要加入伙伴系统。
 每个zone 都有一个free_area，这就是伙伴系统管理的基础。
 所以每个zone都有一个伙伴系统。
+zone有free_area成员，free_area为个类型的链表,为了缓解内存碎片化, 引入类型, 注意迁移类型的最小单元不是page，而是pageblock
 ![](./pic/37.jpg)
 ```c
 struct zone {
@@ -432,9 +598,9 @@ struct free_area {
 
 
 enum {
-	MIGRATE_UNMOVABLE,
-	MIGRATE_RECLAIMABLE,
-	MIGRATE_MOVABLE,
+	MIGRATE_UNMOVABLE, // 在内存中有固定位置，不能随意移动，比如内核态分配的内存
+	MIGRATE_RECLAIMABLE, // 不能移动，但可以删除回收，比如文件映射
+	MIGRATE_MOVABLE, // 可以随意移动，用户态分配的内存
 	MIGRATE_PCPTYPES,	/* the number of types on the pcp lists */
 	MIGRATE_RESERVE = MIGRATE_PCPTYPES,
 	MIGRATE_TYPES
