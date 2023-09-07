@@ -4007,11 +4007,14 @@ static int handle_pte_fault(struct mm_struct *mm,
 			return do_anonymous_page(mm, vma, address,
 						 pte, pmd, flags);
 		}
-		// 已分配物理页，将物理页swap到内存
+		// 如果 L_PTE_PRESENT 为 0，物理页面不在内存中，
+		// 并且 pte 被使用了，则说明页面被交换到了磁盘中
+		// 需要将其swap回内存
 		return do_swap_page(mm, vma, address,
 					pte, pmd, flags, entry);
 	}
 	// 以下是已分配物理页，且物理页在内存中的情况
+	// 比如写时复制
 
 	if (pte_protnone(entry) /* 0 */)
 		return do_numa_page(mm, vma, address, entry, pte, pmd);
@@ -4299,6 +4302,7 @@ static int do_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
 		goto release;
 
 	inc_mm_counter_fast(mm, MM_ANONPAGES);
+	// 建立反向映射
 	page_add_new_anon_rmap(page, vma, address);
 	mem_cgroup_commit_charge(page, memcg, false);
 	lru_cache_add_active_or_unevictable(page, vma);
@@ -4607,5 +4611,145 @@ oom:
 
 (3) 应用场景 : fork，父子进程共享父进程匿名页面，属性为只读，当一方需要写时，发生写时复制
 
+
+# Page
+page 是内存管理的核心，本节深入解析page
+
+下面page最常用成员如下
+```c
+struct page {
+	unsigned long flags;		/* Atomic flags, some possibly
+
+	struct list_head lru;
+	struct address_space *mapping;
+	pgoff_t index;		/* Our offset within mapping. */
+
+	atomic_t _mapcount;
+	atomic_t _refcount;
+};
+```
+
+## flags
+* PG_locked : page已经上锁
+* PG_error : 页面发生IO错误
+* PG_uptodate : 页面内容有效，当对该页面的读操作完成后，设置此标志位
+* PG_dirty : 页面内容为脏，当对该页面写操作完成后，还没有进行写回操作
+* PG_reclaim : 马上被回收
+* PG_unevictable : 页面不可回收
+
+内核提供了一些宏用于读写这些标志位
+```c
+// 下面的宏用于定义函数
+#define TESTPAGEFLAG(uname, lname, policy)				\
+static __always_inline int Page##uname(struct page *page)		\
+	{ return test_bit(PG_##lname, &policy(page, 0)->flags); }
+
+#define SETPAGEFLAG(uname, lname, policy)				\
+static __always_inline void SetPage##uname(struct page *page)		\
+	{ set_bit(PG_##lname, &policy(page, 1)->flags); }
+
+#define CLEARPAGEFLAG(uname, lname, policy)				\
+static __always_inline void ClearPage##uname(struct page *page)		\
+	{ clear_bit(PG_##lname, &policy(page, 1)->flags); }
+
+//  定义函数 PageUptodate
+CLEARPAGEFLAG(Uptodate, uptodate, PF_NO_TAIL)
+
+// 使用
+v9fs_write_begin
+	...
+	if (PageUptodate(page))
+		goto out;
+	...
+```
+
+flags 除了存放标志位，还存放zone编号
+![](./pic/64.jpg)
+```c
+// 将zone编号存放到page->flags
+static inline void set_page_zone(struct page *page, enum zone_type zone)
+{
+	page->flags &= ~(ZONES_MASK << ZONES_PGSHIFT);
+	page->flags |= (zone & ZONES_MASK) << ZONES_PGSHIFT;
+}
+
+// 根据page->flags获得 zone
+static inline struct zone *page_zone(const struct page *page)
+{
+	return &NODE_DATA(page_to_nid(page))->node_zones[page_zonenum(page)];
+}
+```
+
+## mapping
+如果page是 page cache， mapping 指向 address_space
+如果page是 匿名页面，mapping 指向 anon_vma
+
+address_space : 由于一个文件通常要占用多个page，而page之间是离散的，为了实现跨page的连续读写，内核将同个文件的page按照他们对于文件内容的顺序组合成radix tree，并用file->address_space记录这个tree，tree中的每个page->address_space反向指向 address_space这个句柄。
+![](./pic/31.jpg)
+
+anon_vma : 用于反向映射
+
+mapping的后两位还被用于判断page是匿名页面还是page cache
+```c
+#define PAGE_MAPPING_ANON	0x1
+#define PAGE_MAPPING_MOVABLE	0x2
+
+static __always_inline int PageAnon(struct page *page)
+{
+	page = compound_head(page);
+	return ((unsigned long)page->mapping & PAGE_MAPPING_ANON) != 0;
+}
+```
+
+## index
+page cache : 此page相对于文件的偏移
+anon page : 如果是私有页面，相对于vma的偏移，如果是共享页面，相对于0x0的虚拟地址的偏移
+
+## map_count refcount
+- refcount : 表示page数据结构的引用计数，当值为0时，page为空闲，或应该被回收。
+- map_count : 表示page对应物理页面的映射计数，即有多少pte对应此物理页面。为-1时表示没有被映射，为0表示只被父进程映射，map_count > 0 表示多个进程映射此页面
+
+对于 mapcount 和 refcount 应该使用内核的接口进行修改
+
+```c
+static inline void get_page(struct page *page);
+static inline void put_page(struct page *page);
+```
+
+## PG_locked
+PG_locked是 page->flags的标志位，用于实现页面锁
+lock_page ：申请锁，若失败则睡眠等待
+trylock_page : 申请锁，若失败则返回
+
+# 反向映射
+内存回收时，根据要释放的page，需要找到所有映射该page的pte，并解除映射关系。要找到pte就要知道对应的虚拟地址，而vma记录了虚拟地址，所以反向映射就是根据物理地址找到vma 
+
+## 第2版本的反向映射
+1. 父进程分配匿名页面
+```c
+// 父进程发生缺页中断，分配匿名页面，完成正向映射
+static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+	// 分配page 等
+	... 
+	// 建立方向映射
+	page_add_new_anon_rmap(page, vma, vmf->address, false);
+		// 设置map_count为0，表示此page只被一个进程映射
+		atomic_set(&page->_mapcount, 0);
+		__page_set_anon_rmap(page, vma, address/*虚拟地址*/, 1);
+			struct anon_vma *anon_vma = vma->anon_vma;
+			anon_vma = (void *) anon_vma + PAGE_MAPPING_ANON;
+			// 将 page->mapping指向 vma->anon_vma 是反向映射的关键
+			page->mapping = (struct address_space *) anon_vma;
+			// 对于私有匿名页面, page->index 表示相对于vma的偏移
+			page->index = linear_page_index(vma, address);
+				pgoff_t pgoff;
+				pgoff = (address - vma->vm_start) >> PAGE_SHIFT;
+				pgoff += vma->vm_pgoff;
+				return pgoff;
+```
+
+2. 父进程fork子进程
+```c
+```
 
 
