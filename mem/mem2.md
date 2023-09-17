@@ -945,6 +945,148 @@ static inline void __pmd_populate(pmd_t *pmdp, phys_addr_t pte,
 }
 ```
 
+# 如何遍历页表 wakl_pgd
+```c
+static void walk_pgd(struct pg_state *st, struct mm_struct *mm,
+			unsigned long start)
+{
+	pgd_t *pgd = pgd_offset(mm, 0UL); // 找到第一个 pgd项
+			pgd_offset_pgd((mm)->pgd, 0UL)
+				pgd + pgd_index(0UL);
+					pgd + (((a) >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1))
+	unsigned i;
+	unsigned long addr;
+
+#define PTRS_PER_PGD		2048        // 一共有 2048个pgd
+	for (i = 0; i < PTRS_PER_PGD; i++, pgd++) { // 遍历 pgd 表
+		addr = start + i * PGDIR_SIZE; // PGDIR_SIZE 是一个pgd项映射的虚拟空间大小
+									   // addr 为当前pgd项对应虚拟地址，偏移 start 字节
+			addr = start + i * (1UL << PGDIR_SHIFT);
+
+		if (!pgd_none(*pgd)) { // 这里恒为假
+			walk_p4d(st, pgd, addr); // 一定走这里
+		} else {
+			note_page(st, addr, 1, pgd_val(*pgd), NULL);
+		}
+	}
+}
+
+static void walk_p4d(struct pg_state *st, pgd_t *pgd, unsigned long start)
+{
+	p4d_t *p4d = p4d_offset(pgd, 0); // 对于ARM32为2级页表，不存在 p4d
+		return (p4d_t *)pgd;
+
+	unsigned long addr;
+	unsigned i;
+
+#define PTRS_PER_P4D		1
+	for (i = 0; i < PTRS_PER_P4D; i++, p4d++) {
+		addr = start + i * P4D_SIZE;
+		if (!p4d_none(*p4d)) {
+			walk_pud(st, p4d, addr);
+		} else {
+			note_page(st, addr, 2, p4d_val(*p4d), NULL);
+		}
+	}
+}
+
+static void walk_pud(struct pg_state *st, p4d_t *p4d, unsigned long start)
+{
+	pud_t *pud = pud_offset(p4d, 0);
+		return (pud_t *)p4d;
+
+	unsigned long addr;
+	unsigned i;
+
+#define PTRS_PER_PUD	1
+	for (i = 0; i < PTRS_PER_PUD; i++, pud++) {
+		addr = start + i * PUD_SIZE;
+		if (!pud_none(*pud)) {
+			walk_pmd(st, pud, addr);
+		} else {
+			note_page(st, addr, 3, pud_val(*pud), NULL);
+		}
+	}
+}
+
+static void walk_pmd(struct pg_state *st, pud_t *pud, unsigned long start)
+{
+	pmd_t *pmd = pmd_offset(pud, 0);
+		return (pmd_t *)pud;
+
+	unsigned long addr;
+	unsigned i;
+	const char *domain;
+
+#define PTRS_PER_PMD		1
+	for (i = 0; i < PTRS_PER_PMD; i++, pmd++) {
+		addr = start + i * PMD_SIZE;
+		domain = get_domain_name(pmd);
+		if (pmd_none(*pmd) || pmd_large(*pmd) || !pmd_present(*pmd))
+			note_page(st, addr, 4, pmd_val(*pmd), domain);
+		else
+			walk_pte(st, pmd, addr, domain);
+
+		if (SECTION_SIZE < PMD_SIZE && pmd_large(pmd[1])) {
+			addr += SECTION_SIZE;
+			pmd++;
+			domain = get_domain_name(pmd);
+			note_page(st, addr, 4, pmd_val(*pmd), domain);
+		}
+	}
+}
+
+static void walk_pte(struct pg_state *st, pmd_t *pmd, unsigned long start,
+		     const char *domain)
+{
+	pte_t *pte = pte_offset_kernel(pmd, 0);
+		return (pte_t *)pmd_page_vaddr(*pmd) + pte_index(address);
+			// pmd 就是 pgd， pgd的值高20位为 pte表的地址信息
+			// 此地址是物理地址，需要转成虚拟地址
+			return (pte_t *)__va(pmd_val(pmd) & PHYS_MASK & (s32)PAGE_MASK); + pte_index(address);
+				// 再根据目标虚拟地址高20位作为 pte表的索引值，相加得到pte项
+				return (pte_t *)__va(pmd_val(pmd) & PHYS_MASK & (s32)PAGE_MASK) +  \
+				(address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
+
+	unsigned long addr;
+	unsigned i;
+
+#define PTRS_PER_PTE		512 // pte表共有512项
+	for (i = 0; i < PTRS_PER_PTE; i++, pte++) {
+		addr = start + i * PAGE_SIZE; // 获得当前pte项对应的虚拟空间的基地址
+		note_page(st, addr, 5, pte_val(*pte), domain);
+	}
+}
+```
+
+## 如何根据虚拟地址找到对应的物理地址
+```c
+//首先获得mm, 虚拟地址addr
+
+// 获得管理此虚拟地址的pgd
+pgd_t *pgd;
+pgd = pgd_offset(mm, addr);
+
+// 获得 pmd
+p4d_t *p4d;
+p4d = p4d_offset(pdg, addr);
+
+pud_t *pud;
+pud = pud_offset(pdg, addr);
+
+pmd_t *pmd;
+pmd = pmd_offset(pdg, addr);
+
+
+// 使用 pte_offset_kernel 得到对应的pte项
+pte_t *ptep = pte_offset_kernel(pmd, addr);
+pte_t pte = READ_ONCE(*ptep);
+printk("pte : %X\n", pte_val(pte));
+
+// 计算物理地址
+unsigned int phys = ((pte_val(pte) >> PAGE_SHIFT) << PAGE_SHIFT) | (addr & ((1 << PAGE_SHIFT ) - 1));
+```
+
 # 内存的布局图
 思考：
 	32bit Linux中 ，内核空间线性映射的虚拟地址和物理地址是如何转换？
@@ -4751,5 +4893,6 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 2. 父进程fork子进程
 ```c
 ```
+
 
 
