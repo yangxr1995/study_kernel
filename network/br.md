@@ -21,7 +21,342 @@
 ## STP
 
 
-## VLAN
+# VLAN代码分析
+## 注册
+```c
+static int __init vlan_proto_init(void)
+```
+
+## send
+发送数据包最后调用 `dev->netdev_ops->ndo_start_xmit`
+
+```c
+int dev_queue_xmit(struct sk_buff *skb)
+	return __dev_queue_xmit(skb, NULL);
+		skb = dev_hard_start_xmit(skb, dev, txq, &rc);
+			rc = xmit_one(skb, dev, txq, next != NULL);
+				rc = netdev_start_xmit(skb, dev, txq, more);
+					rc = __netdev_start_xmit(ops, skb, dev, more);
+						return ops->ndo_start_xmit(skb, dev);
+```
+
+对于VLAN端口 netdev_ops 为 vlan_netdev_ops
+
+```c
+// 调用 vconfig add 添加vlan端口时，创建vlan dev
+static int vlan_ioctl_handler(struct net *net, void __user *arg)
+	case ADD_VLAN_CMD:
+		err = register_vlan_device(dev, args.u.VID);
+			new_dev = alloc_netdev(sizeof(struct vlan_dev_priv), name,
+					   NET_NAME_UNKNOWN, vlan_setup);
+				void vlan_setup(struct net_device *dev)
+					dev->netdev_ops = &vlan_netdev_ops;
+```
+
+vlan_netdev_ops.ndo_start_xmit 为 vlan_dev_hard_start_xmit
+
+注意，当接受vlan时，协议栈完成了对数据帧 vlan header的去除，
+
+并将vlan header的信息存放到 sk_buff 中 方便后续直接使用，
+
+所以此时数据帧是802_3帧，只需要考虑是否增加vlan header
+
+```c
+
+static netdev_tx_t vlan_dev_hard_start_xmit(struct sk_buff *skb,
+					    struct net_device *dev)
+	struct vlan_dev_priv *vlan = vlan_dev_priv(dev);
+	struct vlan_ethhdr *veth = (struct vlan_ethhdr *)(skb->data);
+	unsigned int len;
+	int ret;
+
+	// 有些情况需要加上vlan header
+	if (vlan->flags & VLAN_FLAG_REORDER_HDR ||
+	    veth->h_vlan_proto != vlan->vlan_proto) {
+		u16 vlan_tci;
+		vlan_tci = vlan->vlan_id;
+		vlan_tci |= vlan_dev_get_egress_qos_mask(dev, skb->priority);
+		__vlan_hwaccel_put_tag(skb, vlan->vlan_proto, vlan_tci);
+	}
+
+	// 使用真实的设备进行发送
+	skb->dev = vlan->real_dev;
+	len = skb->len;
+
+	ret = dev_queue_xmit(skb);
+
+	// 更新vlan 设备发包计数器
+	if (likely(ret == NET_XMIT_SUCCESS || ret == NET_XMIT_CN)) {
+		struct vlan_pcpu_stats *stats;
+
+		stats = this_cpu_ptr(vlan->vlan_pcpu_stats);
+		u64_stats_update_begin(&stats->syncp);
+		stats->tx_packets++;
+		stats->tx_bytes += len;
+		u64_stats_update_end(&stats->syncp);
+	} else {
+		this_cpu_inc(vlan->vlan_pcpu_stats->tx_dropped);
+	}
+
+	return ret;
+
+```
+## recv data
+vlan 的过滤是在 网卡驱动实现，或者在硬件实现
+
+```c
+static int process_backlog(struct napi_struct *napi, int quota)
+	__netif_receive_skb(skb);
+		ret = __netif_receive_skb_one_core(skb, false);
+			ret = __netif_receive_skb_core(&skb, pfmemalloc, &pt_prev);
+				// 当数据帧是带vlan header时，protocol 一定为 ETH_P_8021Q
+				// 将数据帧的vlan header信息提取到sk_buff
+				// 并去除数据帧vlan header
+				if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
+					skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
+					skb = skb_vlan_untag(skb);
+					if (unlikely(!skb))
+						goto out;
+				}
+
+				...
+
+				// 给所有嗅探器发送skb的拷贝
+				list_for_each_entry_rcu(ptype, &ptype_all, list) {
+					if (pt_prev)
+						ret = deliver_skb(skb, pt_prev, orig_dev);
+					pt_prev = ptype;
+				}
+
+				list_for_each_entry_rcu(ptype, &skb->dev->ptype_all, list) {
+					if (pt_prev)
+						ret = deliver_skb(skb, pt_prev, orig_dev);
+					pt_prev = ptype;
+				}
+
+				...
+
+				// 如果此skb 设置了vlan
+				// 则交给vlan_do_receive处理
+				if (skb_vlan_tag_present(skb)) {
+					if (pt_prev) {
+						ret = deliver_skb(skb, pt_prev, orig_dev);
+						pt_prev = NULL;
+					}
+					// 主要功能
+					// 根据vlan id  proto 找到 vlan设备, 这是个虚拟设备
+					// 并设置 skb->dev 为 vlan_dev
+					if (vlan_do_receive(&skb))
+						goto another_round;
+					else if (unlikely(!skb))
+						goto out;
+				}
+
+				// 如果是桥设备 rx_handler 不为NULL，
+				// 则调用 rx_headler 进行桥处理，如转发
+				rx_handler = rcu_dereference(skb->dev->rx_handler);
+				if (rx_handler) {
+					if (pt_prev) {
+						ret = deliver_skb(skb, pt_prev, orig_dev);
+						pt_prev = NULL;
+					}
+					switch (rx_handler(&skb)) {
+					case RX_HANDLER_CONSUMED:
+						ret = NET_RX_SUCCESS;
+						goto out;
+					case RX_HANDLER_ANOTHER:
+						goto another_round;
+					case RX_HANDLER_EXACT:
+						deliver_exact = true;
+					case RX_HANDLER_PASS:
+						break;
+					default:
+						BUG();
+					}
+				}
+
+				// 根据数据帧type字段，将skb传递给上层协议
+				type = skb->protocol;
+
+				// 只交给匹配type的协议
+				if (likely(!deliver_exact)) {
+					deliver_ptype_list_skb(skb, &pt_prev, orig_dev, type,
+								   &ptype_base[ntohs(type) &
+									   PTYPE_HASH_MASK]);
+				}
+
+```
+
+### skb_vlan_untag
+```c
+struct sk_buff *skb_vlan_untag(struct sk_buff *skb)
+
+	struct vlan_hdr *vhdr;
+	u16 vlan_tci;
+
+	// 如果 skb->vlan_present 已经设置了则直接返回
+	if (unlikely(skb_vlan_tag_present(skb))) {
+		/* vlan_tci is already set-up so leave this for another time */
+		return skb;
+	}
+
+	// 如果skb被共享，则克隆skb
+	skb = skb_share_check(skb, GFP_ATOMIC);
+
+	// 接下来要访问 vlan_hdr 空间，所以先确保skb有这些空间
+	/* We may access the two bytes after vlan_hdr in vlan_set_encap_proto(). */
+	if (unlikely(!pskb_may_pull(skb, VLAN_HLEN + sizeof(unsigned short))))
+		goto err_free;
+
+	vhdr = (struct vlan_hdr *)skb->data;
+
+	// 获得vlan id ，并记录到 skb
+	vlan_tci = ntohs(vhdr->h_vlan_TCI);
+	__vlan_hwaccel_put_tag(skb, skb->protocol, vlan_tci);
+		skb->vlan_proto = vlan_proto;
+		skb->vlan_tci = vlan_tci;
+		skb->vlan_present = 1;
+
+	// 移动skb->data += VLAN_HLEN, 并重新计算checksum
+	skb_pull_rcsum(skb, VLAN_HLEN);
+
+	// 设置上层协议 skb->protocol 比如 ETH_P_802_3
+	vlan_set_encap_proto(skb, vhdr);
+
+	// 重组数据帧，去除数据帧中vlan header
+	skb = skb_reorder_vlan_header(skb);
+
+	skb_reset_network_header(skb);
+	skb_reset_transport_header(skb);
+	skb_reset_mac_len(skb);
+
+	return skb;
+```
+
+####  skb_reorder_vlan_header
+```c
+static struct sk_buff *skb_reorder_vlan_header(struct sk_buff *skb)
+	// 拷贝skb，因为之后要修改数据缓存区，
+	// 所以分配内容包括sk_buff 和 数据缓存区
+	skb_cow(skb, skb_headroom(skb);
+
+	// 前面skb->data += VLAN_HLEN，所以当前 data指向 ether type域
+	// skb->mac_header 指向源MAC域
+	mac_len = skb->data - skb_mac_header(skb);
+	if (likely(mac_len > VLAN_HLEN + ETH_TLEN)) {
+		// 此时mac_len 包括 源MAC目的MAC域长度 +
+		//                  vlan header +    // 长度 VLAN_HLEN
+		//                  ETH type      // 长度 ETH_TLEN
+
+		// 将源MAC目的MAC复制到 skb->mac_header + VLAN_HLEN
+		// 也就是覆盖了 VLAN header
+		memmove(skb_mac_header(skb) + VLAN_HLEN, skb_mac_header(skb),
+			mac_len - VLAN_HLEN - ETH_TLEN);
+	}
+
+	meta_len = skb_metadata_len(skb);
+	if (meta_len) {
+		meta = skb_metadata_end(skb) - meta_len;
+		memmove(meta + VLAN_HLEN, meta, meta_len);
+	}
+	
+	skb->mac_header += VLAN_HLEN;
+
+	// 返回去除 vlan header的数据帧
+	return skb;
+```
+
+### vlan_do_receive
+```c
+bool vlan_do_receive(struct sk_buff **skbp)
+{
+	struct sk_buff *skb = *skbp;
+	__be16 vlan_proto = skb->vlan_proto;
+	// 获得vlan id
+	u16 vlan_id = skb_vlan_tag_get_id(skb);
+	struct net_device *vlan_dev;
+	struct vlan_pcpu_stats *rx_stats;
+
+	// 根据vlan id  proto 找到 vlan设备, 这是个虚拟设备
+	vlan_dev = vlan_find_dev(skb->dev, vlan_proto, vlan_id);
+	if (!vlan_dev)
+		return false;
+
+	// 如果skb被共享，则克隆skb
+	skb = *skbp = skb_share_check(skb, GFP_ATOMIC);
+	if (unlikely(!skb))
+		return false;
+
+	// 如果vlan设备没有开启则报错
+	if (unlikely(!(vlan_dev->flags & IFF_UP))) {
+		kfree_skb(skb);
+		*skbp = NULL;
+		return false;
+	}
+
+	// 将数据帧交给vlan 设备
+	skb->dev = vlan_dev;
+
+	// 驱动可能认为这个数据帧不是发给本机的，因为目的MAC不是真实设备MAC
+	// 但是可能是vlan的MAC，vlanMAC 可以和真实设备MAC不同
+	// 所以这里重新确定是否是发送给本机的
+	// 注意，默认情况新建的vlan 设备的mac和真实设备的mac一样
+	if (unlikely(skb->pkt_type == PACKET_OTHERHOST)) {
+		/* Our lower layer thinks this is not local, let's make sure.
+		 * This allows the VLAN to have a different MAC than the
+		 * underlying device, and still route correctly. */
+		if (ether_addr_equal_64bits(eth_hdr(skb)->h_dest, vlan_dev->dev_addr))
+			skb->pkt_type = PACKET_HOST;
+	}
+
+	// 如果vlan设备没有设置 VLAN_FLAG_REORDER_HDR 
+	// 并且不是 mac vlan
+	// 并且不是 桥端口
+	// 则将 vlan header 重新添加到 数据帧
+
+	// IFF_MACVLAN_PORT是Linux内核中用于虚拟化MAC地址的网络设备标志。它是一个常量，用于表示一个网络设备是MACVLAN端口。
+	// MACVLAN是一种虚拟网络设备，它允许在单个物理网络接口上创建多个虚拟接口，并为每个虚拟接口分配一个独立的MAC地址。这些虚拟接口可以像独立的网络接口一样进行配置和使用，但它们共享物理接口的网络连接。
+	// 当一个网络设备被标记为IFF_MACVLAN_PORT时，它表示该设备是一个MACVLAN端口，可以用于创建和管理MACVLAN接口。
+
+	if (!(vlan_dev_priv(vlan_dev)->flags & VLAN_FLAG_REORDER_HDR) &&
+	    !netif_is_macvlan_port(vlan_dev) &&
+	    !netif_is_bridge_port(vlan_dev)) {
+		unsigned int offset = skb->data - skb_mac_header(skb);
+
+		/*
+		 * vlan_insert_tag expect skb->data pointing to mac header.
+		 * So change skb->data before calling it and change back to
+		 * original position later
+		 */
+		skb_push(skb, offset);
+		// 添加vlan header到数据帧
+		skb = *skbp = vlan_insert_inner_tag(skb, skb->vlan_proto,
+						    skb->vlan_tci, skb->mac_len);
+		if (!skb)
+			return false;
+		skb_pull(skb, offset + VLAN_HLEN);
+		skb_reset_mac_len(skb);
+	}
+
+	// 根据vlan header的qos，设置skb->priority
+	skb->priority = vlan_get_ingress_priority(vlan_dev, skb->vlan_tci);
+
+	__vlan_hwaccel_clear_tag(skb);
+		skb->vlan_present = 0;
+
+	// 更新vlan设备的统计计数器
+	rx_stats = this_cpu_ptr(vlan_dev_priv(vlan_dev)->vlan_pcpu_stats);
+
+	u64_stats_update_begin(&rx_stats->syncp);
+	rx_stats->rx_packets++;
+	rx_stats->rx_bytes += skb->len;
+	if (skb->pkt_type == PACKET_MULTICAST)
+		rx_stats->rx_multicast++;
+	u64_stats_update_end(&rx_stats->syncp);
+
+	return true;
+}
+```
 
 
 # 桥接受skb代码分析
@@ -50,7 +385,7 @@ static int __init br_init(void)
 	brioctl_set(br_ioctl_deviceless_stub);
 ```
 
-# 核心数据结构
+## 核心数据结构
 ### net_bridge
 ```c
 struct net_bridge {

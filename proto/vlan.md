@@ -61,3 +61,26 @@ trunk的特点：
 # 典型应用
 ![](./pic/75.jpg)
 
+
+# linux设置vlan
+## vconfig
+添加vlan
+```shell
+vconfig add eth0 8
+```
+
+
+查看vlan
+```shell
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast qlen 1000
+    link/ether 52:54:00:12:34:56 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.3.10/24 brd 192.168.3.255 scope global eth0
+       valid_lft forever preferred_lft forever
+3: eth0.8@eth0: <BROADCAST,MULTICAST> mtu 1500 qdisc noop qlen 1000
+    link/ether 52:54:00:12:34:56 brd ff:ff:ff:ff:ff:ff
+```
+
+
+
+
+
