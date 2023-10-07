@@ -84,31 +84,31 @@ ASSURED : 带此标记的条目在内存不足时不会被删除, 因为他们�
 
 连接跟踪条目可以具有一系列不同的值，这些值在linux/include/netfilter-ipv4/ip_conntrack.h文件中的连接跟踪头文件中指定。这些值取决于我们使用的IP的子协议。TCP、UDP或ICMP协议在linux/include/netfilter-ipv4/ip_conntrack.h中指定了特定的默认值。我们将在查看每个协议时更详细地了解这一点；然而，在本章中，我们不会广泛使用它们，因为它们在连接跟踪内部之外不使用。此外，根据状态的更改方式，连接被销毁之前的默认时间值也会发生变化。
 
-可以通过使用/proc/sys/net/ipv4/netfilter目录中提供的特定系统调用来更改这些值。您应该特别关注/proc/net/netfilter/nf_conntrack_\*变量。
+可以通过使用/proc/sys/net/netfilter目录中提供的特定系统调用来更改这些值。您应该特别关注/proc/net/netfilter/nf_conntrack_\*变量。
 ```shell
-ls /proc/sys/net/ipv4/netfilter/ip_conntrack_*
-/proc/sys/net/ipv4/netfilter/ip_conntrack_buckets
-/proc/sys/net/ipv4/netfilter/ip_conntrack_checksum
-/proc/sys/net/ipv4/netfilter/ip_conntrack_count
-/proc/sys/net/ipv4/netfilter/ip_conntrack_generic_timeout
-/proc/sys/net/ipv4/netfilter/ip_conntrack_icmp_timeout
-/proc/sys/net/ipv4/netfilter/ip_conntrack_log_invalid
-/proc/sys/net/ipv4/netfilter/ip_conntrack_max
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_be_liberal
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_loose
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_max_retrans
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_close
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_close_wait
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_fin_wait
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_last_ack
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_max_retrans
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_syn_recv
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_syn_sent
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_syn_sent2
-/proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_time_wait
-/proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout
-/proc/sys/net/ipv4/netfilter/ip_conntrack_udp_timeout_stream
+ls /proc/sys/net/netfilter/ip_conntrack_*
+/proc/sys/net/netfilter/ip_conntrack_buckets
+/proc/sys/net/netfilter/ip_conntrack_checksum
+/proc/sys/net/netfilter/ip_conntrack_count
+/proc/sys/net/netfilter/ip_conntrack_generic_timeout
+/proc/sys/net/netfilter/ip_conntrack_icmp_timeout
+/proc/sys/net/netfilter/ip_conntrack_log_invalid
+/proc/sys/net/netfilter/ip_conntrack_max
+/proc/sys/net/netfilter/ip_conntrack_tcp_be_liberal
+/proc/sys/net/netfilter/ip_conntrack_tcp_loose
+/proc/sys/net/netfilter/ip_conntrack_tcp_max_retrans
+/proc/sys/net/netfilter/ip_conntrack_tcp_timeout_close
+/proc/sys/net/netfilter/ip_conntrack_tcp_timeout_close_wait
+/proc/sys/net/netfilter/ip_conntrack_tcp_timeout_established
+/proc/sys/net/netfilter/ip_conntrack_tcp_timeout_fin_wait
+/proc/sys/net/netfilter/ip_conntrack_tcp_timeout_last_ack
+/proc/sys/net/netfilter/ip_conntrack_tcp_timeout_max_retrans
+/proc/sys/net/netfilter/ip_conntrack_tcp_timeout_syn_recv
+/proc/sys/net/netfilter/ip_conntrack_tcp_timeout_syn_sent
+/proc/sys/net/netfilter/ip_conntrack_tcp_timeout_syn_sent2
+/proc/sys/net/netfilter/ip_conntrack_tcp_timeout_time_wait
+/proc/sys/net/netfilter/ip_conntrack_udp_timeout
+/proc/sys/net/netfilter/ip_conntrack_udp_timeout_stream
 ```
 
 当连接在两个方向上都收到流量时，连接跟踪条目将清除[UNREPLIED]标志，然后重新设置它。
