@@ -62,25 +62,105 @@ trunk的特点：
 ![](./pic/75.jpg)
 
 
-# linux设置vlan
-## vconfig
-添加vlan
+# 示例
+## 
+![](./pic/76.jpg)
+
+进入主机A
 ```shell
-vconfig add eth0 8
+# 添加vlan
+sudo ip link add link eth0 name eth0.10 type vlan id 10
+sudo ip link add link eth0 name eth0.20 type vlan id 20
+
+# 给vlan设备添加ip
+ip addr add 172.1.1.11/24 dev eth0.10
+ip addr add 172.1.1.22/24 dev eth0.20
+
+# 启动设备
+ip link set eth0 up
+ip link set eth0.10 up
+ip link set eth0.20 up
+
+# 添加路由
+ip route add 172.1.1.10/32 dev eth0.10
+ip route add 172.1.1.20/32 dev eth0.20
 ```
 
-
-查看vlan
+进入主机B
 ```shell
-2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast qlen 1000
-    link/ether 52:54:00:12:34:56 brd ff:ff:ff:ff:ff:ff
-    inet 192.168.3.10/24 brd 192.168.3.255 scope global eth0
-       valid_lft forever preferred_lft forever
-3: eth0.8@eth0: <BROADCAST,MULTICAST> mtu 1500 qdisc noop qlen 1000
-    link/ether 52:54:00:12:34:56 brd ff:ff:ff:ff:ff:ff
+# 添加vlan
+sudo ip link add link eth0 name eth0.10 type vlan id 10
+sudo ip link add link eth0 name eth0.20 type vlan id 20
+
+# 给vlan设备添加ip
+ip addr add 172.1.1.10/24 dev eth0.10
+ip addr add 172.1.1.20/24 dev eth0.20
+
+# 启动设备
+ip link set eth0 up
+ip link set eth0.10 up
+ip link set eth0.20 up
+
+# 先不添加路由
+# ip route add 172.1.1.11/32 dev eth0.10
+# ip route add 172.1.1.22/32 dev eth0.20
 ```
 
+测试
+```shell
+# 进入主机A
 
+# 可以收到回复 
+ping -I eth0.10 172.1.1.11
 
+# 不能收到
+ping -I eth0.10 172.1.1.22
+
+# 可以收到
+ping 172.1.1.22
+
+# 进入桥主机，抓包
+tcpdump -i tap0 -e
+
+04:11:53.721117 52:54:00:12:34:55 (oui Unknown) > 52:54:00:12:34:56 (oui Unknown), ethertype 802.1Q (0x8100), length 102: vlan 10, p 0, ethertype IPv4 (0x0800), 172-1-1-10.lightspeed.hstntx.sbcglobal.net > 172-1-1-22.lightspeed.hstntx.sbcglobal.net: ICMP echo reply, id 30976, seq 1, length 64
+04:11:54.724385 52:54:00:12:34:56 (oui Unknown) > 52:54:00:12:34:55 (oui Unknown), ethertype 802.1Q (0x8100), length 102: vlan 20, p 0, ethertype IPv4 (0x0800), 172-1-1-22.lightspeed.hstntx.sbcglobal.net > 172-1-1-10.lightspeed.hstntx.sbcglobal.net: ICMP echo request, id 30976, seq 2, length 64
+```
+可以发现发送的包带 vlan id 10，返回的包带 vlan id 20，
+
+回忆内核代码， vlan id 20 的回复包会查询 vlan id proto，发现接受设备为 eth0.20，但是ping程序绑定到 eth0.10，所以ping收不到响应
+
+解决方法在B主机添加路由，让回复对应vlan id 的设备回复
+```shell
+ip route add 172.1.1.11/32 dev eth0.10
+ip route add 172.1.1.22/32 dev eth0.20
+```
+
+对网络环境进行修改
+![](./pic/77.jpg)
+```shell
+#进入B主机
+ip link del eth0.10
+
+ip link add addr 172.1.1.10/24 dev eth0.20
+```
+
+测试
+```shell
+# 进入A主机,
+
+# 使用vlan id 10 ，不通
+ping -I eth0.10 172.1.1.10
+
+# 抓包，发现是主机B的eth口没有 vlan id 10，所以拒绝接受
+04:21:28.261424 52:54:00:12:34:56 (oui Unknown) > Broadcast, ethertype 802.1Q (0x8100), length 46: vlan 10, p 0, ethertype ARP (0x0806), Request who-has 172-1-1-10.lightspeed.hstntx.sbcglobal.net tell 172-1-1-11.lightspeed.hstntx.sbcglobal.net, length 28
+04:21:30.215406 52:54:00:12:34:56 (oui Unknown) > Broadcast, ethertype 802.1Q (0x8100), length 46: vlan 10, p 0, ethertype ARP (0x0806), Request who-has 172-1-1-10.lightspeed.hstntx.sbcglobal.net tell 172-1-1-11.lightspeed.hstntx.sbcglobal.net, length 28
+
+# 使用vlan id 20 ，
+ping -I eth0.20 172.1.1.10
+
+# 抓包
+04:25:52.998684 52:54:00:12:34:56 (oui Unknown) > 52:54:00:12:34:55 (oui Unknown), ethertype 802.1Q (0x8100), length 102: vlan 20, p 0, ethertype IPv4 (0x0800), 172-1-1-22.lightspeed.hstntx.sbcglobal.net > 172-1-1-10.lightspeed.hstntx.sbcglobal.net: ICMP echo request, id 32768, seq 3, length 64
+04:25:52.999921 52:54:00:12:34:55 (oui Unknown) > 52:54:00:12:34:56 (oui Unknown), ethertype 802.1Q (0x8100), length 102: vlan 20, p 0, ethertype IPv4 (0x0800), 172-1-1-10.lightspeed.hstntx.sbcglobal.net > 172-1-1-22.lightspeed.hstntx.sbcglobal.net: ICMP echo reply, id 32768, seq 3, length 64
+```
 
 

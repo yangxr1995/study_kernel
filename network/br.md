@@ -55,14 +55,11 @@ static int vlan_ioctl_handler(struct net *net, void __user *arg)
 
 vlan_netdev_ops.ndo_start_xmit 为 vlan_dev_hard_start_xmit
 
-注意，当接受vlan时，协议栈完成了对数据帧 vlan header的去除，
-
-并将vlan header的信息存放到 sk_buff 中 方便后续直接使用，
-
-所以此时数据帧是802_3帧，只需要考虑是否增加vlan header
-
 ```c
-
+// vlan发送数据帧时，数据帧来源要么是转发，要么是本机生成的，
+// 两种情况下，到此函数时，数据帧都绝不会带vlan header
+// 对于转发的数据帧，可能数据帧一开始带了vlan header，
+// 但是接受函数会去除vlan header，并标记到sk_buff中
 static netdev_tx_t vlan_dev_hard_start_xmit(struct sk_buff *skb,
 					    struct net_device *dev)
 	struct vlan_dev_priv *vlan = vlan_dev_priv(dev);
@@ -70,13 +67,13 @@ static netdev_tx_t vlan_dev_hard_start_xmit(struct sk_buff *skb,
 	unsigned int len;
 	int ret;
 
-	// 有些情况需要加上vlan header
+	// 通过vlan设备发送的数据帧，绝大部分都要加上vlan header
 	if (vlan->flags & VLAN_FLAG_REORDER_HDR ||
 	    veth->h_vlan_proto != vlan->vlan_proto) {
 		u16 vlan_tci;
 		vlan_tci = vlan->vlan_id;
 		vlan_tci |= vlan_dev_get_egress_qos_mask(dev, skb->priority);
-		__vlan_hwaccel_put_tag(skb, vlan->vlan_proto, vlan_tci);
+		__vlan_hwaccel_put_tag(skb, vlan->vlan_proto, vlan_tci); // 由网口实现加header
 	}
 
 	// 使用真实的设备进行发送
@@ -102,8 +99,10 @@ static netdev_tx_t vlan_dev_hard_start_xmit(struct sk_buff *skb,
 
 ```
 ## recv data
-vlan 的过滤是在 网卡驱动实现，或者在硬件实现
-
+接受数据包可能三种情况：
+1. 无vlan header
+2. 有vlan header 但是id不对
+3. 有vlan header id正确
 ```c
 static int process_backlog(struct napi_struct *napi, int quota)
 	__netif_receive_skb(skb);

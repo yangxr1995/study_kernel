@@ -67,6 +67,9 @@ ip route flush table main
 #       如果数据包有源地址，则不使用src指定的参数
 #       src 只作用于本机发出的数据包，且没有显示指定源地址
 ip route add 78.22.45.0/24 via 10.45.22.1 src 10.45.22.12
+
+# 修改mac
+ip link set eth0 addr 52:54:00:12:34:55
 ```
 
 ### 显示链路
@@ -357,3 +360,127 @@ default via 192.168.3.1 dev ens33 proto static metric 20100
 192.168.3.0/24 dev ens33 proto kernel scope link src 192.168.3.2 metric 100
 192.168.4.0/24 dev ens38 proto kernel scope link src 192.168.4.128 metric 101
 ```
+
+# 网络命名空间
+下面展示基于网络命名空间和VLAN的示例
+
+1. 增加虚拟网络命名空间
+```shell
+ip netns add net0
+```
+
+2. 显示所有的虚拟网络命名空间
+```shell
+ip netns list
+
+ls /var/run/netns
+```
+
+3. 进入虚拟机网络环境
+```shell
+ip netns exec net0 command
+```
+
+如
+打开虚拟网络环境net0的bash窗口
+```shell
+ip netns exec net0 bash
+```
+显示所有虚拟网络环境的设备
+```shell
+ip addr 
+```
+退出该虚拟网络环境
+```shell
+exit
+```
+
+4. 增加一对veth虚拟网卡
+```shell
+ip link add type veth
+
+ip link show
+13: veth0@veth1: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether f6:d1:08:40:29:1c brd ff:ff:ff:ff:ff:ff
+14: veth1@veth0: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether 76:81:60:aa:2d:a2 brd ff:ff:ff:ff:ff:ff
+
+# 删除veth0 veth1 虚拟网卡对
+ip link del veth0
+
+# 指定名称的方式添加
+ip link add veth01 type veth peer name veth10
+
+ip link show
+15: veth10@veth01: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether 9e:84:f1:d1:4b:37 brd ff:ff:ff:ff:ff:ff
+16: veth01@veth10: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether 62:d4:29:8d:53:9b brd ff:ff:ff:ff:ff:ff
+```
+
+5. 将veth0 添加到net0虚拟网络环境
+```shell
+ip link set veth0 netns net0
+```
+
+6. 将虚拟网卡eth1改名并添加到net1虚拟网络环境中
+```shell
+ip link set dev  veth1 name net1-bridge netns net1
+```
+
+7. 设置虚拟网络环境net0的veth0设备处于激活状态
+```shell
+ip netns exec net0 ip link set veth0 up
+```
+
+8. 为虚拟网络环境net0的veth0设备增加IP地址
+```shell
+ip netns exec net0 ip address add 10.0.1.1/24 dev veth0
+```
+
+# VLAN
+
+linux对vlan的实现效果和很多交换机有所不同，linux只实现了基础设施 802.1q，而交换机还在802.1q基础上实现了使用策略。
+
+下面解释linux对vlan的实现效果
+
+当使用vlan 设备发送时，发出的数据包一定会加上vlan header
+
+当接受数据包时，一个真实设备，如eth0，可以连接多个vlan 设备，每个vlan设备的id不同，
+
+所以在接受vlan数据包时，只要数据包的vlan id在eth0相关vlan设备的vlan id号内，则能接受，
+
+如果接受vlan数据包时，vlan id不在此范围内，则视为发送给其他主机的数据包，则丢弃。
+
+所以vlan id 相当于在 L2层多了一个地址域，即以前是只比较目的地址和mac地址，现在还要比较vlan id
+
+对于接受不带vlan的数据包时，由真实设备接受，但是需要注意，若主机使用了vlan，则发送响应包时会查询路由，
+
+可能路由的结果是通过 vlan 设备发送，所以响应包会带 vlan id，但接受方的网口没有添加对应vlan id 的设备，
+
+所以无法通信, 这时要么添加合适的路由，要么让接受方也使用vlan
+
+## 示例
+主机有网卡eth0
+```shell
+# 1. 保证eth0没有IP
+
+# 2. 添加vlan
+sudo ip link add link eth0 name eth0.10 type vlan id 10
+
+sudo ip link add link eth0 name eth0.20 type vlan id 20
+
+# 3. 给vlan设备添加ip
+ip addr add 172.1.1.10/24 dev eth0.10
+ip addr add 172.1.1.20/24 dev eth0.20
+
+# 4. 启动设备
+ip link set eth0 up
+ip link set eth0.10 up
+ip link set eth0.20 up
+
+# 5. 查看vlan
+cat /proc/net/vlan/config
+```
+
+
