@@ -441,89 +441,12 @@ struct net_bridge {
 	u16				group_fwd_mask_required;
 
 	/* STP */
-	bridge_id			designated_root;
-	bridge_id			bridge_id;
-	unsigned char			topology_change;
-	unsigned char			topology_change_detected;
-	u16				root_port;
-	unsigned long			max_age;
-	unsigned long			hello_time;
-	unsigned long			forward_delay;
-	unsigned long			ageing_time;
-	unsigned long			bridge_max_age;
-	unsigned long			bridge_hello_time;
-	unsigned long			bridge_forward_delay;
-	unsigned long			bridge_ageing_time;
-	u32				root_path_cost;
-
-	u8				group_addr[ETH_ALEN];
-
-	enum {
-		BR_NO_STP, 		/* no spanning tree */
-		BR_KERNEL_STP,		/* old STP in kernel */
-		BR_USER_STP,		/* new RSTP in userspace */
-	} stp_enabled;
-
-#ifdef CONFIG_BRIDGE_IGMP_SNOOPING
-
-	u32				hash_max;
-
-	u32				multicast_last_member_count;
-	u32				multicast_startup_query_count;
-
-	u8				multicast_igmp_version;
-	u8				multicast_router;
-#if IS_ENABLED(CONFIG_IPV6)
-	u8				multicast_mld_version;
-#endif
-	spinlock_t			multicast_lock;
-	unsigned long			multicast_last_member_interval;
-	unsigned long			multicast_membership_interval;
-	unsigned long			multicast_querier_interval;
-	unsigned long			multicast_query_interval;
-	unsigned long			multicast_query_response_interval;
-	unsigned long			multicast_startup_query_interval;
-
-	struct rhashtable		mdb_hash_tbl;
-	struct rhashtable		sg_port_tbl;
-
-	struct hlist_head		mcast_gc_list;
-	struct hlist_head		mdb_list;
-	struct hlist_head		router_list;
-
-	struct timer_list		multicast_router_timer;
-	struct bridge_mcast_other_query	ip4_other_query;
-	struct bridge_mcast_own_query	ip4_own_query;
-	struct bridge_mcast_querier	ip4_querier;
-	struct bridge_mcast_stats	__percpu *mcast_stats;
-#if IS_ENABLED(CONFIG_IPV6)
-	struct bridge_mcast_other_query	ip6_other_query;
-	struct bridge_mcast_own_query	ip6_own_query;
-	struct bridge_mcast_querier	ip6_querier;
-#endif /* IS_ENABLED(CONFIG_IPV6) */
-	struct work_struct		mcast_gc_work;
-#endif
-
-	struct timer_list		hello_timer;
-	struct timer_list		tcn_timer;
-	struct timer_list		topology_change_timer;
-	struct delayed_work		gc_work;
-	struct kobject			*ifobj;
-	u32				auto_cnt;
-
-#ifdef CONFIG_NET_SWITCHDEV
-	int offload_fwd_mark;
-#endif
-	struct hlist_head		fdb_list;
-
-#if IS_ENABLED(CONFIG_BRIDGE_MRP)
-	struct list_head		mrp_list;
-#endif
+	...
 };
 
 ```
 
-## net_bridge_port
+### net_bridge_port
 ```c
 struct net_bridge_port {
 	struct net_bridge		*br; // 端口所属的桥
@@ -647,16 +570,13 @@ static rx_handler_result_t br_handle_frame(struct sk_buff **pskb)
 	if (!is_valid_ether_addr(eth_hdr(skb)->h_source))
 		goto drop;
 
-	// net_bridge_port 为描述桥的数据结构
-	p = br_port_get_rcu(skb->dev);
-
 	// 如果 当前skb被共享 skb->users != 1
 	// 则克隆skb，并返回新的skb
 	skb = skb_share_check(skb, GFP_ATOMIC);
 
 	memset(skb->cb, 0, sizeof(struct br_input_skb_cb));
 
-	// 获得桥端口
+	// 获得桥端口, 即本网络设备做桥端口使用
 	p = br_port_get_rcu(skb->dev);
 
 	// 如果是link local数据包，比如 STP包
@@ -811,6 +731,7 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb
 
 		if (!mcast_hit)
 			// 不是组播，则当广播处理
+			// 比如收到单播，但是转发表没有找到目的端口，则广播
 			br_flood(br, skb, pkt_type, local_rcv, false);
 		else
 			// 组播
@@ -1046,3 +967,225 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 }
 ```
 
+## send data
+查询路由，使用br0设备发送数据包，最后调用 dev->ndo_start_xmit
+```c
+static const struct net_device_ops br_netdev_ops = {
+	.ndo_start_xmit		 = br_dev_xmit,
+```
+### br_dev_xmit
+```c
+netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct net_bridge *br = netdev_priv(dev);
+	struct net_bridge_fdb_entry *dst;
+	struct net_bridge_mdb_entry *mdst;
+	struct pcpu_sw_netstats *brstats = this_cpu_ptr(br->stats);
+	const struct nf_br_ops *nf_ops;
+	u8 state = BR_STATE_FORWARDING;
+	const unsigned char *dest;
+	u16 vid = 0;
+
+	memset(skb->cb, 0, sizeof(struct br_input_skb_cb));
+
+	// 当前不考虑nf，所以nf_ops默认为NULL
+	rcu_read_lock();
+	nf_ops = rcu_dereference(nf_br_ops);
+	if (nf_ops && nf_ops->br_dev_xmit_hook(skb)) {
+		rcu_read_unlock();
+		return NETDEV_TX_OK;
+	}
+	
+	// 更新br发送统计
+	u64_stats_update_begin(&brstats->syncp);
+	brstats->tx_packets++;
+	brstats->tx_bytes += skb->len;
+	u64_stats_update_end(&brstats->syncp);
+
+	br_switchdev_frame_unmark(skb);
+	BR_INPUT_SKB_CB(skb)->brdev = dev;
+	BR_INPUT_SKB_CB(skb)->frag_max_size = 0;
+
+	// 调整skb->mac_header 指向 skb->head
+	skb_reset_mac_header(skb);
+	// 减少数据，增加 headroom
+	// skb->data += ETH_HLEN; skb->len -= ETH_HLEN
+	skb_pull(skb, ETH_HLEN);
+
+	if (!br_allowed_ingress(br, br_vlan_group_rcu(br), skb, &vid, &state))
+		goto out;
+
+	if (IS_ENABLED(CONFIG_INET) &&
+	    (eth_hdr(skb)->h_proto == htons(ETH_P_ARP) ||
+	     eth_hdr(skb)->h_proto == htons(ETH_P_RARP)) &&
+	    br_opt_get(br, BROPT_NEIGH_SUPPRESS_ENABLED)) {
+		br_do_proxy_suppress_arp(skb, br, vid, NULL);
+	} else if (IS_ENABLED(CONFIG_IPV6) &&
+		   skb->protocol == htons(ETH_P_IPV6) &&
+		   br_opt_get(br, BROPT_NEIGH_SUPPRESS_ENABLED) &&
+		   pskb_may_pull(skb, sizeof(struct ipv6hdr) +
+				 sizeof(struct nd_msg)) &&
+		   ipv6_hdr(skb)->nexthdr == IPPROTO_ICMPV6) {
+			struct nd_msg *msg, _msg;
+
+			msg = br_is_nd_neigh_msg(skb, &_msg);
+			if (msg)
+				br_do_suppress_nd(skb, br, vid, NULL, msg);
+	}
+
+	dest = eth_hdr(skb)->h_dest;
+	if (is_broadcast_ether_addr(dest)) {
+		br_flood(br, skb, BR_PKT_BROADCAST, false, true);
+	} else if (is_multicast_ether_addr(dest)) {
+		if (unlikely(netpoll_tx_running(dev))) {
+			br_flood(br, skb, BR_PKT_MULTICAST, false, true);
+			goto out;
+		}
+		if (br_multicast_rcv(br, NULL, skb, vid)) {
+			kfree_skb(skb);
+			goto out;
+		}
+
+		mdst = br_mdb_get(br, skb, vid);
+		if ((mdst || BR_INPUT_SKB_CB_MROUTERS_ONLY(skb)) &&
+		    br_multicast_querier_exists(br, eth_hdr(skb)))
+			br_multicast_flood(mdst, skb, false, true);
+		else
+			br_flood(br, skb, BR_PKT_MULTICAST, false, true);
+	} else if ((dst = br_fdb_find_rcu(br, dest, vid)) != NULL) {  //查询转发端口
+		// 找到端口，单播发送 
+		br_forward(dst->dst, skb, false, true);
+	} else {
+		// 没有找到，广播发送
+		br_flood(br, skb, BR_PKT_UNICAST, false, true);
+	}
+out:
+	rcu_read_unlock();
+	return NETDEV_TX_OK;
+}
+```
+
+### br_forward
+```c
+void br_forward(const struct net_bridge_port *to,
+		struct sk_buff *skb, bool local_rcv, bool local_orig)
+{
+	if (unlikely(!to))
+		goto out;
+
+	/* redirect to backup link if the destination port is down */
+	// 如果转发端口无法使用，则考虑备用端口
+	if (rcu_access_pointer(to->backup_port) && !netif_carrier_ok(to->dev)) {
+		struct net_bridge_port *backup_port;
+
+		backup_port = rcu_dereference(to->backup_port);
+		if (unlikely(!backup_port))
+			goto out;
+		to = backup_port;
+	}
+
+	// 过滤掉不应该转发的情况，如转发端口是源端口，或者转发端口禁用
+	if (should_deliver(to, skb)) {
+		if (local_rcv)
+			deliver_clone(to, skb, local_orig);
+		else
+			__br_forward(to, skb, local_orig);
+		return;
+	}
+
+out:
+	if (!local_rcv)
+		kfree_skb(skb);
+}
+```
+
+### __br_forward
+```c
+static void __br_forward(const struct net_bridge_port *to,
+			 struct sk_buff *skb, bool local_orig)
+{
+	struct net_bridge_vlan_group *vg;
+	struct net_device *indev;
+	struct net *net;
+	int br_hook;
+
+	// 这可能是做交换机策略的vlan逻辑
+	vg = nbp_vlan_group_rcu(to);
+	skb = br_handle_vlan(to->br, to, vg, skb);
+	if (!skb)
+		return;
+
+	indev = skb->dev; // br0做源设备
+	skb->dev = to->dev; // eth0做输出设备
+	if (!local_orig) {
+		if (skb_warn_if_lro(skb)) {
+			kfree_skb(skb);
+			return;
+		}
+		br_hook = NF_BR_FORWARD;
+		skb_forward_csum(skb);
+		net = dev_net(indev);
+	} else {
+		if (unlikely(netpoll_tx_running(to->br->dev))) {
+			skb_push(skb, ETH_HLEN);
+			if (!is_skb_forwardable(skb->dev, skb))
+				kfree_skb(skb);
+			else
+				br_netpoll_send_skb(to, skb);
+			return;
+		}
+		br_hook = NF_BR_LOCAL_OUT;
+		net = dev_net(skb->dev);
+		indev = NULL;
+	}
+
+	NF_HOOK(NFPROTO_BRIDGE, br_hook,
+		net, NULL, skb, indev, skb->dev,
+		br_forward_finish);
+}
+```
+
+### br_forward_finish
+```c
+int br_forward_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+{
+	skb->tstamp = 0;
+	return NF_HOOK(NFPROTO_BRIDGE, NF_BR_POST_ROUTING,
+		       net, sk, skb, NULL, skb->dev,
+		       br_dev_queue_push_xmit);
+
+}
+```
+
+### br_dev_queue_push_xmit
+```c
+int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb)
+{
+	// 消耗ETH_HLEN headroom
+	skb_push(skb, ETH_HLEN);
+	if (!is_skb_forwardable(skb->dev, skb))
+		goto drop;
+
+	br_drop_fake_rtable(skb);
+
+	if (skb->ip_summed == CHECKSUM_PARTIAL &&
+	    (skb->protocol == htons(ETH_P_8021Q) ||
+	     skb->protocol == htons(ETH_P_8021AD))) {
+		int depth;
+
+		if (!vlan_get_protocol_and_depth(skb, skb->protocol, &depth))
+			goto drop;
+
+		skb_set_network_header(skb, depth);
+	}
+
+	// 使用端口设备进行发送, 先放入qdisc，最后调用驱动发送
+	dev_queue_xmit(skb);
+
+	return 0;
+
+drop:
+	kfree_skb(skb);
+	return 0;
+}
+```
