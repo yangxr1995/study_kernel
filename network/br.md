@@ -31,7 +31,8 @@ static int __init vlan_proto_init(void)
 发送数据包最后调用 `dev->netdev_ops->ndo_start_xmit`
 
 ```c
-int dev_queue_xmit(struct sk_buff *skb)
+... // 根据目的地址，源地址，设备，查询路由，确定使用vlan设备发送数据帧
+dev_queue_xmit(struct sk_buff *skb)
 	return __dev_queue_xmit(skb, NULL);
 		skb = dev_hard_start_xmit(skb, dev, txq, &rc);
 			rc = xmit_one(skb, dev, txq, next != NULL);
@@ -68,6 +69,7 @@ static netdev_tx_t vlan_dev_hard_start_xmit(struct sk_buff *skb,
 	int ret;
 
 	// 通过vlan设备发送的数据帧，绝大部分都要加上vlan header
+	// 内核不直接修改skb数据缓存区，而是在skb上标记vlan信息，由硬件添加vlan到数据包
 	if (vlan->flags & VLAN_FLAG_REORDER_HDR ||
 	    veth->h_vlan_proto != vlan->vlan_proto) {
 		u16 vlan_tci;
@@ -108,12 +110,22 @@ static int process_backlog(struct napi_struct *napi, int quota)
 	__netif_receive_skb(skb);
 		ret = __netif_receive_skb_one_core(skb, false);
 			ret = __netif_receive_skb_core(&skb, pfmemalloc, &pt_prev);
+
+another_round:
+				// 当开始 skb->dev 为真实设备，比如 eth0, 数据包为802.1q包
+				// 第二次运行到这里时，dev为vlan设备，且数据包为802.3包
+
+				skb->skb_iif = skb->dev->ifindex;
+
 				// 当数据帧是带vlan header时，protocol 一定为 ETH_P_8021Q
 				// 将数据帧的vlan header信息提取到sk_buff
 				// 并去除数据帧vlan header
 				if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
 					skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
 					skb = skb_vlan_untag(skb);
+						skb->vlan_tci = vlan_tci;
+						skb->vlan_present = 1; // vlan_present为1
+					                           // 表示skb有vlan信息待处理	
 					if (unlikely(!skb))
 						goto out;
 				}
@@ -121,6 +133,7 @@ static int process_backlog(struct napi_struct *napi, int quota)
 				...
 
 				// 给所有嗅探器发送skb的拷贝
+				// 所以本机无法抓到802.1q包
 				list_for_each_entry_rcu(ptype, &ptype_all, list) {
 					if (pt_prev)
 						ret = deliver_skb(skb, pt_prev, orig_dev);
@@ -135,7 +148,7 @@ static int process_backlog(struct napi_struct *napi, int quota)
 
 				...
 
-				// 如果此skb 设置了vlan
+				// skb->vlan_present == 1 
 				// 则交给vlan_do_receive处理
 				if (skb_vlan_tag_present(skb)) {
 					if (pt_prev) {
@@ -145,6 +158,8 @@ static int process_backlog(struct napi_struct *napi, int quota)
 					// 主要功能
 					// 根据vlan id  proto 找到 vlan设备, 这是个虚拟设备
 					// 并设置 skb->dev 为 vlan_dev
+					// 如果vlan id 没有找到对应的vlan设备，认为是发送给其他主机的，则返回false，丢弃此包
+					// 还有点很重要 skb->vlan_present 设置为 0, 如此返回true后，goto another_round， 
 					if (vlan_do_receive(&skb))
 						goto another_round;
 					else if (unlikely(!skb))
@@ -177,13 +192,27 @@ static int process_backlog(struct napi_struct *napi, int quota)
 				// 根据数据帧type字段，将skb传递给上层协议
 				type = skb->protocol;
 
-				// 只交给匹配type的协议
+				// 比较 ptype_base 中所有协议，将匹配的 packet_type 记录到 pt_prev
+				// 如果有多个匹配，则上传前一次匹配的结果
+				// 通常只有一个匹配，一般为 pt_prev = &ip_packet_type
+				// 所以这里不会进行上传数据包
 				if (likely(!deliver_exact)) {
 					deliver_ptype_list_skb(skb, &pt_prev, orig_dev, type,
 								   &ptype_base[ntohs(type) &
 									   PTYPE_HASH_MASK]);
 				}
 
+				if (pt_prev)
+					*ppt_prev = pt_prev;
+
+				*pskb = skb;
+				return ret;
+
+		// 返回到 __netif_receive_skb_one_core
+		if (pt_prev)
+			// 由于 pt_prev 为 ip_packet_type, 所以调用 ip_rcv
+			ret = INDIRECT_CALL_INET(pt_prev->func, ipv6_rcv, ip_rcv, skb,
+					 skb->dev, pt_prev, orig_dev);
 ```
 
 ### skb_vlan_untag
