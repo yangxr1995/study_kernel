@@ -885,3 +885,640 @@ skb_linearize : 将分片的小数据包组装成一个完整的大数据包
 skb_shinfo : 在skb中并没有指向skb_shared_info的指针，需要用 skb_shinfo 返回该指针
 
 
+# skb 使用分析
+## smsc911x_poll
+smsc911x 网卡接受skb
+```c
+/* return minimum truesize of one skb containing X bytes of data */
+#define SKB_TRUESIZE(X) ((X) +						\
+			 SKB_DATA_ALIGN(sizeof(struct sk_buff)) +	\
+			 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+
+static inline void skb_reset_tail_pointer(struct sk_buff *skb)
+{
+	skb->tail = skb->data;
+}
+
+// 调整headroom
+static inline void skb_reserve(struct sk_buff *skb, int len)
+{
+	skb->data += len;
+	skb->tail += len;
+}
+
+// add data to a buffer
+void *skb_put(struct sk_buff *skb, unsigned int len)
+{
+	void *tmp = skb_tail_pointer(skb);
+	SKB_LINEAR_ASSERT(skb);
+	skb->tail += len;
+	skb->len  += len;
+	if (unlikely(skb->tail > skb->end))
+		skb_over_panic(skb, len, __builtin_return_address(0));
+	return tmp;
+}
+
+#define skb_shinfo(SKB)	((struct skb_shared_info *)(skb_end_pointer(SKB)))
+
+static int smsc911x_poll(struct napi_struct *napi, int budget)
+
+		// 根据网卡寄存器获得 接受的数据包大小 pktlength
+		unsigned int rxstat = smsc911x_rx_get_rxstatus(pdata);
+		pktlength = ((rxstat & 0x3FFF0000) >> 16);
+
+		skb = netdev_alloc_skb(dev, pktwords << 2);
+
+		// 如果数据帧太小或太大则使用kmalloc分配
+		// 此处不考虑其他情况
+			if (len <= SKB_WITH_OVERHEAD(1024) ||
+				len > SKB_WITH_OVERHEAD(PAGE_SIZE) ||
+				(gfp_mask & (__GFP_DIRECT_RECLAIM | GFP_DMA)))
+				skb = __alloc_skb(len, gfp_mask, SKB_ALLOC_RX, NUMA_NO_NODE);
+					skb = kmem_cache_alloc_node(cache, gfp_mask & ~__GFP_DMA, node);
+					skb->truesize = SKB_TRUESIZE(size); // 整个skb真正占用的空间大小
+														// 包括 sk_buff 和 skb_shared_info 的大小和数据缓存区的大小(size)
+					refcount_set(&skb->users, 1); // 当前skb被一个任务引用
+
+					// head data tail end 都是指向数据缓存区的
+					// head 和 end 分别指向数据缓冲区首和尾
+					// data 和 tail 分别指向当前已确认的数据帧的首尾, 当前为0
+					// 其中 head 和 end 是固定的
+					// data 和 tail 是移动的
+					skb->head = data;
+					skb->data = data;
+					skb_reset_tail_pointer(skb);
+					skb->end = skb->tail + size;
+
+					// mac_header transport_header 为相对于head的偏移量
+					// 如 mac header的位置为 skb->head + skb->mac_header
+					//    transport header : skb->head + skb->transport_header
+					skb->mac_header = (typeof(skb->mac_header))~0U;
+					skb->transport_header = (typeof(skb->transport_header))~0U;
+
+					// shinfo 空间为end之后
+					// 当IP包分片时，分片skb记录到主 skb_shinfo(skb)
+					shinfo = skb_shinfo(skb);
+					memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+
+					// 主skb对分片的引用计数
+					atomic_set(&shinfo->dataref, 1);
+
+					return skb;
+
+		pktlength = ((rxstat & 0x3FFF0000) >> 16);
+		pktwords = (pktlength + NET_IP_ALIGN + 3) >> 2;
+
+		// 从网卡读取数据帧
+		pdata->ops->rx_readfifo(pdata,
+				 (unsigned int *)skb->data, pktwords);
+
+		/* Align IP on 16B boundary */
+		// eth header 是 14B,增加2B，对齐为 16B
+		// 即前面读取的数据帧前 2B 是多读的
+		skb_reserve(skb, NET_IP_ALIGN);
+
+		// skb增加数据, skb->len 表示数据缓存区中待解析的有效数据长度， 
+		//                       也就是 skb->data 到 skb->tail
+		// 				skb->data_len 表示数据缓存区中有效负荷长度
+		// pktlength - 4 应该是不考虑  校验尾
+		skb_put(skb, pktlength - 4);
+			skb->tail += len;
+			skb->len  += len;
+
+		skb->protocol = eth_type_trans(skb, dev);
+			// 记录skb 的输入设备
+			skb->dev = dev;
+			// 记录下mac header的位置
+			skb_reset_mac_header(skb);
+				// 也就是说 mac header 的位置为 skb->head + skb->mac_header
+				skb->mac_header = skb->data - skb->head;
+
+			// 开始解析eth header
+			// 获得eth header 并将 skb->len -= ETH_HLEN, skb->data += ETH_HLEN
+			// 表示待解析数据减少，并指向其他待解析数据的头
+			eth = (struct ethhdr *)skb->data;
+			skb_pull_inline(skb, ETH_HLEN);
+				return unlikely(len > skb->len) ? NULL : __skb_pull(skb, len);
+					skb->len -= len;
+					BUG_ON(skb->len < skb->data_len);
+					return skb->data += len;
+
+			// 比较帧目的MAC，确定数据包是发给谁的，
+			// 对于单播，如果开启了混淆模式，网卡会接受，
+			// 但这里会标记为 PACKET_OTHERHOST
+			if (unlikely(!ether_addr_equal_64bits(eth->h_dest,
+								  dev->dev_addr))) {
+				if (unlikely(is_multicast_ether_addr_64bits(eth->h_dest))) {
+					if (ether_addr_equal_64bits(eth->h_dest, dev->broadcast))
+						skb->pkt_type = PACKET_BROADCAST;
+					else
+						skb->pkt_type = PACKET_MULTICAST;
+				} else {
+					skb->pkt_type = PACKET_OTHERHOST;
+				}
+			}
+
+			// 返回payload协议，通常为 ETH_P_ARP / ETH_P_IP ... 
+			if (likely(eth_proto_is_802_3(eth->h_proto)))
+				return eth->h_proto;
+
+		// 推送给上层
+		netif_receive_skb(skb);
+
+		// 更新计数器
+		dev->stats.rx_packets++;
+		dev->stats.rx_bytes += (pktlength - 4);
+```
+
+推送给上层时，skb的情况如下
+
+* data : 指向eth帧的payload
+* len : 长度为eth帧payload的长度
+* data_len : 0
+* mac_header : 指向 eth header
+* data : 指向eth payload 开始
+* tail : 指向 eth payload 结尾
+* head : 指向 数据缓存区 开始
+* end : 指向 数据缓存区 结尾
+* protocol : ETH_P_ARP / ETH_P_IP 
+* pkt_type : PACKET_OTHERHOST/PACKET_HOST/PACKET_MULTICAST/PACKET_BROADCAST 
+
+## netif_receive_skb
+分析L2层 skb的变化
+
+```c
+netif_receive_skb(skb);
+static int __netif_receive_skb_one_core(struct sk_buff *skb, bool pfmemalloc)
+	struct net_device *orig_dev = skb->dev;
+	struct packet_type *pt_prev = NULL;
+
+	// 涉及 vlan brigde 这里不考虑
+	ret = __netif_receive_skb_core(&skb, pfmemalloc, &pt_prev);
+		skb_reset_network_header(skb);
+		skb_reset_transport_header(skb);
+		skb_reset_mac_len(skb);
+
+		skb->skb_iif = skb->dev->ifindex;
+
+		type = skb->protocol;
+
+		// 查询skb->protocol 对于的 packet_type
+		if (likely(!deliver_exact)) {
+			deliver_ptype_list_skb(skb, &pt_prev, orig_dev, type,
+						   &ptype_base[ntohs(type) &
+							   PTYPE_HASH_MASK]);
+		}
+		*ppt_prev = pt_prev;
+
+	// 假设走 ip_rcv
+	if (pt_prev)
+		ret = INDIRECT_CALL_INET(pt_prev->func, ipv6_rcv, ip_rcv, skb,
+					 skb->dev, pt_prev, orig_dev);
+```
+
+可见如果不是802.3q，则skb没有大的变化
+
+## ip_rcv
+```c
+
+static inline unsigned int skb_headlen(const struct sk_buff *skb)
+{
+	// len 正在解析的有效数据长度，data_len为payload长度
+	return skb->len - skb->data_len;
+}
+
+// 检查是否有足够的 headlen
+// 调用这个函数说明要从 headlen中解析 header了，header的长度为 len
+static inline bool pskb_may_pull(struct sk_buff *skb, unsigned int len)
+{
+	// 通常情况都有足够的空间已解析 header
+	if (likely(len <= skb_headlen(skb)))
+		return true;
+	if (unlikely(len > skb->len))
+		return false;
+
+	// 不考虑这情况
+	return __pskb_pull_tail(skb, len - skb_headlen(skb)) != NULL;
+}
+
+int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
+	   struct net_device *orig_dev)
+{
+	struct net *net = dev_net(dev);
+
+	skb = ip_rcv_core(skb, net); // 对iphdr进行解析，并过滤掉畸形的包
+		// 对于单播，如果数据帧目的MAC不是自己，则丢弃
+		if (skb->pkt_type == PACKET_OTHERHOST)
+			goto drop;
+
+		// 可能克隆
+		skb = skb_share_check(skb, GFP_ATOMIC);
+
+		// 确定有足够带解析header空间，够用于解析 iphdr
+		if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+			goto inhdr_error;
+
+		iph = ip_hdr(skb);
+
+		if (iph->ihl < 5 || iph->version != 4)
+			goto inhdr_error;
+
+		if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl)))
+			goto csum_error;
+
+		// IP 头是可变长的，所以iphdr->tot_len 表示真个IP头的实际长度
+		len = ntohs(iph->tot_len);
+		if (skb->len < len) {
+			__IP_INC_STATS(net, IPSTATS_MIB_INTRUNCATEDPKTS);
+			goto drop;
+		} else if (len < (iph->ihl*4))
+			goto inhdr_error;
+
+		iph = ip_hdr(skb);
+
+		skb->transport_header = skb->network_header + iph->ihl*4;
+
+		return skb;
+
+	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING,
+		       net, NULL, skb, dev, NULL,
+		       ip_rcv_finish);
+}
+```
+
+此时 skb 的情况如下
+* len : 长度为eth帧payload的长度
+* data_len : 0
+* mac_header : 指向 eth header
+* data : 指向 eth payload 开始, 比如 iphdr 开始
+* tail : 指向 eth payload 结尾
+* head : 指向 数据缓存区 开始
+* end : 指向 数据缓存区 结尾
+* protocol : ETH_P_ARP / ETH_P_IP 
+* pkt_type : PACKET_OTHERHOST/PACKET_HOST/PACKET_MULTICAST/PACKET_BROADCAST 
+* transport_header : network_header + iph->ihl\*4
+* network_header : skb->head + skb->network_header 为 iphdr
+
+### ip_rcv_finish
+
+```c
+static int ip_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+{
+	struct net_device *dev = skb->dev;
+	int ret;
+
+	/* if ingress device is enslaved to an L3 master device pass the
+	 * skb to its handler for processing
+	 */
+	skb = l3mdev_ip_rcv(skb);
+	if (!skb)
+		return NET_RX_SUCCESS;
+
+	ret = ip_rcv_finish_core(net, sk, skb, dev, NULL);
+	if (ret != NET_RX_DROP)
+		ret = dst_input(skb);
+	return ret;
+}
+```
+
+```c
+static int ip_rcv_finish_core(struct net *net, struct sock *sk,
+			      struct sk_buff *skb, struct net_device *dev,
+			      const struct sk_buff *hint)
+{
+	const struct iphdr *iph = ip_hdr(skb);
+	struct rtable *rt;
+	int err;
+
+	// 此时hint为NULL，因该是根据以前的skb进行加速路由的
+	if (ip_can_use_hint(skb, iph, hint)) {
+		err = ip_route_use_hint(skb, iph->daddr, iph->saddr, iph->tos,
+					dev, hint);
+		if (unlikely(err))
+			goto drop_error;
+	}
+
+	// 对 LOCAL_INPUT 的 TCP UDP 数据包进行提前分流
+	//
+	// 本地套接字的输入数据包处理涉及两个主要的分流过程。一个是用于路由的分流，另一个是用于套接字的分流。
+	// 但是，对于某些特定类型的本地套接字，我们可以将这个过程优化为只进行一次分流。
+	// 目前，我们只对已建立的TCP套接字执行此操作，但至少在理论上，它可以扩展到其他类型的连接。
+	// linux默认开启此功能
+	// 如果作用路由器使用，可以关闭此功能
+	if (READ_ONCE(net->ipv4.sysctl_ip_early_demux) &&
+	    !skb_dst(skb) &&
+	    !skb->sk &&
+	    !ip_is_fragment(iph)) {
+		switch (iph->protocol) {
+		case IPPROTO_TCP:
+			if (READ_ONCE(net->ipv4.sysctl_tcp_early_demux)) {
+				tcp_v4_early_demux(skb);
+
+				/* must reload iph, skb->head might have changed */
+				iph = ip_hdr(skb);
+			}
+			break;
+		case IPPROTO_UDP:
+			if (READ_ONCE(net->ipv4.sysctl_udp_early_demux)) {
+				err = udp_v4_early_demux(skb);
+				if (unlikely(err))
+					goto drop_error;
+
+				/* must reload iph, skb->head might have changed */
+				iph = ip_hdr(skb);
+			}
+			break;
+		}
+	}
+
+	/*
+	 *	Initialise the virtual path cache for the packet. It describes
+	 *	how the packet travels inside Linux networking.
+	 */
+	// 如果skb没有合法的dst则查询路由
+	if (!skb_valid_dst(skb)) {
+		err = ip_route_input_noref(skb, iph->daddr, iph->saddr,
+					   iph->tos, dev);
+			// 查询路由也决定下一步
+			rt->dst.output = ip_output;
+			if (flags & RTCF_LOCAL)
+				rt->dst.input = ip_local_deliver;
+
+		if (unlikely(err))
+			goto drop_error;
+	} else {
+		struct in_device *in_dev = __in_dev_get_rcu(dev);
+
+		if (in_dev && IN_DEV_ORCONF(in_dev, NOPOLICY))
+			IPCB(skb)->flags |= IPSKB_NOPOLICY;
+	}
+
+	// 解析 iphdr options
+	if (iph->ihl > 5 && ip_rcv_options(skb, dev))
+		goto drop;
+
+	rt = skb_rtable(skb);
+	if (rt->rt_type == RTN_MULTICAST) {
+		__IP_UPD_PO_STATS(net, IPSTATS_MIB_INMCAST, skb->len);
+	} else if (rt->rt_type == RTN_BROADCAST) {
+		__IP_UPD_PO_STATS(net, IPSTATS_MIB_INBCAST, skb->len);
+	} else if (skb->pkt_type == PACKET_BROADCAST ||
+		   skb->pkt_type == PACKET_MULTICAST) {
+		struct in_device *in_dev = __in_dev_get_rcu(dev);
+
+		if (in_dev &&
+		    IN_DEV_ORCONF(in_dev, DROP_UNICAST_IN_L2_MULTICAST))
+			goto drop;
+	}
+
+	return NET_RX_SUCCESS;
+
+drop:
+	kfree_skb(skb);
+	return NET_RX_DROP;
+
+drop_error:
+	if (err == -EXDEV)
+		__NET_INC_STATS(net, LINUX_MIB_IPRPFILTER);
+	goto drop;
+}
+```
+
+此时skb 主要加了 dst
+
+### ip_local_deliver
+```c
+int ip_local_deliver(struct sk_buff *skb)
+{
+	/*
+	 *	Reassemble IP fragments.
+	 */
+	struct net *net = dev_net(skb->dev);
+
+	if (ip_is_fragment(ip_hdr(skb))) {
+		if (ip_defrag(net, skb, IP_DEFRAG_LOCAL_DELIVER))
+			return 0;
+	}
+
+	return NF_HOOK(NFPROTO_IPV4, NF_INET_LOCAL_IN,
+		       net, NULL, skb, skb->dev, NULL,
+		       ip_local_deliver_finish);
+}
+
+static inline u32 skb_network_header_len(const struct sk_buff *skb)
+{
+	return skb->transport_header - skb->network_header;
+}
+
+static inline void *__skb_pull(struct sk_buff *skb, unsigned int len)
+{
+	skb->len -= len;
+	BUG_ON(skb->len < skb->data_len);
+	return skb->data += len;
+}
+
+static int ip_local_deliver_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+{
+	// skb->network_header 和 skb->transport_header 都在正确位置
+	// 所以 skb_network_header_len(skb) 得到真实的 iphdr头部 为 len
+	// 而 skb->data当前指向 iphdr
+	// skb->data += len; skb->len -= len;
+	// 让 skb->data 指向transport_header, 正在解析的数据长度减少
+	__skb_pull(skb, skb_network_header_len(skb));
+
+	rcu_read_lock();
+	ip_protocol_deliver_rcu(net, skb, ip_hdr(skb)->protocol);
+	rcu_read_unlock();
+
+	return 0;
+}
+
+void ip_protocol_deliver_rcu(struct net *net, struct sk_buff *skb, int protocol)
+{
+	const struct net_protocol *ipprot;
+	int raw, ret;
+
+resubmit:
+	// 发送给原始套接字
+	raw = raw_local_deliver(skb, protocol);
+
+	// 根据传输协议号找到上级协议
+	ipprot = rcu_dereference(inet_protos[protocol]);
+	if (ipprot) {
+		if (!ipprot->no_policy) {
+			if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+				kfree_skb(skb);
+				return;
+			}
+			nf_reset_ct(skb);
+		}
+		// 调用对应的处理函数
+		ret = INDIRECT_CALL_2(ipprot->handler, tcp_v4_rcv, udp_rcv,
+				      skb);
+		if (ret < 0) {
+			protocol = -ret;
+			goto resubmit;
+		}
+		__IP_INC_STATS(net, IPSTATS_MIB_INDELIVERS);
+	} else {
+		if (!raw) {
+			if (xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+				__IP_INC_STATS(net, IPSTATS_MIB_INUNKNOWNPROTOS);
+				icmp_send(skb, ICMP_DEST_UNREACH,
+					  ICMP_PROT_UNREACH, 0);
+			}
+			kfree_skb(skb);
+		} else {
+			__IP_INC_STATS(net, IPSTATS_MIB_INDELIVERS);
+			consume_skb(skb);
+		}
+	}
+}
+```
+
+此时 skb 的情况如下
+* len : 长度为ip层payload的长度, 就是整个 transport header + body
+* data_len : 0
+* mac_header : 指向 eth header
+* data : 指向 transport_header
+* tail : 指向 transport body结尾
+* head : 指向 数据缓存区 开始
+* end : 指向 数据缓存区 结尾
+* protocol : TCP UDP ICMP
+* pkt_type : PACKET_HOST/PACKET_MULTICAST/PACKET_BROADCAST 
+* transport_header : network_header + iph->ihl\*4
+* network_header : skb->head + skb->network_header 为 iphdr
+
+## 传输层
+### udp_rcv
+```c
+int udp_rcv(struct sk_buff *skb)
+{
+	return __udp4_lib_rcv(skb, &udp_table, IPPROTO_UDP);
+}
+
+int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+		   int proto)
+{
+	struct sock *sk;
+	struct udphdr *uh;
+	unsigned short ulen;
+	struct rtable *rt = skb_rtable(skb);
+	__be32 saddr, daddr;
+	struct net *net = dev_net(skb->dev);
+	bool refcounted;
+
+	/*
+	 *  Validate the packet.
+	 */
+	// 确保L4层待解析数据有 udphdr 大小
+	if (!pskb_may_pull(skb, sizeof(struct udphdr)))
+		goto drop;		/* No space for header. */
+
+	// 当前 skb->data 指向 transport_header, 解析 UDP头
+	uh   = udp_hdr(skb);
+	ulen = ntohs(uh->len); // ulen包括udp header 和 body的长度
+	saddr = ip_hdr(skb)->saddr;
+	daddr = ip_hdr(skb)->daddr;
+
+	// 如果udp长度大于当前skb中transport层的长度，则说明被分片了
+	// UDP没有重组功能，本应该由IP实现，所以IP应该给完整的包，
+	// 所以UDP若收到不完整的包，就只能丢弃	
+	if (ulen > skb->len)
+		goto short_packet;
+
+	if (proto == IPPROTO_UDP) {
+		/* UDP validates ulen. */
+		// 过滤非法包,并修剪udp，重新获得udp header
+		if (ulen < sizeof(*uh) || pskb_trim_rcsum(skb, ulen))
+			goto short_packet;
+		uh = udp_hdr(skb);
+	}
+
+	if (udp4_csum_init(skb, uh, proto))
+		goto csum_error;
+
+	// 如果skb已经接受 sock ，则直接返回
+	sk = skb_steal_sock(skb, &refcounted);
+			if (skb->sk) {
+				struct sock *sk = skb->sk;
+
+				*refcounted = true;
+				if (skb_sk_is_prefetched(skb))
+					*refcounted = sk_is_refcounted(sk);
+				skb->destructor = NULL;
+				skb->sk = NULL;
+				return sk;
+			}
+			*refcounted = false;
+			return NULL;
+
+	if (sk) {
+		// 如果有关联的sock则将skb加入sock的接受队列
+		struct dst_entry *dst = skb_dst(skb);
+		int ret;
+
+		if (unlikely(rcu_dereference(sk->sk_rx_dst) != dst))
+			udp_sk_rx_dst_set(sk, dst);
+
+		ret = udp_unicast_rcv_skb(sk, skb, uh);
+		if (refcounted)
+			sock_put(sk);
+		return ret;
+	}
+
+	if (rt->rt_flags & (RTCF_BROADCAST|RTCF_MULTICAST))
+		return __udp4_lib_mcast_deliver(net, skb, uh,
+						saddr, daddr, udptable, proto);
+
+	// 根据端口找目的的sock, 找到了就发给sock
+	sk = __udp4_lib_lookup_skb(skb, uh->source, uh->dest, udptable);
+	if (sk)
+		return udp_unicast_rcv_skb(sk, skb, uh);
+
+	// 没有找到，报错
+
+	if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
+		goto drop;
+	nf_reset_ct(skb);
+
+	/* No socket. Drop packet silently, if checksum is wrong */
+	if (udp_lib_checksum_complete(skb))
+		goto csum_error;
+
+	__UDP_INC_STATS(net, UDP_MIB_NOPORTS, proto == IPPROTO_UDPLITE);
+	icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
+
+	/*
+	 * Hmm.  We got an UDP packet to a port to which we
+	 * don't wanna listen.  Ignore it.
+	 */
+	kfree_skb(skb);
+	return 0;
+
+short_packet:
+	net_dbg_ratelimited("UDP%s: short packet: From %pI4:%u %d/%d to %pI4:%u\n",
+			    proto == IPPROTO_UDPLITE ? "Lite" : "",
+			    &saddr, ntohs(uh->source),
+			    ulen, skb->len,
+			    &daddr, ntohs(uh->dest));
+	goto drop;
+
+csum_error:
+	/*
+	 * RFC1122: OK.  Discards the bad packet silently (as far as
+	 * the network is concerned, anyway) as per 4.1.3.4 (MUST).
+	 */
+	net_dbg_ratelimited("UDP%s: bad checksum. From %pI4:%u to %pI4:%u ulen %d\n",
+			    proto == IPPROTO_UDPLITE ? "Lite" : "",
+			    &saddr, ntohs(uh->source), &daddr, ntohs(uh->dest),
+			    ulen);
+	__UDP_INC_STATS(net, UDP_MIB_CSUMERRORS, proto == IPPROTO_UDPLITE);
+drop:
+	__UDP_INC_STATS(net, UDP_MIB_INERRORS, proto == IPPROTO_UDPLITE);
+	kfree_skb(skb);
+	return 0;
+}
+```
+
+

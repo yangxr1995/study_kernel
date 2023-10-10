@@ -9,10 +9,13 @@ L3层有很多协议，其中使用最多的是IP协议
 3. IP选项处理
 
 4. 数据的分片和重组
+
 IP协议头描述数据包长度的数据域为16位，所以IP数据包最大为64KB，
+
 但由于网络设备有MTU，所以IP协议需要对数据包进行分片和重组
 
 5. 发送转发接受
+
 在IP层处理数据包分为接受，转发，发送，每一类由不同的IP协议函数处理
 
 ## IP协议头
@@ -68,17 +71,14 @@ static int __init inet_init(void)
 	...
 }
 
-static struct packet_type ip_packet_type = {
-	.type = __constant_htons(ETH_P_IP),
+static struct packet_type ip_packet_type __read_mostly = {
+	.type = cpu_to_be16(ETH_P_IP),
 	.func = ip_rcv,
-	.gso_send_check = inet_gso_send_check,
-	.gso_segment = inet_gso_segment,
-	.gro_receive = inet_gro_receive,
-	.gro_complete = inet_gro_complete,
+	.list_func = ip_list_rcv,
 };
 ```
 
-IP协议处理数据时，会多出调用网络过滤子系统和路由子系统。
+IP协议处理数据时，会调用网络过滤子系统和路由子系统。
 
 ## 与网络过滤子系统的交互
 网络过滤子系统在TCP/IP协议栈出现的场合有：
@@ -88,6 +88,7 @@ IP协议处理数据时，会多出调用网络过滤子系统和路由子系统
 * 发送数据包
 
 上面的每一处，相应的协议处理函数都分两个阶段
+
 第一阶段函数为 do_something(如 ip_rcv) ，do_something只对数据包做必要的合法性检测，或为数据包预留需要的内存空间。
 
 第二阶段函数为 do_something_finish(如 ip_rcv_finish), 是实际完成接受/发送的函数，在do_something完成对数据包合法性检测并预留空间后，在函数结束返回时调用网络过滤子系统的回调函数 NF_HOOK 来对网络数据包进行安全性检查。该回调函数的参数之一就是：当前是哪个功能点处调用的网络过滤回调函数（接受数据包时，还是发送数据包时）。
@@ -95,10 +96,24 @@ IP协议处理数据时，会多出调用网络过滤子系统和路由子系统
 如果用户使用iptables配置了过滤规则，则会执行过滤回调函数，否则，就跳过数据包过滤，直接执行do_something_finish
 
 网络过滤子系统回调函数的格式为：
+
 ```c
 NF_HOOK(pf /*协议*/, hook /*hook点*/, 
 	skb /*被检查的数据包*/, indev /*输入设备的index*/, 
 	outdev /*输出设备*/, okfn /*通过过滤后调用的函数*/) 
+
+static inline int
+NF_HOOK(uint8_t pf, unsigned int hook, struct net *net, struct sock *sk,
+	struct sk_buff *skb, struct net_device *in, struct net_device *out,
+	int (*okfn)(struct net *, struct sock *, struct sk_buff *))
+{
+	return okfn(net, sk, skb);
+}
+
+// 示例
+	return NF_HOOK(NFPROTO_IPV4, NF_INET_FORWARD,
+		       net, NULL, skb, skb->dev, rt->dst.dev,
+		       ip_forward_finish);
 ```
 NF_HOOK 的输出可以以下情况
 * 执行 okfn : 如果数据通过安全检查
@@ -107,17 +122,17 @@ NF_HOOK 的输出可以以下情况
 
 ## 与路由子系统的交互
 这里介绍在IP层用到查询路由表的API：
-* ip_route_input : 根据输入数据包的目的地址，确认是否接受，转发，或扔掉
 
-* ip_route_output_flow : 在发送一个数据包之前使用，该函数返回数据包发送路径中下一跳的网关IP和发送数据包的网络设备
+* ip_route_input : 接受数据包时调用，根据输入数据包的目的地址，确认是否接受，转发，或扔掉
 
-* dst_pmtu : 该函数的输入参数为路由表入口，返回数据包发送路径上最大传输单元MTU
+* ip_route_output_flow : 发送/转发时调用，该函数返回数据包发送路径中网关IP(根据网关IP查询邻居子系统获得下一跳MAC)和发送数据包的网络设备
+
+~~dst_pmtu : 该函数的输入参数为路由表入口，返回数据包发送路径上最大传输单元MTU~~
 
 对路由表查询的结果保存在 skb->dst 
 
-
 # 输入数据包在IP层的处理
-## ip_rcv
+## 从L2到L3
 数据链路层调用 netif_receive_skb 上传数据包， netif_receive_skb 会根据 skb->protocol 查询 ptype_base 哈希表，遍历执行哈希链上的 packet_type->func，对于IP协议就是 ip_rcv
 
 skb 随着数据包分析时，结构体变化
@@ -159,7 +174,6 @@ net_rx
 		}
 		...
 
-
 ```
 ![](./pic/32.jpg)
 
@@ -175,6 +189,123 @@ netif_receive_skb
 ```
 所以当IP层接受数据包时，socket buffer结构如下 
 ![](./pic/33.jpg)
+
+## ip_rcv
+```c
+int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
+	   struct net_device *orig_dev)
+{
+	struct net *net = dev_net(dev);
+
+	skb = ip_rcv_core(skb, net);
+	if (skb == NULL)
+		return NET_RX_DROP;
+
+	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING,
+		       net, NULL, skb, dev, NULL,
+		       ip_rcv_finish);
+}
+```
+
+### ip_rcv_core
+```c
+static struct sk_buff *ip_rcv_core(struct sk_buff *skb, struct net *net)
+{
+	const struct iphdr *iph;
+	u32 len;
+
+	/* When the interface is in promisc. mode, drop all the crap
+	 * that it receives, do not try to analyse it.
+	 */
+	// 通常网卡会过滤掉和自己MAC地址不匹配的数据包
+	// 但开启混淆模式后，网卡会接受所有数据包，主要为了给嗅探器，
+	// 所以IP协议需要自己过滤掉MAC地址和自己不匹配的数据包
+	if (skb->pkt_type == PACKET_OTHERHOST)
+		goto drop;
+
+	// 更新信息，为了SNMP协议
+	__IP_UPD_PO_STATS(net, IPSTATS_MIB_IN, skb->len);
+
+	// 如果skb被共享，则克隆
+	skb = skb_share_check(skb, GFP_ATOMIC);
+	if (!skb) {
+		__IP_INC_STATS(net, IPSTATS_MIB_INDISCARDS);
+		goto out;
+	}
+
+	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+		goto inhdr_error;
+
+	iph = ip_hdr(skb);
+
+	/*
+	 *	RFC1122: 3.2.1.2 MUST silently discard any IP frame that fails the checksum.
+	 *
+	 *	Is the datagram acceptable?
+	 *
+	 *	1.	Length at least the size of an ip header
+	 *	2.	Version of 4
+	 *	3.	Checksums correctly. [Speed optimisation for later, skip loopback checksums]
+	 *	4.	Doesn't have a bogus length
+	 */
+
+	if (iph->ihl < 5 || iph->version != 4)
+		goto inhdr_error;
+
+	BUILD_BUG_ON(IPSTATS_MIB_ECT1PKTS != IPSTATS_MIB_NOECTPKTS + INET_ECN_ECT_1);
+	BUILD_BUG_ON(IPSTATS_MIB_ECT0PKTS != IPSTATS_MIB_NOECTPKTS + INET_ECN_ECT_0);
+	BUILD_BUG_ON(IPSTATS_MIB_CEPKTS != IPSTATS_MIB_NOECTPKTS + INET_ECN_CE);
+	__IP_ADD_STATS(net,
+		       IPSTATS_MIB_NOECTPKTS + (iph->tos & INET_ECN_MASK),
+		       max_t(unsigned short, 1, skb_shinfo(skb)->gso_segs));
+
+	if (!pskb_may_pull(skb, iph->ihl*4))
+		goto inhdr_error;
+
+	iph = ip_hdr(skb);
+
+	if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl)))
+		goto csum_error;
+
+	len = ntohs(iph->tot_len);
+	if (skb->len < len) {
+		__IP_INC_STATS(net, IPSTATS_MIB_INTRUNCATEDPKTS);
+		goto drop;
+	} else if (len < (iph->ihl*4))
+		goto inhdr_error;
+
+	/* Our transport medium may have padded the buffer out. Now we know it
+	 * is IP we can trim to the true length of the frame.
+	 * Note this now means skb->len holds ntohs(iph->tot_len).
+	 */
+	if (pskb_trim_rcsum(skb, len)) {
+		__IP_INC_STATS(net, IPSTATS_MIB_INDISCARDS);
+		goto drop;
+	}
+
+	iph = ip_hdr(skb);
+	skb->transport_header = skb->network_header + iph->ihl*4;
+
+	/* Remove any debris in the socket control block */
+	memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
+	IPCB(skb)->iif = skb->skb_iif;
+
+	/* Must drop socket now because of tproxy. */
+	if (!skb_sk_is_prefetched(skb))
+		skb_orphan(skb);
+
+	return skb;
+
+csum_error:
+	__IP_INC_STATS(net, IPSTATS_MIB_CSUMERRORS);
+inhdr_error:
+	__IP_INC_STATS(net, IPSTATS_MIB_INHDRERRORS);
+drop:
+	kfree_skb(skb);
+out:
+	return NULL;
+}
+```
 
 ```c
 int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)

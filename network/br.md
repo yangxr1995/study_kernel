@@ -133,7 +133,9 @@ another_round:
 				...
 
 				// 给所有嗅探器发送skb的拷贝
-				// 所以本机无法抓到802.1q包
+				// 注意，数据帧的vlan header虽然已经去除，但是skb记录vlan信息
+				// 发送给嗅探器的数据帧会重新加上vlan header
+				// 所以嗅探器可以抓到 802.1q帧
 				list_for_each_entry_rcu(ptype, &ptype_all, list) {
 					if (pt_prev)
 						ret = deliver_skb(skb, pt_prev, orig_dev);
