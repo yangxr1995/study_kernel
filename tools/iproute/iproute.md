@@ -483,4 +483,36 @@ ip link set eth0.20 up
 cat /proc/net/vlan/config
 ```
 
+# 在VPN拨号程序的应用
+当vpn拨号前调用 routing_init, routing_start, 设置到vpn server 的路由，关闭vpn时 routing_end 
+```c
+char *route;
+
+void routing_init(char *ip) 
+{
+	char buf[256];
+	snprintf(buf, 255, "/bin/ip route get %s", ip);
+	FILE *p = popen(buf, "r");
+	fgets(buf, 255, p);
+	/* TODO: check for failure of fgets */
+	route = strdup(buf);
+	pclose(p);
+	/* TODO: check for failure of command */
+}
+
+void routing_start() {
+	char buf[256];
+	snprintf(buf, 255, "/bin/ip route replace %s", route);
+	FILE *p = popen(buf, "r");
+	pclose(p);
+}
+
+void routing_end() {
+	char buf[256];
+	snprintf(buf, 255, "/bin/ip route delete %s", route);
+	FILE *p = popen(buf, "r");
+	pclose(p);
+}
+
+```
 
