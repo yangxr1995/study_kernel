@@ -65,6 +65,8 @@ raw table主要用于一个目的，那就是在数据包上设置一个标记�
 
 ## 连接跟踪条目
 
+注意默认情况 nf_conntrack 为空，需要添加一条nat，conntrack才开始记录
+
 让我们简要介绍一下连接跟踪条目以及如何在/proc/net/nf_conntrack中读取它们。这提供了您的连接跟踪数据库中所有当前条目的列表。如果您加载了ip_conntrack模块，那么/proc/net/nf_conntrack的内容可能如下所示：
  ```shell
 tcp(TCP连接)      6(传输层协议号7) 117(此跟踪条目存在时间117秒) SYN_SENT(发现一个SYN_SENT的数据包) src=192.168.1.6 dst=192.168.1.9 sport=32775 \
