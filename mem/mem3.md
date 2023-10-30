@@ -556,6 +556,10 @@ static int __init_memblock memblock_remove_range(struct memblock_type *type,
 	int start_rgn, end_rgn;
 	int i, ret;
 
+	// 找到type.regions[] 内存区域和 [base, end] 重叠的部分，
+	// 因为只有重叠部分才是有效可以被删除的部分
+	// 并分割现有region，构建新的 memblock_region 保存这些重叠的区域
+	// 通过start_rgn ， end_rgn返回重叠regions
 	ret = memblock_isolate_range(type, base, size, &start_rgn, &end_rgn);
 	if (ret)
 		return ret;
@@ -564,5 +568,296 @@ static int __init_memblock memblock_remove_range(struct memblock_type *type,
 		memblock_remove_region(type, i);
 	return 0;
 }
+
+static void __init_memblock memblock_remove_region(struct memblock_type *type, unsigned long r)
+{
+	type->total_size -= type->regions[r].size;
+	// 数组元素向前移动一个元素，覆盖掉被删除的 region
+	memmove(&type->regions[r], &type->regions[r + 1],
+		(type->cnt - (r + 1)) * sizeof(type->regions[r]));
+	type->cnt--;
+
+	/* Special case for empty arrays */
+	if (type->cnt == 0) {
+		WARN_ON(type->total_size != 0);
+		type->cnt = 1;
+		type->regions[0].base = 0;
+		type->regions[0].size = 0;
+		type->regions[0].flags = 0;
+		memblock_set_region_node(&type->regions[0], MAX_NUMNODES);
+	}
+}
+
+static int __init_memblock memblock_isolate_range(struct memblock_type *type,
+					phys_addr_t base, phys_addr_t size,
+					int *start_rgn, int *end_rgn)
+{
+	phys_addr_t end = base + memblock_cap_size(base, &size);
+	int idx;
+	struct memblock_region *rgn;
+
+	*start_rgn = *end_rgn = 0;
+
+	if (!size)
+		return 0;
+
+	/* we'll create at most two more regions */
+	while (type->cnt + 2 > type->max)
+		if (memblock_double_array(type, base, size) < 0)
+			return -ENOMEM;
+
+	for_each_memblock_type(idx, type, rgn) {
+		phys_addr_t rbase = rgn->base;
+		phys_addr_t rend = rbase + rgn->size;
+
+		// 不可能和regions[]任意元素有重叠,break
+		//        rbase
+		// baese  end               rend
+		//  |------|   
+		//         |----------------|-----
+		if (rbase >= end)
+			break;
+
+		// 和当前区域块无重叠，但是和后面内存块可能重叠，continue
+		//      rbase           rend
+		//                      base      end
+		//                        |--------|--
+		//    ---|----------------|-----
+		if (rend <= base)
+			continue;
+
+		if (rbase < base) {
+
+
+		// 分割
+		//   case 1 :
+		//      rbase       base rend end
+		//                   |--------|--
+		//    ---|----------------|-----
+		//
+		//              idx[1]_base
+		//     idx_base    idx_end   
+		//                   |--------|--
+		//    ---|-----------|----|-----
+		//                      idx[1]_end
+		//
+		//           继续遍历
+		//                  base     end         
+		//                   |--------|
+		//    ---------------|----|-----
+		//                  rbase rend
+		//           完全覆盖的情况
+		//
+		//                     
+		//
+		//    case 2:
+		//     rbase base      end   rend
+		//            |---------|
+		//    ---|--------------------|---
+		//
+		//
+		//         idx[1]_base
+		//            |---------|   idx[1]_end
+		//    ---|----|---------------|---
+		//    idx_base
+		//          idx_end
+		//
+		//         继续遍历
+		//            base      end
+		//            |---------|
+		//           rbase           rend 
+		//    --------|---------------|---
+		//        
+		//          走下面if (rend > end)的情况
+		//    
+			/*
+			 * @rgn intersects from below.  Split and continue
+			 * to process the next region - the new top half.
+			 */
+			rgn->base = base;
+			rgn->size -= base - rbase;
+			type->total_size -= base - rbase;
+			memblock_insert_region(type, idx, rbase, base - rbase,
+					       memblock_get_region_node(rgn),
+					       rgn->flags);
+		} else if (rend > end) {
+
+		// 分割并保证地址小的在前面
+		// base rbase end          rend 
+		// |-----------|
+		//    ---|----------------|-----
+		//
+		//   
+		//           idx[-1].end
+		// |-----------|
+		//    ---|-----|----------|-----
+		//  idx[-1].base 
+		//            idx.base   idx.end
+		//
+		//          继续遍历
+		// base       end           
+		// |-----------|
+		//    ---|-----|----------------
+		//      rbase rend
+		//           完全覆盖的情况
+		//
+
+			/*
+			 * @rgn intersects from above.  Split and redo the
+			 * current region - the new bottom half.
+			 */
+			rgn->base = end;
+			rgn->size -= end - rbase;
+			type->total_size -= end - rbase;
+			memblock_insert_region(type, idx--, rbase, end - rbase,
+					       memblock_get_region_node(rgn),
+					       rgn->flags);
+		} else {
+
+		//      base                   end
+		//     rbase                  rend
+		//       |----------------------|
+		//    ---|----------------------|-----
+		//
+		//	 base                           end
+		//    |------------------------------|
+		//    ---|----------------------|-----
+		//
+		//                             rend
+		//   base                      end
+		//    |-------------------------|
+		//    ---|----------------------|-----
+		//       rbase
+		// 
+		//      rbase                     rend
+		//      base                  end
+		//       |-------------------------|
+		//    ---|----------------------|-----
+		//
+			/* @rgn is fully contained, record it */
+			// 将完全覆盖的reg对于的下标保存
+			if (!*end_rgn)
+				*start_rgn = idx;
+			*end_rgn = idx + 1;
+		}
+	}
+
+	return 0;
+}
 ```
 
+### memblock_alloc
+```c
+static inline void * __init memblock_alloc(phys_addr_t size,  phys_addr_t align)
+{
+	return memblock_alloc_try_nid(size, align, MEMBLOCK_LOW_LIMIT,
+				      MEMBLOCK_ALLOC_ACCESSIBLE, NUMA_NO_NODE);
+}
+
+void * __init memblock_alloc_try_nid(
+			phys_addr_t size, phys_addr_t align,
+			phys_addr_t min_addr, phys_addr_t max_addr,
+			int nid)
+{
+	void *ptr;
+
+	memblock_dbg("%s: %llu bytes align=0x%llx nid=%d from=%pa max_addr=%pa %pS\n",
+		     __func__, (u64)size, (u64)align, nid, &min_addr,
+		     &max_addr, (void *)_RET_IP_);
+	ptr = memblock_alloc_internal(size, align,
+					   min_addr, max_addr, nid, false);
+	if (ptr)
+		memset(ptr, 0, size);
+
+	return ptr;
+}
+
+static void * __init memblock_alloc_internal(
+				phys_addr_t size, phys_addr_t align,
+				phys_addr_t min_addr, phys_addr_t max_addr,
+				int nid, bool exact_nid)
+{
+	phys_addr_t alloc;
+
+	/*
+	 * Detect any accidental use of these APIs after slab is ready, as at
+	 * this moment memblock may be deinitialized already and its
+	 * internal data may be destroyed (after execution of memblock_free_all)
+	 */
+	if (WARN_ON_ONCE(slab_is_available()))
+		return kzalloc_node(size, GFP_NOWAIT, nid);
+
+	if (max_addr > memblock.current_limit)
+		max_addr = memblock.current_limit;
+
+	alloc = memblock_alloc_range_nid(size, align, min_addr, max_addr, nid,
+					exact_nid);
+
+	/* retry allocation without lower limit */
+	if (!alloc && min_addr)
+		alloc = memblock_alloc_range_nid(size, align, 0, max_addr, nid,
+						exact_nid);
+
+	if (!alloc)
+		return NULL;
+
+	return phys_to_virt(alloc);
+}
+```
+
+#### memblock_alloc_range_nid
+```c
+phys_addr_t __init memblock_alloc_range_nid(phys_addr_t size,
+					phys_addr_t align, phys_addr_t start,
+					phys_addr_t end, int nid,
+					bool exact_nid)
+{
+	enum memblock_flags flags = choose_memblock_flags();
+	phys_addr_t found;
+
+	if (WARN_ONCE(nid == MAX_NUMNODES, "Usage of MAX_NUMNODES is deprecated. Use NUMA_NO_NODE instead\n"))
+		nid = NUMA_NO_NODE;
+
+	if (!align) {
+		/* Can't use WARNs this early in boot on powerpc */
+		dump_stack();
+		align = SMP_CACHE_BYTES;
+	}
+
+again:
+	found = memblock_find_in_range_node(size, align, start, end, nid,
+					    flags);
+	if (found && !memblock_reserve(found, size))
+		goto done;
+
+	if (nid != NUMA_NO_NODE && !exact_nid) {
+		found = memblock_find_in_range_node(size, align, start,
+						    end, NUMA_NO_NODE,
+						    flags);
+		if (found && !memblock_reserve(found, size))
+			goto done;
+	}
+
+	if (flags & MEMBLOCK_MIRROR) {
+		flags &= ~MEMBLOCK_MIRROR;
+		pr_warn("Could not allocate %pap bytes of mirrored memory\n",
+			&size);
+		goto again;
+	}
+
+	return 0;
+
+done:
+	/* Skip kmemleak for kasan_init() due to high volume. */
+	if (end != MEMBLOCK_ALLOC_KASAN)
+		/*
+		 * The min_count is set to 0 so that memblock allocated
+		 * blocks are never reported as leaks. This is because many
+		 * of these blocks are only referred via the physical
+		 * address which is not looked up by kmemleak.
+		 */
+		kmemleak_alloc_phys(found, size, 0, 0);
+
+	return found;
+}
+```
