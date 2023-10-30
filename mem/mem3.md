@@ -1,6 +1,140 @@
 # 物理内存的管理
-## 内核如何确定物理内存大小
-### 设备树的定义
+## 核心数据结构
+### memblock 
+memblock 是替代 bootmem 的接口, 用于在伙伴系统初始化前，提供内存管理
+
+```c
+struct memblock {
+	// 分配内存的方向
+	// true 从0地址向高地址分配
+	// false 从高地址向0地址分配
+	bool bottom_up;  
+	// 可分配的物理内存的最大地址
+	phys_addr_t current_limit;
+	// 内存类型：包括已分配和未分配
+	struct memblock_type memory;
+	// 内存类型：预留类型，也就是已经被分配的内存
+	struct memblock_type reserved;
+};
+```
+#### memblock_type
+memblock_type 描述同类型的可离散的多个物理内存块
+
+```c
+struct memblock_type {
+	unsigned long cnt; // 当前内存管理集合中记录内存区域的个数
+	unsigned long max; // 当前内存管理集合能记录的内存区域的最大个数
+	phys_addr_t total_size; // 当前内存管理集合所管理的所有内存区域的内存大小综合
+	struct memblock_region *regions; // 所管理的内存区域
+	char *name;
+};
+```
+
+##### 物理类型 和 内存类型
+```c
+struct memblock_type memory;
+struct memblock_type physmem;
+```
+内存类型是物理类型的子集，物理类型包含所有物理内存，
+
+引导内核时可以使用 mem=nn[KMG] 指定可用的内存大小，导致部分内存不可见。
+
+内存类型只包含mem=nn[KMG]指定的内存
+
+
+#### memblock_region
+memblock_region 描述一段连续的物理内存块
+
+```c
+enum memblock_flags {
+	MEMBLOCK_NONE		= 0x0,	// 没有特殊要求的区域
+	MEMBLOCK_HOTPLUG	= 0x1,	// 支持的热插拔的内存区域
+	MEMBLOCK_MIRROR		= 0x2,  // 支持内存镜像的区域，内存镜像就是内存热备份
+	MEMBLOCK_NOMAP		= 0x4,	// 不添加到内核线性映射区
+};
+
+// 内存区域
+struct memblock_region {
+	phys_addr_t base; // 起始物理地址
+	phys_addr_t size; // 大小
+	enum memblock_flags flags;
+#ifdef CONFIG_NEED_MULTIPLE_NODES
+	int nid;
+#endif
+};
+```
+
+### 数据结构间的关系
+![](./pic/65.jpg)
+
+## 内核确定物理内存信息
+
+### 定义 memblock 全局变量
+```c
+static struct memblock_region memblock_memory_init_regions[INIT_MEMBLOCK_REGIONS] __initdata_memblock;
+static struct memblock_region memblock_reserved_init_regions[INIT_MEMBLOCK_REGIONS] __initdata_memblock;
+#ifdef CONFIG_HAVE_MEMBLOCK_PHYS_MAP
+static struct memblock_region memblock_physmem_init_regions[INIT_PHYSMEM_REGIONS] __initdata_memblock;
+#endif
+
+struct memblock memblock __initdata_memblock = {
+	.memory.regions		= memblock_memory_init_regions,
+	.memory.cnt		= 1,	/* empty dummy entry */
+	.memory.max		= INIT_MEMBLOCK_REGIONS,
+	.memory.name		= "memory",
+
+	.reserved.regions	= memblock_reserved_init_regions,
+	.reserved.cnt		= 1,	/* empty dummy entry */
+	.reserved.max		= INIT_MEMBLOCK_REGIONS,
+	.reserved.name		= "reserved",
+
+#ifdef CONFIG_HAVE_MEMBLOCK_PHYS_MAP
+	.physmem.regions	= memblock_physmem_init_regions,
+	.physmem.cnt		= 1,	/* empty dummy entry */
+	.physmem.max		= INIT_PHYSMEM_REGIONS,
+	.physmem.name		= "physmem",
+#endif
+
+	.bottom_up		= false,
+	.current_limit		= MEMBLOCK_ALLOC_ANYWHERE,
+};
+```
+
+### 初始化memblock
+
+```c
+start_kernel
+	setup_arch(char **cmdline_p)
+		mdesc = setup_machine_fdt(atags_vaddr);
+			early_init_dt_scan_nodes();
+				// 初始化 memblock.memory，即可参与内存分配的区域
+				of_scan_flat_dt(early_init_dt_scan_memory, NULL);
+
+		// 确定 arm_lowmem_limit
+		adjust_lowmem_bounds();
+		// 初始化 memblock.reserve，即不参与内存分配的区域
+		arm_memblock_init(mdesc);
+			/* 预留内核镜像内存，其中包括.text,.data,.init */
+			memblock_reserve(__pa(KERNEL_START), KERNEL_END - KERNEL_START);
+			arm_initrd_init();
+			// 预留vector page内存
+			// 如果CPU支持向量重定向（控制寄存器的V位），则CPU中断向量被映射到这里。
+			arm_mm_memblock_reserve();
+			//预留架构相关的内存，这里包括内存屏障和安全ram
+			if (mdesc->reserve)
+				mdesc->reserve();  
+			early_init_fdt_reserve_self();  //预留设备树自身加载所占内存
+			early_init_fdt_scan_reserved_mem();  //初始化设备树扫描reserved-memory节点预留内存
+			dma_contiguous_reserve(arm_dma_limit);  //内核配置参数或命令行参数中预留的DMA连续内存
+			arm_memblock_steal_permitted = false;
+			memblock_dump_all();
+
+		/* Memory may have been removed so recalculate the bounds. */
+		adjust_lowmem_bounds();
+```
+
+#### early_init_dt_scan_memory
+##### 设备树中memory定义  
 ```
 / {
 	// reg是 cells数组
@@ -24,7 +158,7 @@
 	};
 }
 ```
-### 内核如何分析fdt格式的设备树节点
+##### 内核如何分析fdt格式的设备树节点
 ```c
 // 假设扫描到 fdt 格式节点  memory@60000000
 int __init early_init_dt_scan_memory(unsigned long node, const char *uname,
@@ -106,7 +240,7 @@ int __init early_init_dt_scan_memory(unsigned long node, const char *uname,
 }
 
 ```
-#### dt_mem_next_cell 获得cell的值并指向下一个cell
+##### dt_mem_next_cell 获得cell的值并指向下一个cell
 ```
 // s : 本类型的值占用 s 个单元，单位为 __be32
 // cellp : 当前扫描到的单位的地址的地址
@@ -132,7 +266,7 @@ static inline u64 of_read_number(const __be32 *cell, int size)
 }
 ```
 
-### 将从设备树获得的信息添加到memory子系统
+##### 将从设备树获得的信息添加到memory子系统
 ```c
 void __init __weak early_init_dt_add_memory_arch(u64 base, u64 size)
 {
@@ -185,45 +319,250 @@ static int __init_memblock memblock_add_range(struct memblock_type *type,
 // memblock.memory.regions[i] 表示某一个内存区域	
 memblock.memory.regions[0].base = base;   // 0x60000000
 memblock.memory.regions[0].size = size;   // 0x40000000
-memblock.memory.regions[0].flags = flags; // MEMBLOCK_NONE 普通内存 
+memblock.memory.regions[0].flags = flags; // MEMBLOCK_NONE 没有特殊要求的内存
 
 memblock.memory.total_size = size;        // 所有内存区域的大小0x40000000
 ```
 
-### 总结
-内存从设备树获得内存区域信息，可能有多个内存区域，依次添加到 `memblock.memory.regions[]` 中
-
-memblock_region 最重要描述了一块内存区域的起始地址和大小和内存是否有特殊请求
+## memblock 编程接口
 ```c
-/**
- * struct memblock_region - represents a memory region
- * @base: base address of the region
- * @size: size of the region
- * @flags: memory region attributes
- * @nid: NUMA node id
- */
-struct memblock_region {
-	phys_addr_t base;
-	phys_addr_t size;
-	enum memblock_flags flags;
-#ifdef CONFIG_NEED_MULTIPLE_NODES
-	int nid;
-#endif
-};
-
-/**
- * struct memblock_type - collection of memory regions of certain type
- * @cnt: number of regions
- * @max: size of the allocated array
- * @total_size: size of all regions
- * @regions: array of regions
- * @name: the memory type symbolic name
- */
-struct memblock_type {
-	unsigned long cnt;
-	unsigned long max;
-	phys_addr_t total_size;
-	struct memblock_region *regions;
-	char *name;
-};
+// 将内存区域添加到 memblock.memory
+int memblock_add(phys_addr_t base, phys_addr_t size);
+// 从memblock.memory 中删除内存区域
+int memblock_remove(phys_addr_t base, phys_addr_t size);
+// 释放内存
+int memblock_free(phys_addr_t base, phys_addr_t size);
+// 从memblock.memory 分配内存
+static inline void * __init memblock_alloc(phys_addr_t size,  phys_addr_t align)
 ```
+
+### memblock_add
+
+![](./pic/66.jpg)
+
+图中的左侧是函数的执行流程图，执行效果是右侧部分。
+
+右侧部分画的是一个典型的情况，实际的情况可能有多种，但是核心的逻辑都是对插入的region进行判断，
+
+如果出现了物理地址范围重叠的部分，那就进行split操作，最终对具有相同flag的region进行merge操作。
+
+#### memblock_add_range
+```c
+static int __init_memblock memblock_add_range(struct memblock_type *type,
+				phys_addr_t base, phys_addr_t size,
+				int nid, enum memblock_flags flags)
+{
+	bool insert = false;
+	phys_addr_t obase = base;
+	phys_addr_t end = base + memblock_cap_size(base, &size);
+	int idx, nr_new;
+	struct memblock_region *rgn;
+
+	if (!size)
+		return 0;
+
+	// 添加内存块是从[0]开始添加，如果[0]内存块大小为0，
+	// 则说明memblock_type没有添加过内存
+	if (type->regions[0].size == 0) {
+		WARN_ON(type->cnt != 1 || type->total_size);
+		type->regions[0].base = base;
+		type->regions[0].size = size;
+		type->regions[0].flags = flags;
+		memblock_set_region_node(&type->regions[0], nid);
+		type->total_size = size;
+		return 0;
+	}
+repeat:
+	/*
+	 * The following is executed twice.  Once with %false @insert and
+	 * then with %true.  The first counts the number of regions needed
+	 * to accommodate the new area.  The second actually inserts them.
+	 */
+	base = obase;
+	nr_new = 0;
+
+	for_each_memblock_type(idx, type, rgn) {
+		phys_addr_t rbase = rgn->base;
+		phys_addr_t rend = rbase + rgn->size;
+
+		//  base  end   rbase   rend
+		//          -----|-------|--
+		// --|----|--
+		// 这种情况肯定和所有已知区域块都不会重叠
+		if (rbase >= end)
+			break;
+		//  rbase  rend   base   end
+		//          -----|-------|--
+		// --|----|--
+		// 和当前区域块无重叠，但是和后面内存块可能重叠，continue
+		if (rend <= base)
+			continue;
+
+		// 新添加区域和以前的区域有重叠
+
+		/*
+		 * @rgn overlaps.  If it separates the lower part of new
+		 * area, insert that portion.
+		 */
+		//  base    rbase  end   rend
+		//      -----|------------|--
+		// --|--------------|---
+		if (rbase > base) {
+#ifdef CONFIG_NEED_MULTIPLE_NODES
+			WARN_ON(nid != memblock_get_region_node(rgn));
+#endif
+			WARN_ON(flags != rgn->flags);
+			nr_new++;
+			if (insert) // 第一次遍历时 insert == false
+				memblock_insert_region(type, idx++, base,
+						       rbase - base, nid,
+						       flags);
+		}
+
+		// 上面完成了添加，下一句将剩余空间清零
+		//  base    rbase  end   rend
+		//      -----|------------|--
+		// --|--------------|---
+		//
+		//                base
+		//          rbase  end   rend
+		//      -----|------------|--
+		//              ----|---
+		//
+
+		// 将此情况等价于不相交的情况
+		//  rbase    base  rend   end
+		//      -----|------------|--
+		// --|--------------|---
+		//
+		//                 base   end
+		//                --|-----|--
+		// --|--------------|---
+		//
+		/* area below @rend is dealt with, forget about it */
+		base = min(rend, end);
+	}
+
+	/* insert the remaining portion */
+	if (base < end) {
+		// 处理不重叠情况
+		//                    base   end
+		//                   --|-----|--
+		// --|--------------|---
+		//	
+		//                 base   end
+		//                --|-----|--
+		// --|--------------|---
+		//
+		//  base   end
+		// --|-----|--
+		//       --|--------------|---
+		//
+		//  base   end
+		// --|-----|--
+		//          --|--------------|---
+		nr_new++;
+		if (insert)
+			memblock_insert_region(type, idx, base, end - base,
+					       nid, flags);
+	}
+
+	if (!nr_new)
+		return 0;
+
+	/*
+	 * If this was the first round, resize array and repeat for actual
+	 * insertions; otherwise, merge and return.
+	 */
+	if (!insert) {
+		// 第一次遍历的主要目的就是确保 region[] 足够大
+		// 因为使用数组类型，不方便动态添加，所以计算出 nr_new
+		// 并一次分配足够的空间
+		// 如果 memblock_type.region[]数组不够大，则两倍扩大他
+		while (type->cnt + nr_new > type->max)
+			if (memblock_double_array(type, obase, size) < 0)
+				return -ENOMEM;
+		// 第二次遍历，进行插入操作
+		insert = true;
+		goto repeat;
+	} else {
+		// 插入完成后，进行合并操作
+		//  base   end
+		// --|-----|--
+		//       --|--------------|---
+		//
+		//                 base   end
+		//                --|-----|--
+		// --|--------------|---
+		memblock_merge_regions(type);
+		return 0;
+	}
+}
+```
+
+#### memblock_merge_regions
+
+合并regions, 可合并的条件
+* this->base == next->end
+* 并且 this 和 next 是同一个内存节点
+* 并且 this->flags == next->flags
+
+```c
+static void __init_memblock memblock_merge_regions(struct memblock_type *type)
+{
+	int i = 0;
+
+	/* cnt never goes below 1 */
+	while (i < type->cnt - 1) {
+		struct memblock_region *this = &type->regions[i];
+		struct memblock_region *next = &type->regions[i + 1];
+
+		if (this->base + this->size != next->base ||
+		    memblock_get_region_node(this) !=
+		    memblock_get_region_node(next) ||
+		    this->flags != next->flags) {
+			BUG_ON(this->base + this->size > next->base);
+			i++;
+			continue;
+		}
+
+		this->size += next->size;
+		/* move forward from next + 1, index of which is i + 2 */
+		// 将next后面的元素往前移动，覆盖掉被合并的元素next
+		memmove(next, next + 1, (type->cnt - (i + 2)) * sizeof(*next));
+		type->cnt--;
+	}
+}
+```
+
+### memblock_remove
+
+![](./pic/67.jpg)
+
+```c
+int __init_memblock memblock_remove(phys_addr_t base, phys_addr_t size)
+{
+	phys_addr_t end = base + size - 1;
+
+	memblock_dbg("%s: [%pa-%pa] %pS\n", __func__,
+		     &base, &end, (void *)_RET_IP_);
+
+	return memblock_remove_range(&memblock.memory, base, size);
+}
+
+static int __init_memblock memblock_remove_range(struct memblock_type *type,
+					  phys_addr_t base, phys_addr_t size)
+{
+	int start_rgn, end_rgn;
+	int i, ret;
+
+	ret = memblock_isolate_range(type, base, size, &start_rgn, &end_rgn);
+	if (ret)
+		return ret;
+
+	for (i = end_rgn - 1; i >= start_rgn; i--)
+		memblock_remove_region(type, i);
+	return 0;
+}
+```
+
