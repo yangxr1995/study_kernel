@@ -1092,23 +1092,65 @@ unsigned long __init memblock_free_all(void)
 }
 ```
 
+# 高端内存的确定
+```c
+start_kernel
+	setup_arch(&command_line);
+		...
+		mdesc = setup_machine_fdt(atags_vaddr); // 根据设备树memory节点，初始化memblock
+		...
+		adjust_lowmem_bounds();
+		arm_memblock_init(mdesc);
+		adjust_lowmem_bounds();
+		...
+		paging_init(mdesc);
+		...
+
+```
+
+## adjust_lowmem_bounds
+
+
 # 内存映射
+## mm_struct
+`mm_struct` 是内存管理和根对象，内核和用户进程有不同的`mm_struct`
+
+内核的`mm_struct`为 全局变量 `init_mm`，用户进程的`mm_struct`为 `task->mm`
+
+建立内存映射的核心就是要初始化 `mm_struct.pgd`
+
+```c
+struct mm_struct init_mm = {
+	.mm_rb		= RB_ROOT,
+	.pgd		= swapper_pg_dir,
+	.mm_users	= ATOMIC_INIT(2),
+	.mm_count	= ATOMIC_INIT(1),
+	.write_protect_seq = SEQCNT_ZERO(init_mm.write_protect_seq),
+	MMAP_LOCK_INITIALIZER(init_mm)
+	.page_table_lock =  __SPIN_LOCK_UNLOCKED(init_mm.page_table_lock),
+	.arg_lock	=  __SPIN_LOCK_UNLOCKED(init_mm.arg_lock),
+	.mmlist		= LIST_HEAD_INIT(init_mm.mmlist),
+	.user_ns	= &init_user_ns,
+	.cpu_bitmap	= CPU_BITS_NONE,
+	INIT_MM_CONTEXT(init_mm)
+};
+
+EXPORT_SYMBOL(init_mm);
+```
+
 ## 段映射部分
+
+![](./pic/68.jpg)
+
 ```asm
 /*
- * 创建恒等映射，为什么使用恒等映射？
- * 因为创建页表，并打开MMu的代码，前部分运行在物理地址
- * 后部分运行在虚拟地址，代码是连续的，所以物理地址必须
- * 等于虚拟地址
- */ 
-/*
- * 设置初始页表。我们只设置了最基本的部分，
- * 这些是使内核运行所必需的，通常是映射内核代码
+ * 建立两个段表映射，一个是对开启MMu代码的恒等映射
+ * 一个是内核镜像的映射
  *
  * r8 = phys_offset, r9 = cpuid, r10 = procinfo
  * 
  *  phys_offset : 内核解压后镜像的起始地址
- *  procinfo : 0号进程信息
+ *  procinfo : CPU信息
  *
  * Returns:
  *  r0, r3, r5-r7 corrupted
@@ -1117,9 +1159,8 @@ unsigned long __init memblock_free_all(void)
 __create_page_tables:
 	pgtbl	r4, r8				@ page table address 分配页表内存
 	                            @ r4 记录页表地址
-
 	/*
-	 * 将页表清零
+	 * 将段表清零
 	 */
 	mov	r0, r4
 	mov	r3, #0
@@ -1130,34 +1171,6 @@ __create_page_tables:
 	str	r3, [r0], #4
 	teq	r0, r6
 	bne	1b
-
-#ifdef CONFIG_ARM_LPAE
-	/*
-	 * Build the PGD table (first level) to point to the PMD table. A PGD
-	 * entry is 64-bit wide.
-	 */
-	mov	r0, r4
-	add	r3, r4, #0x1000			@ first PMD table address
-	orr	r3, r3, #3			@ PGD block type
-	mov	r6, #4				@ PTRS_PER_PGD
-	mov	r7, #1 << (55 - 32)		@ L_PGD_SWAPPER
-1:
-#ifdef CONFIG_CPU_ENDIAN_BE8
-	str	r7, [r0], #4			@ set top PGD entry bits
-	str	r3, [r0], #4			@ set bottom PGD entry bits
-#else
-	str	r3, [r0], #4			@ set bottom PGD entry bits
-	str	r7, [r0], #4			@ set top PGD entry bits
-#endif
-	add	r3, r3, #0x1000			@ next PMD table
-	subs	r6, r6, #1
-	bne	1b
-
-	add	r4, r4, #0x1000			@ point to the PMD tables
-#ifdef CONFIG_CPU_ENDIAN_BE8
-	add	r4, r4, #4			@ we only write the bottom word
-#endif
-#endif
 
 	ldr	r7, [r10, #PROCINFO_MM_MMUFLAGS] @ 读取MMU flags
 
@@ -1219,21 +1232,36 @@ __create_page_tables:
 
 	/*
 	 * Map our RAM from the start to the end of the kernel .bss section.
-	 * 建立kernel镜像映射，包括 .data .text ..
+	 * 建立内核镜像映射
+	 * r4 段表的基地址
 	 */
-	add	r0, r4, #PAGE_OFFSET >> (SECTION_SHIFT - PMD_ORDER) @ r0记录kernel起始页地址
-
-                                                            @ 因为第一个页号被对等映射占据，
-                                                            @ 所以kernel的从第二个页开始
-                                                            @ r0 = 页表基地址 + 第二个页的偏移地址
+	add	r0, r4, #PAGE_OFFSET >> (SECTION_SHIFT - PMD_ORDER) @ r0记录kernel起始段地址
+                                                            @ 因为第一个段被对等映射占据，
+                                                            @ 所以kernel的从第二个段开始
+                                                            @ r0 = 段表基地址 + 第二个段的偏移地址
 	ldr	r6, =(_end - 1)   @ kernel的虚拟地址的结束地址
-	orr	r3, r8, r7        @ r8:kernel镜像物理起始地址的基地址
-	add	r6, r4, r6, lsr #(SECTION_SHIFT - PMD_ORDER)
-1:	str	r3, [r0], #1 << PMD_ORDER
-	add	r3, r3, #1 << SECTION_SHIFT
-	cmp	r0, r6
-	bls	1b
+						  @ _end在vmlinux.lds中定义，是内核镜像结束的连接地址
 
+	orr	r3, r8, r7        @ r8:kernel镜像物理起始地址的基地址
+						  @ r3 = r8 | r7
+						  @ r3 = 内核镜像物理起始地址的基地址 | MMU-flags
+
+	add	r6, r4, r6, lsr #(SECTION_SHIFT - PMD_ORDER)  @ 得到镜像虚拟结束地址对应的段的地址
+                                                      @ 将 r6 >> (20 - 2) 可以理解为
+                                                      @ (r6 >> 20) * 4
+                                                      @ 首先将虚拟地址右移20位，得到段号
+                                                      @ 再将段号乘以 4 得到偏移地址
+                                                      @ 将段表基地址加上偏移地址得到结束段的地址
+
+1:	str	r3, [r0], #1 << PMD_ORDER             @ 将物理基地址和mmu flags写道对应页表项       
+                                              @ 将 *r0 = r3 ,写4B
+                                              @ r0 += 4
+
+	add	r3, r3, #1 << SECTION_SHIFT           @ 增加物理基地址 
+	                                          @ 1 << 20 位保证只对物理基地址增加，不修改mmc flags
+
+	cmp	r0, r6       @ 比较当前页表项地址和镜像的结束页表项地址 
+	bls	1b           @ 如果 r0 < r6 循环
 
 ```
 
