@@ -1,7 +1,9 @@
-# 物理内存的管理
+# 物理内存的管理 -- memblock
 ## 核心数据结构
 ### memblock 
-memblock 是替代 bootmem 的接口, 用于在伙伴系统初始化前，提供内存管理
+memblock 内存页帧分配器是 Linux 启动早期内存管理器，在伙伴系统（Buddy System）接管内存管理之前为系统提供内存分配、预留等功能。
+
+memblock 将系统启动时获取的可用内存范围（如从设备树中获取的内存范围）纳入管理，为内核启动阶段内存分配需求提供服务，直到 memblock 分配器将内存管理权移交给伙伴系统。同时 memblock 分配器也维护预留内存（reserved memory），使其不会被分配器直接用于分配，保证其不被非预留者使用。
 
 ```c
 struct memblock {
@@ -11,9 +13,9 @@ struct memblock {
 	bool bottom_up;  
 	// 可分配的物理内存的最大地址
 	phys_addr_t current_limit;
-	// 内存类型：包括已分配和未分配
+	// 可使用的内存：包括已分配和未分配
 	struct memblock_type memory;
-	// 内存类型：预留类型，也就是已经被分配的内存
+	// 已分配的内存
 	struct memblock_type reserved;
 };
 ```
@@ -22,11 +24,11 @@ memblock_type 描述同类型的可离散的多个物理内存块
 
 ```c
 struct memblock_type {
-	unsigned long cnt; // 当前内存管理集合中记录内存区域的个数
-	unsigned long max; // 当前内存管理集合能记录的内存区域的最大个数
+	unsigned long cnt; // 记录了结构体中含有的内存区块数量。regions数组有效元素
+	unsigned long max; // 结构体中为 regions 数组分配的数量，当需要维护内存区域数目超过 max 后 ，则会倍增 regions 的内存空间
 	phys_addr_t total_size; // 当前内存管理集合所管理的所有内存区域的内存大小综合
-	struct memblock_region *regions; // 所管理的内存区域
-	char *name;
+	struct memblock_region *regions; // 为内存区块数组，描述该集合下管理的所有内存区块，每个数组元素代表一块内存区域，可通过索引获取对应区块。注意区块是按照内存升序或降序排列（由上一层结构中 bottom_up 决定），且相邻数组元素所描述内存必不连续（连续会合并为一个数组元素）。
+	char *name; // 为内存类型集合名字，如名为 memory 代表可用内存集合，reserved 代码预留内存集合。
 };
 ```
 
@@ -67,9 +69,17 @@ struct memblock_region {
 ### 数据结构间的关系
 ![](./pic/65.jpg)
 
-## 内核确定物理内存信息
+## 主要逻辑
 
-### 定义 memblock 全局变量
+memblock 依次进行
+
+* 可用内存初始化
+* 预留内存初始化
+* 为内核提供内存管理服务，释放和移交管理权等流程。
+
+### 可用内存初始化
+
+#### 全局变量
 ```c
 static struct memblock_region memblock_memory_init_regions[INIT_MEMBLOCK_REGIONS] __initdata_memblock;
 static struct memblock_region memblock_reserved_init_regions[INIT_MEMBLOCK_REGIONS] __initdata_memblock;
@@ -100,7 +110,7 @@ struct memblock memblock __initdata_memblock = {
 };
 ```
 
-### 初始化memblock
+#### 初始化memblock
 
 ```c
 start_kernel
@@ -133,8 +143,8 @@ start_kernel
 		adjust_lowmem_bounds();
 ```
 
-#### early_init_dt_scan_memory
-##### 设备树中memory定义  
+##### early_init_dt_scan_memory
+###### 设备树中memory定义  
 ```
 / {
 	// reg是 cells数组
@@ -158,7 +168,7 @@ start_kernel
 	};
 }
 ```
-##### 内核如何分析fdt格式的设备树节点
+###### 内核如何分析fdt格式的设备树节点
 ```c
 // 假设扫描到 fdt 格式节点  memory@60000000
 int __init early_init_dt_scan_memory(unsigned long node, const char *uname,
@@ -240,7 +250,7 @@ int __init early_init_dt_scan_memory(unsigned long node, const char *uname,
 }
 
 ```
-##### dt_mem_next_cell 获得cell的值并指向下一个cell
+###### dt_mem_next_cell 获得cell的值并指向下一个cell
 ```
 // s : 本类型的值占用 s 个单元，单位为 __be32
 // cellp : 当前扫描到的单位的地址的地址
@@ -266,7 +276,7 @@ static inline u64 of_read_number(const __be32 *cell, int size)
 }
 ```
 
-##### 将从设备树获得的信息添加到memory子系统
+###### 将从设备树获得的信息添加到memory子系统
 ```c
 void __init __weak early_init_dt_add_memory_arch(u64 base, u64 size)
 {
@@ -324,7 +334,31 @@ memblock.memory.regions[0].flags = flags; // MEMBLOCK_NONE 没有特殊要求的
 memblock.memory.total_size = size;        // 所有内存区域的大小0x40000000
 ```
 
-## memblock 编程接口
+### 预留内存初始化
+将需要保留的内存添加进预留内存类型集合（`memblock.reserved`）,使得后续使用 `memblock` 分配内存时，避开预留内存。例如，在分页系统初始化过程中会调用 `memblock_reserve` 函数将内核程序在内存中的范围保留，保证其不会被覆盖，调用关系如下：
+```c
+    - paging_init
+      - setup_bootmem()
+        - memblock_reserve(vmlinux_start, vmlinux_end - vmlinux_start)
+```
+
+### memblock的使用
+当 memblock 系统完成初始化后，需要申请内存时内核会通过 memblock 系统。
+
+使用者调用 `memblock_alloc` 申请内存，`memblock_free` 释放内存
+
+`setup_vm_final` 函数调用 `create_pgd_mapping` 函数建立页全局目录时，会调用 `alloc_pgd_next` 获取一个页面作为页表。`alloc_pgd_next` 实际是调用 `memblock_phys_alloc` 函数从 `memblock` 分配器中获取一个空闲页面。又如 `setup_log_buf` 中申请存放日志的内存时，会调用 `memblock_alloc` 获得一块内存的虚拟地址。
+
+### memblock和伙伴系统
+当内核完成部分初始化功能，并继续启动到要建立以后内核都将使用内存管理系统时，就到了 `memblock` 向伙伴系统移交控制权的时候了。`mm_init` 函数负责建立内存管理系统。该函数会调用 `memblock_free_all` 函数，此函数完成 `memblock` 释放并移交管理权的流程。相关流程如下：
+
+```c
+- mm_init
+    - mem_init
+        - memblock_free_all
+```
+
+## 重要函数分析
 ```c
 // 将内存区域添加到 memblock.memory
 int memblock_add(phys_addr_t base, phys_addr_t size);
@@ -337,6 +371,10 @@ static inline void * __init memblock_alloc(phys_addr_t size,  phys_addr_t align)
 ```
 
 ### memblock_add
+
+memblock_add 添加内存块到 memblock.memory 
+
+另一个类似的接口 memblock_reserve 添加内存块到 memblock.reserve
 
 ![](./pic/66.jpg)
 
@@ -747,13 +785,43 @@ static int __init_memblock memblock_isolate_range(struct memblock_type *type,
 ```
 
 ### memblock_alloc
+从 memblock.memory 申请内存块，并清零，并返回虚拟地址
+
+memblock_phys_alloc 从 memblock.memory 申请内存块，
+
+且排除memblock.reserved的内存区域，并返回物理地址
+
+注意成功分配内存块时，并不会对 memblock.memory.regions[] 进行分割，
+
+而是将其中被使用的区域建立新的内存区域加入 memblock.reserved 
+
 ```c
+#define MEMBLOCK_LOW_LIMIT 0
+#define MEMBLOCK_ALLOC_ACCESSIBLE	0
+
+// 从memblock.memory.region[]分配size大小的物理内存，并转换为虚拟地址返回
+// 并且返回的内存块数据清零
 static inline void * __init memblock_alloc(phys_addr_t size,  phys_addr_t align)
 {
+	// 根据下面对函数的介绍，
+	// 此分配的内存区域下限是 0, 
+	// 上限是 memblock.current_limit也就是最大物理地址
+	// nid是任意节点
 	return memblock_alloc_try_nid(size, align, MEMBLOCK_LOW_LIMIT,
 				      MEMBLOCK_ALLOC_ACCESSIBLE, NUMA_NO_NODE);
 }
 
+/*
+ * size : 将被分配的内存块大小, 字节单位
+ * align : 内存区域和块的对齐大小
+ * min_addr : 首选分配的内存区域的下限（物理地址）
+ * max_addr : 首选分配的内存区域的上限（物理地址），或者使用MEMBLOCK_ALLOC_ACCESSIBLE仅从受memblock.current_limit值限制的内存中进行分配。
+ * nid :  要查找的空闲区域的节点ID，使用NUMA_NO_NODE表示任何节点。
+ * 
+ * 公共函数，在启用时提供附加的调试信息（包括调用者信息）。该函数将分配的内存清零。
+ * 返回：
+ * 成功时分配内存块的虚拟地址，失败时返回NULL。
+ */
 void * __init memblock_alloc_try_nid(
 			phys_addr_t size, phys_addr_t align,
 			phys_addr_t min_addr, phys_addr_t max_addr,
@@ -761,9 +829,6 @@ void * __init memblock_alloc_try_nid(
 {
 	void *ptr;
 
-	memblock_dbg("%s: %llu bytes align=0x%llx nid=%d from=%pa max_addr=%pa %pS\n",
-		     __func__, (u64)size, (u64)align, nid, &min_addr,
-		     &max_addr, (void *)_RET_IP_);
 	ptr = memblock_alloc_internal(size, align,
 					   min_addr, max_addr, nid, false);
 	if (ptr)
@@ -772,6 +837,9 @@ void * __init memblock_alloc_try_nid(
 	return ptr;
 }
 
+// exact_nid : false, 从nid节点分配失败时，尝试从其他内存节点进行分配
+// 如果无法满足@min_addr限制，则会放弃该限制，并将分配回退到@min_addr以下的内存。其他约束条件，如节点和镜像内存，将在memblock_alloc_range_nid()中再次处理。
+// 分配物理内存块，并返回虚拟地址
 static void * __init memblock_alloc_internal(
 				phys_addr_t size, phys_addr_t align,
 				phys_addr_t min_addr, phys_addr_t max_addr,
@@ -779,21 +847,21 @@ static void * __init memblock_alloc_internal(
 {
 	phys_addr_t alloc;
 
-	/*
-	 * Detect any accidental use of these APIs after slab is ready, as at
-	 * this moment memblock may be deinitialized already and its
-	 * internal data may be destroyed (after execution of memblock_free_all)
-	 */
+	// 检查是否启用了 slab 分配器，如果已启用，说明 memblock 已将管理权移交给伙伴系统
 	if (WARN_ON_ONCE(slab_is_available()))
 		return kzalloc_node(size, GFP_NOWAIT, nid);
 
+	// 分配区域地址最大地址不超过 memblock能提供的最大地址
 	if (max_addr > memblock.current_limit)
 		max_addr = memblock.current_limit;
 
+	// 分配物理内存块
 	alloc = memblock_alloc_range_nid(size, align, min_addr, max_addr, nid,
 					exact_nid);
 
 	/* retry allocation without lower limit */
+	// 如果使用min_addr限制条件，但分配失败，
+	// 则弃用min_addr限制，尝试从min_addr之下的内存进行分配
 	if (!alloc && min_addr)
 		alloc = memblock_alloc_range_nid(size, align, 0, max_addr, nid,
 						exact_nid);
@@ -801,6 +869,7 @@ static void * __init memblock_alloc_internal(
 	if (!alloc)
 		return NULL;
 
+	// 分配成功后返回虚拟地址
 	return phys_to_virt(alloc);
 }
 ```
@@ -813,6 +882,7 @@ phys_addr_t __init memblock_alloc_range_nid(phys_addr_t size,
 					bool exact_nid)
 {
 	enum memblock_flags flags = choose_memblock_flags();
+		return system_has_some_mirror ? MEMBLOCK_MIRROR : MEMBLOCK_NONE;
 	phys_addr_t found;
 
 	if (WARN_ONCE(nid == MAX_NUMNODES, "Usage of MAX_NUMNODES is deprecated. Use NUMA_NO_NODE instead\n"))
@@ -825,15 +895,19 @@ phys_addr_t __init memblock_alloc_range_nid(phys_addr_t size,
 	}
 
 again:
+	// 分配物理内存块
 	found = memblock_find_in_range_node(size, align, start, end, nid,
 					    flags);
+	// 如果分配成功，则将内存块[founc, found + size) 加入 reserved
 	if (found && !memblock_reserve(found, size))
 		goto done;
 
+	// 如果分配失败，且nid不受限制，则从其他nid分配
 	if (nid != NUMA_NO_NODE && !exact_nid) {
 		found = memblock_find_in_range_node(size, align, start,
 						    end, NUMA_NO_NODE,
 						    flags);
+		// 如果分配成功，则将内存块[founc, found + size) 加入 reserved
 		if (found && !memblock_reserve(found, size))
 			goto done;
 	}
@@ -848,16 +922,487 @@ again:
 	return 0;
 
 done:
+	// 是否进行内存泄露检查
 	/* Skip kmemleak for kasan_init() due to high volume. */
 	if (end != MEMBLOCK_ALLOC_KASAN)
-		/*
-		 * The min_count is set to 0 so that memblock allocated
-		 * blocks are never reported as leaks. This is because many
-		 * of these blocks are only referred via the physical
-		 * address which is not looked up by kmemleak.
-		 */
 		kmemleak_alloc_phys(found, size, 0, 0);
 
 	return found;
 }
+```
+
+#### memblock_find_in_range_node
+```c
+static phys_addr_t __init_memblock memblock_find_in_range_node(phys_addr_t size,
+					phys_addr_t align, phys_addr_t start,
+					phys_addr_t end, int nid,
+					enum memblock_flags flags)
+{
+	/* pump up @end */
+	if (end == MEMBLOCK_ALLOC_ACCESSIBLE ||
+	    end == MEMBLOCK_ALLOC_KASAN)
+		end = memblock.current_limit;
+
+	/* avoid allocating the first page */
+	start = max_t(phys_addr_t, start, PAGE_SIZE);
+	end = max(start, end);
+
+	// 从0地址向高地址分配 还是 从高地址向0地址分配
+	if (memblock_bottom_up()) // memblock.bottom_up
+		return __memblock_find_range_bottom_up(start, end, size, align,
+						       nid, flags);
+	else
+		return __memblock_find_range_top_down(start, end, size, align,
+						      nid, flags);
+}
+
+// 从高地址向0地址分配
+// start : 内存区域下限，此处是 0 + PAGE_SIZE
+// end : 内存区域上限，此处是 memblock.current_limit，也就是最大值
+static phys_addr_t __init_memblock
+__memblock_find_range_top_down(phys_addr_t start, phys_addr_t end,
+			       phys_addr_t size, phys_addr_t align, int nid,
+			       enum memblock_flags flags)
+{
+	phys_addr_t this_start, this_end, cand;
+	u64 i;
+
+	// 遍历存在于memblock.memory 但排除 memblock.reserve的内存块
+	// 注意并没有修改 memblock.memory.regions[] 
+	// 获得 this_start this_end
+	for_each_free_mem_range_reverse(i, nid, flags, &this_start, &this_end,
+					NULL) {
+		// 限制this_start this_end 在 [start, end] 范围内
+		this_start = clamp(this_start, start, end);
+		this_end = clamp(this_end, start, end);
+
+		// 从 this_end 开始分配内存，即 [this_start, this_end] 这块内存
+		// 区域最大能提供 [0, this_end]大小的内存，
+		// 如果 this_end < size，则说明内存大小肯定不足
+		if (this_end < size)
+			continue;
+
+		// 从this_end分配size大小的内存，并确保对齐
+		// 如果分配区域在this_start内则说明分配成功
+		cand = round_down(this_end - size, align);
+		if (cand >= this_start)
+			return cand;
+	}
+
+	return 0;
+}
+
+/**
+ * clamp - clamp - 返回一个在给定范围内的值，并进行严格的类型检查
+ * @val: current value
+ * @lo: lowest allowable value
+ * @hi: highest allowable value
+ *
+ * This macro does strict typechecking of @lo/@hi to make sure they are of the
+ * same type as @val.  See the unnecessary pointer comparisons.
+ */
+#define clamp(val, lo, hi) min((typeof(val))max(val, lo), hi)
+
+/**
+ * round_down -  向下舍入到下一个指定的2的幂次方
+ * @x: the value to round
+ * @y: multiple to round down to (must be a power of 2)
+ *
+ * Rounds @x down to next multiple of @y (which must be a power of 2).
+ * To perform arbitrary rounding down, use rounddown() below.
+ */
+#define round_down(x, y) ((x) & ~__round_mask(x, y))
+```
+
+### memblock_free
+```c
+/*
+ * 释放由 memblock_alloc_xx 分配的内存块[base, base + size)
+ * 被释放了的内存，不会被释放给伙伴分配器
+ */
+int __init_memblock memblock_free(phys_addr_t base, phys_addr_t size)
+{
+	phys_addr_t end = base + size - 1;
+
+	memblock_dbg("%s: [%pa-%pa] %pS\n", __func__,
+		     &base, &end, (void *)_RET_IP_);
+
+	kmemleak_free_part_phys(base, size);
+	// memblock_free是释放预留的内存，
+	// 当这些内存不存在于memblock.reserved时，就可以从 memblock.memory中分配
+	return memblock_remove_range(&memblock.reserved, base, size);
+}
+
+static int __init_memblock memblock_remove_range(struct memblock_type *type,
+					  phys_addr_t base, phys_addr_t size)
+{
+	int start_rgn, end_rgn;
+	int i, ret;
+
+	ret = memblock_isolate_range(type, base, size, &start_rgn, &end_rgn);
+	if (ret)
+		return ret;
+
+	for (i = end_rgn - 1; i >= start_rgn; i--)
+		memblock_remove_region(type, i);
+	return 0;
+}
+```
+
+### for_each_reserved_mem_range
+```c
+#define for_each_reserved_mem_range(i, p_start, p_end)			\
+	__for_each_mem_range(i, &memblock.reserved, NULL, NUMA_NO_NODE,	\
+			     MEMBLOCK_NONE, p_start, p_end, NULL)
+
+#define __for_each_mem_range(i, type_a, type_b, nid, flags,		\
+			   p_start, p_end, p_nid)			\
+	for (i = 0, __next_mem_range(&i, nid, flags, type_a, type_b,	\
+				     p_start, p_end, p_nid);		\
+	     i != (u64)ULLONG_MAX;					\
+	     __next_mem_range(&i, nid, flags, type_a, type_b,		\
+			      p_start, p_end, p_nid))
+
+```
+
+`__next_mem_range` 函数的功能是给出类型为 `type_a` 集合中排除 `type_b` 集合后的可用区间。
+
+故此函数在多处遍历时被使用：
+
+`for_each_free_mem_range` 函数使用它时，`tpye_a` 取 `memblock.memory` ，`tpye_b` 取 `memblock.reserved` ，遍历可被申请的内存。
+
+`for_each_mem_range` 函数使用它时，`tpye_a` 取 `memblock.memory` ，`tpye_b` 取 `NULL` ，直接遍历 `memblock.memory` 可用内存集合区间。
+
+`for_each_reserved_mem_range` 函数使用它时，`tpye_a` 取 `memblock.reserved` ，`tpye_b` 取 `NULL` ，直接遍历 `memblock.reserved` 预留内存集合区间。
+
+## memblock_free_all
+当伙伴系统建立后，调用此函数释放所有物理页到伙伴系统
+
+```c
+unsigned long __init memblock_free_all(void)
+{
+	unsigned long pages;
+
+	reset_all_zones_managed_pages();
+
+	pages = free_low_memory_core_early();
+	totalram_pages_add(pages);
+
+	return pages;
+}
+```
+
+# 内存映射
+## 段映射部分
+```asm
+/*
+ * 创建恒等映射，为什么使用恒等映射？
+ * 因为创建页表，并打开MMu的代码，前部分运行在物理地址
+ * 后部分运行在虚拟地址，代码是连续的，所以物理地址必须
+ * 等于虚拟地址
+ */ 
+/*
+ * 设置初始页表。我们只设置了最基本的部分，
+ * 这些是使内核运行所必需的，通常是映射内核代码
+ *
+ * r8 = phys_offset, r9 = cpuid, r10 = procinfo
+ * 
+ *  phys_offset : 内核解压后镜像的起始地址
+ *  procinfo : 0号进程信息
+ *
+ * Returns:
+ *  r0, r3, r5-r7 corrupted
+ *  r4 = physical page table address
+ */
+__create_page_tables:
+	pgtbl	r4, r8				@ page table address 分配页表内存
+	                            @ r4 记录页表地址
+
+	/*
+	 * 将页表清零
+	 */
+	mov	r0, r4
+	mov	r3, #0
+	add	r6, r0, #PG_DIR_SIZE
+1:	str	r3, [r0], #4
+	str	r3, [r0], #4
+	str	r3, [r0], #4
+	str	r3, [r0], #4
+	teq	r0, r6
+	bne	1b
+
+#ifdef CONFIG_ARM_LPAE
+	/*
+	 * Build the PGD table (first level) to point to the PMD table. A PGD
+	 * entry is 64-bit wide.
+	 */
+	mov	r0, r4
+	add	r3, r4, #0x1000			@ first PMD table address
+	orr	r3, r3, #3			@ PGD block type
+	mov	r6, #4				@ PTRS_PER_PGD
+	mov	r7, #1 << (55 - 32)		@ L_PGD_SWAPPER
+1:
+#ifdef CONFIG_CPU_ENDIAN_BE8
+	str	r7, [r0], #4			@ set top PGD entry bits
+	str	r3, [r0], #4			@ set bottom PGD entry bits
+#else
+	str	r3, [r0], #4			@ set bottom PGD entry bits
+	str	r7, [r0], #4			@ set top PGD entry bits
+#endif
+	add	r3, r3, #0x1000			@ next PMD table
+	subs	r6, r6, #1
+	bne	1b
+
+	add	r4, r4, #0x1000			@ point to the PMD tables
+#ifdef CONFIG_CPU_ENDIAN_BE8
+	add	r4, r4, #4			@ we only write the bottom word
+#endif
+#endif
+
+	ldr	r7, [r10, #PROCINFO_MM_MMUFLAGS] @ 读取MMU flags
+
+	/*
+	 * 现在 __turn_mmu_on 的物理地址已经确定（因为代码已经加载完成）
+	 * 所以要根据 __turn_mmu_on 到 __turn_mmu_on_end 的物理地址填充页表
+	 * 并且由于__turn_mmu_on一部分运行在虚拟地址，一部分运行在物理地址
+	 * 所以必须建立恒等映射
+	 *
+	 * 将开启MMU的代码 __turn_mmu_on 建立恒等映射
+	 * __turn_mmu_on代码的虚拟地址范围是 __turn_mmu_on - __turn_mmu_on_end
+	 */
+	adr	r0, __turn_mmu_on_loc @ r0存放__turn_mmu_on_loc的物理地址
+	ldmia	r0, {r3, r5, r6} @ 将r0指向的内存的值依次放到 r3 r5 r6
+	                         @ r3 = __turn_mmu_loc 虚拟地址
+							 @ r5 = __turn_mmu_on 虚拟地址
+							 @ r6 = __turn_mmu_on_end 虚拟地址
+
+	sub	r0, r0, r3			@ virt->phys offset
+	                        @ 计算虚拟地址和物理地址间的偏移
+							@ r0 = r0 - r3
+							@ r0 = __turn_mmu_on_loc物理地址 - __turn_mmu_on_loc虚拟地址
+
+	add	r5, r5, r0			@ phys __turn_mmu_on
+							@ 计算 __turn_mmu_on的物理地址
+							@ r5 = r5 + r0
+							@ r5 = __turn_mmu_on虚拟地址 + offset
+
+	add	r6, r6, r0			@ phys __turn_mmu_on_end
+							@ 计算__turn_mmu_on_end的物理地址
+
+	mov	r5, r5, lsr #SECTION_SHIFT  @ r5=r5>>20
+                                    @ 对等映射：将物理地址当成虚拟地址
+                                    @ 虚拟地址>>20 得到 页表索引号
+									@ 同时得到物理地址基地址>>20
+
+	mov	r6, r6, lsr #SECTION_SHIFT  @ r6=r6>>20
+                                    @ 对等映射：将物理地址当成虚拟地址
+                                    @ 虚拟地址>>20 得到 页表索引号
+									@ 同时得到物理地址基地址>>20
+
+1:	orr	r3, r7, r5, lsl #SECTION_SHIFT	@ flags + kernel base
+                                        @ r3 = r7 | r5<<20
+                                        @ 将物理基地址做高位，
+										@ 位或上mmu flags 得到填充页表的值
+
+	str	r3, [r4, r5, lsl #PMD_ORDER]	@ identity mapping
+                                        @ 将r3页表项值填充到页表
+                                        @ 页表的地址计算：
+                                        @     r4 + r5<<2
+                                        @     页表基地址 + 页索引号 * 4   得到页表项地址
+                                        @     之所以乘以4，是因为一个页表项占4字节
+
+	cmp	r5, r6                  @ 比较当前页表号和结束页表号
+	addlo	r5, r5, #1			@ next section
+								@ 当r5 < r6 时，r5 = r5+1 , 也就是r5为下一个页表号
+
+	blo	1b                      @ 当r5 < r6 时，循环
+
+	/*
+	 * Map our RAM from the start to the end of the kernel .bss section.
+	 * 建立kernel镜像映射，包括 .data .text ..
+	 */
+	add	r0, r4, #PAGE_OFFSET >> (SECTION_SHIFT - PMD_ORDER) @ r0记录kernel起始页地址
+
+                                                            @ 因为第一个页号被对等映射占据，
+                                                            @ 所以kernel的从第二个页开始
+                                                            @ r0 = 页表基地址 + 第二个页的偏移地址
+	ldr	r6, =(_end - 1)   @ kernel的虚拟地址的结束地址
+	orr	r3, r8, r7        @ r8:kernel镜像物理起始地址的基地址
+	add	r6, r4, r6, lsr #(SECTION_SHIFT - PMD_ORDER)
+1:	str	r3, [r0], #1 << PMD_ORDER
+	add	r3, r3, #1 << SECTION_SHIFT
+	cmp	r0, r6
+	bls	1b
+
+
+```
+
+
+
+# 伙伴系统
+伙伴系统用于分配连续的物理页，称为 page block。
+
+阶order是伙伴系统的专业术语，表示页的数量，2^n个连续的page称为 n阶page block
+
+满足以下条件两个page block称为伙伴，伙伴才可以合并
+* page block必须相邻, 即物理地址连续
+* page block 第一个page 号必须是2的整数倍
+* 如果合并成 n+1 阶page block，第一页page号必须是2^(n+1)整数倍
+
+简单说，能合并的page block必须是从相同上级page block分割
+
+
+## 数据结构
+```c
+struct zone {
+	/* Read-mostly fields */
+
+	/* zone watermarks, access with *_wmark_pages(zone) macros */
+	unsigned long _watermark[NR_WMARK];
+	unsigned long watermark_boost;
+
+	unsigned long nr_reserved_highatomic;
+
+	/*
+	 * We don't know if the memory that we're going to allocate will be
+	 * freeable or/and it will be released eventually, so to avoid totally
+	 * wasting several GB of ram we must reserve some of the lower zone
+	 * memory (otherwise we risk to run OOM on the lower zones despite
+	 * there being tons of freeable ram on the higher zones).  This array is
+	 * recalculated at runtime if the sysctl_lowmem_reserve_ratio sysctl
+	 * changes.
+	 */
+	long lowmem_reserve[MAX_NR_ZONES];
+
+#ifdef CONFIG_NEED_MULTIPLE_NODES
+	int node;
+#endif
+	struct pglist_data	*zone_pgdat;
+	struct per_cpu_pageset __percpu *pageset;
+
+#ifndef CONFIG_SPARSEMEM
+	/*
+	 * Flags for a pageblock_nr_pages block. See pageblock-flags.h.
+	 * In SPARSEMEM, this map is stored in struct mem_section
+	 */
+	unsigned long		*pageblock_flags;
+#endif /* CONFIG_SPARSEMEM */
+
+	/* zone_start_pfn == zone_start_paddr >> PAGE_SHIFT */
+	unsigned long		zone_start_pfn;
+
+	/*
+	 * spanned_pages is the total pages spanned by the zone, including
+	 * holes, which is calculated as:
+	 * 	spanned_pages = zone_end_pfn - zone_start_pfn;
+	 *
+	 * present_pages is physical pages existing within the zone, which
+	 * is calculated as:
+	 *	present_pages = spanned_pages - absent_pages(pages in holes);
+	 *
+	 * managed_pages is present pages managed by the buddy system, which
+	 * is calculated as (reserved_pages includes pages allocated by the
+	 * bootmem allocator):
+	 *	managed_pages = present_pages - reserved_pages;
+	 *
+	 * So present_pages may be used by memory hotplug or memory power
+	 * management logic to figure out unmanaged pages by checking
+	 * (present_pages - managed_pages). And managed_pages should be used
+	 * by page allocator and vm scanner to calculate all kinds of watermarks
+	 * and thresholds.
+	 *
+	 * Locking rules:
+	 *
+	 * zone_start_pfn and spanned_pages are protected by span_seqlock.
+	 * It is a seqlock because it has to be read outside of zone->lock,
+	 * and it is done in the main allocator path.  But, it is written
+	 * quite infrequently.
+	 *
+	 * The span_seq lock is declared along with zone->lock because it is
+	 * frequently read in proximity to zone->lock.  It's good to
+	 * give them a chance of being in the same cacheline.
+	 *
+	 * Write access to present_pages at runtime should be protected by
+	 * mem_hotplug_begin/end(). Any reader who can't tolerant drift of
+	 * present_pages should get_online_mems() to get a stable value.
+	 */
+	atomic_long_t		managed_pages;
+	unsigned long		spanned_pages;
+	unsigned long		present_pages;
+
+	const char		*name;
+
+#ifdef CONFIG_MEMORY_ISOLATION
+	/*
+	 * Number of isolated pageblock. It is used to solve incorrect
+	 * freepage counting problem due to racy retrieving migratetype
+	 * of pageblock. Protected by zone->lock.
+	 */
+	unsigned long		nr_isolate_pageblock;
+#endif
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+	/* see spanned/present_pages for more description */
+	seqlock_t		span_seqlock;
+#endif
+
+	int initialized;
+
+	/* Write-intensive fields used from the page allocator */
+	ZONE_PADDING(_pad1_)
+
+	/* free areas of different sizes */
+	struct free_area	free_area[MAX_ORDER];
+
+	/* zone flags, see below */
+	unsigned long		flags;
+
+	/* Primarily protects free_area */
+	spinlock_t		lock;
+
+	/* Write-intensive fields used by compaction and vmstats. */
+	ZONE_PADDING(_pad2_)
+
+	/*
+	 * When free pages are below this point, additional steps are taken
+	 * when reading the number of free pages to avoid per-cpu counter
+	 * drift allowing watermarks to be breached
+	 */
+	unsigned long percpu_drift_mark;
+
+#if defined CONFIG_COMPACTION || defined CONFIG_CMA
+	/* pfn where compaction free scanner should start */
+	unsigned long		compact_cached_free_pfn;
+	/* pfn where compaction migration scanner should start */
+	unsigned long		compact_cached_migrate_pfn[ASYNC_AND_SYNC];
+	unsigned long		compact_init_migrate_pfn;
+	unsigned long		compact_init_free_pfn;
+#endif
+
+#ifdef CONFIG_COMPACTION
+	/*
+	 * On compaction failure, 1<<compact_defer_shift compactions
+	 * are skipped before trying again. The number attempted since
+	 * last failure is tracked with compact_considered.
+	 * compact_order_failed is the minimum compaction failed order.
+	 */
+	unsigned int		compact_considered;
+	unsigned int		compact_defer_shift;
+	int			compact_order_failed;
+#endif
+
+#if defined CONFIG_COMPACTION || defined CONFIG_CMA
+	/* Set to true when the PG_migrate_skip bits should be cleared */
+	bool			compact_blockskip_flush;
+#endif
+
+	bool			contiguous;
+
+	ZONE_PADDING(_pad3_)
+	/* Zone statistics */
+	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];
+	atomic_long_t		vm_numa_stat[NR_VM_NUMA_STAT_ITEMS];
+} ____cacheline_internodealigned_in_smp;
+
+
 ```
