@@ -1112,7 +1112,7 @@ start_kernel
 		// 由于memblock.memory可能变化，重新确定物理内存arm_lowmem_limit
 		adjust_lowmem_bounds();
 		...
-		// 初始化伙伴系统
+		// 完成线性映射
 		paging_init(mdesc);
 		...
 
@@ -1382,6 +1382,135 @@ __create_page_tables:
 ```
 
 
+## 建立线性映射 paging_init
+```c
+setup_arch
+	adjust_lowmem_bounds	// 确定高端内存和低端内存，线性映射区 
+	paging_init // 进行线性映射
+```
+
+```c
+void __init paging_init(const struct machine_desc *mdesc)
+{
+	void *zero_page;
+
+	prepare_page_table(); // 清零部分映射
+	map_lowmem(); // 建立线性映射
+	memblock_set_current_limit(arm_lowmem_limit);
+	dma_contiguous_remap();
+	early_fixmap_shutdown();
+	devicemaps_init(mdesc);
+	kmap_init();
+	tcm_init();
+
+	top_pmd = pmd_off_k(0xffff0000);
+
+	/* allocate the zero page. */
+	zero_page = early_alloc(PAGE_SIZE);
+
+	bootmem_init();
+
+	empty_zero_page = virt_to_page(zero_page);
+	__flush_dcache_page(NULL, empty_zero_page);
+}
+```
+
+### prepare_page_table
+```c
+static inline void prepare_page_table(void)
+{
+	unsigned long addr;
+	phys_addr_t end;
+
+	// 将 内核镜像之下的虚拟空间的映射清零
+	for (addr = 0; addr < MODULES_VADDR; addr += PMD_SIZE)
+		pmd_clear(pmd_off_k(addr));
+
+	// 将 MODULES_VADDR - PAGE_OFFSET 也就是modules区映射清零
+	for ( ; addr < PAGE_OFFSET; addr += PMD_SIZE)
+		pmd_clear(pmd_off_k(addr));
+
+	/*
+	 * Find the end of the first block of lowmem.
+	 */
+	end = memblock.memory.regions[0].base + memblock.memory.regions[0].size;
+	if (end >= arm_lowmem_limit)
+		end = arm_lowmem_limit;
+
+	/*
+	 * Clear out all the kernel space mappings, except for the first
+	 * memory bank, up to the vmalloc region.
+	 */
+	for (addr = __phys_to_virt(end);
+	     addr < VMALLOC_START; addr += PMD_SIZE)
+		pmd_clear(pmd_off_k(addr));
+}
+```
+
+### map_lowmem
+```c
+static void __init map_lowmem(void)
+{
+	phys_addr_t kernel_x_start = round_down(__pa(KERNEL_START), SECTION_SIZE);
+	phys_addr_t kernel_x_end = round_up(__pa(__init_end), SECTION_SIZE);
+	phys_addr_t start, end;
+	u64 i;
+
+	/* Map all the lowmem memory banks. */
+	for_each_mem_range(i, &start, &end) {
+		struct map_desc map;
+
+		if (end > arm_lowmem_limit)
+			end = arm_lowmem_limit;
+		if (start >= end)
+			break;
+
+		if (end < kernel_x_start) {
+			map.pfn = __phys_to_pfn(start);
+			map.virtual = __phys_to_virt(start);
+			map.length = end - start;
+			map.type = MT_MEMORY_RWX;
+
+			create_mapping(&map);
+		} else if (start >= kernel_x_end) {
+			map.pfn = __phys_to_pfn(start);
+			map.virtual = __phys_to_virt(start);
+			map.length = end - start;
+			map.type = MT_MEMORY_RW;
+
+			create_mapping(&map);
+		} else {
+			/* This better cover the entire kernel */
+			if (start < kernel_x_start) {
+				map.pfn = __phys_to_pfn(start);
+				map.virtual = __phys_to_virt(start);
+				map.length = kernel_x_start - start;
+				map.type = MT_MEMORY_RW;
+
+				create_mapping(&map);
+			}
+
+			map.pfn = __phys_to_pfn(kernel_x_start);
+			map.virtual = __phys_to_virt(kernel_x_start);
+			map.length = kernel_x_end - kernel_x_start;
+			map.type = MT_MEMORY_RWX;
+
+			create_mapping(&map);
+
+			if (kernel_x_end < end) {
+				map.pfn = __phys_to_pfn(kernel_x_end);
+				map.virtual = __phys_to_virt(kernel_x_end);
+				map.length = end - kernel_x_end;
+				map.type = MT_MEMORY_RW;
+
+				create_mapping(&map);
+			}
+		}
+	}
+}
+```
+
+
 
 # 伙伴系统
 伙伴系统用于分配连续的物理页，称为 page block。
@@ -1550,3 +1679,13 @@ struct zone {
 
 
 ```
+
+# 重要的宏和全局变量
+
+| 宏定义符号 | 描述 |
+| VA_START | 内核地址空间的起始地址 |
+| --- | --- |
+| PAGE_OFFSET | kernel image的起始虚拟地址，一般而言也就是系统中RAM的首地址，在该地址TEXT_OFFSET之后保存了kernel image。 |
+| TASK_SIZE	 | 一般而言，用户地址空间从0开始，大小就是TASK_SIZE，因此，这个宏定义的全称应该是task userspace size。对于ARM64的用户空间进程而言，有两种，一种是运行在AArch64状态下，另外一种是运行在AArch32状态，因此，实际上代码中又定义了TASK_SIZE_32和TASK_SIZE_64两个宏定义。 |
+| PHYS_OFFSET | 由于内存和IO统一编址，物理内存的起始地址不是0x0，使用PHYS_OFFSET表示物理空间的起始地址 |
+
