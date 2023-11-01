@@ -145,6 +145,9 @@ start_kernel
 
 ##### early_init_dt_scan_memory
 ###### 设备树中memory定义  
+
+注意，新的uboot会检查真实的物理内存情况，如果真实物理内存只有256MB，但是设备树写的是 1GB，则会修改设备树，保证传递给kernel的设备树正确描述硬件
+
 ```
 / {
 	// reg是 cells数组
@@ -1099,17 +1102,130 @@ start_kernel
 		...
 		mdesc = setup_machine_fdt(atags_vaddr); // 根据设备树memory节点，初始化memblock
 		...
-		adjust_lowmem_bounds();
-		arm_memblock_init(mdesc);
+		// 计算物理内存的高端和低端
+		adjust_lowmem_bounds(); 
+		// 将不参与分配的内存加入 memblock.reserved
+		// 包括 内核镜像占用的内存, initrd占用的内存
+		// 设备树中  /memreserve 节点定义的内存
+		// DMA 占用的内存
+		arm_memblock_init(mdesc); 
+		// 由于memblock.memory可能变化，重新确定物理内存arm_lowmem_limit
 		adjust_lowmem_bounds();
 		...
+		// 初始化伙伴系统
 		paging_init(mdesc);
 		...
 
 ```
 
+
 ## adjust_lowmem_bounds
 
+本函数计算物理内存的高端和低端，
+
+输出全局变量：
+* arm_lowmem_limit : 记录低端内存的上限，物理地址
+* high_memory : 记录 高端内存的开始，虚拟地址
+
+首先令虚拟地址vmalloc区的底部加上8MB的空洞得到虚拟空间中高端内存和低端内存的分界地址。
+
+然后将其转换为物理地址 `vmalloc_limit`。
+
+然后比较 `vmalloc_limit` 和 `memblock.memory` 可用的物理地址最高位，
+
+以两者中最小的作为物理内存中高端和低端的分界 `arm_lowmem_limit`。
+
+也就是说若线性映射区能覆盖所有的物理内存，则 `arm_lowmem_limit` 为 物理地址最高位，即没有高端物理内存
+
+若不能覆盖，则 `[ block_start , arm_lowmem_limit]`做低端物理内存
+
+`[arm_lowmem_limit, block_end]` 做高端物理内存
+
+若没有开启`CONFIG_HIGHMEM` ，则高端物理内存无法被映射，将高端物理内存移除 `memblock.memory`
+
+```c
+void __init adjust_lowmem_bounds(void)
+{
+	phys_addr_t block_start, block_end, memblock_limit = 0;
+	u64 vmalloc_limit, i;
+	phys_addr_t lowmem_limit = 0;
+
+	// vmalloc_limit : 物理地址，VMALLOC分区在物理地址上的开始
+	vmalloc_limit = (u64)(uintptr_t)vmalloc_min - PAGE_OFFSET + PHYS_OFFSET; // 0xd0000000
+
+	for_each_mem_range(i, &block_start, &block_end) {
+		if (!IS_ALIGNED(block_start, PMD_SIZE)) {
+			phys_addr_t len;
+
+			len = round_up(block_start, PMD_SIZE) - block_start;
+			memblock_mark_nomap(block_start, len);
+		}
+		break;
+	}
+
+	for_each_mem_range(i, &block_start, &block_end) {
+		if (block_start < vmalloc_limit) {
+			if (block_end > lowmem_limit)
+				// 如果 vmalloc_limit < block_end 
+				// 意味着线性映射无法覆盖所有物理内存
+				// 那么物理内存将分为高端内存和低端内存
+				lowmem_limit = min_t(u64,
+							 vmalloc_limit,
+							 block_end);
+
+			if (!memblock_limit) {
+				if (!IS_ALIGNED(block_start, PMD_SIZE))
+					memblock_limit = block_start;
+				else if (!IS_ALIGNED(block_end, PMD_SIZE))
+					memblock_limit = lowmem_limit;
+			}
+
+		}
+	}
+
+	// 记录低端内存的上限，物理地址
+	arm_lowmem_limit = lowmem_limit;
+
+	// 记录 高端内存的开始，虚拟地址
+	high_memory = __va(arm_lowmem_limit - 1) + 1;
+
+	if (!memblock_limit)
+		memblock_limit = arm_lowmem_limit;
+
+	/*
+	 * Round the memblock limit down to a pmd size.  This
+	 * helps to ensure that we will allocate memory from the
+	 * last full pmd, which should be mapped.
+	 */
+	memblock_limit = round_down(memblock_limit, PMD_SIZE);
+
+	// 如果没有开启高端内存，且 物理内存的结束地址 > 物理内存低端区的上限
+	// 则意味着一部分内存无法被线性映射访问，但又没有使用高端内存
+	// 所以一部分内存无法被访问，将这部分内存移除memblock
+	// 这部分内存为 [ arm_lowmem_limit, end ]
+	if (!IS_ENABLED(CONFIG_HIGHMEM) || cache_is_vipt_aliasing()) {
+		if (memblock_end_of_DRAM() > arm_lowmem_limit) {
+			phys_addr_t end = memblock_end_of_DRAM();
+
+			pr_notice("Ignoring RAM at %pa-%pa\n",
+				  &memblock_limit, &end);
+			pr_notice("Consider using a HIGHMEM enabled kernel.\n");
+
+			memblock_remove(memblock_limit, end - memblock_limit);
+		}
+	}
+
+	memblock_set_current_limit(memblock_limit);
+}
+```
+
+当虚拟内存足够大，则所有物理内存都为低端内存，由`NORMAL_ZONE`管理，线性映射区和 `VMALLOC`区都映射到低端内存。
+
+![](./pic/69.jpg)
+
+当虚拟内存不足时，无法线性映射的物理内存区域做高端内存，vmalloc优先映射高端内存.
+
+![](./pic/69.jpg)
 
 # 内存映射
 ## mm_struct
