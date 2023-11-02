@@ -1507,8 +1507,10 @@ void __init paging_init(const struct machine_desc *mdesc)
 	// 分配zero_page, zero_page不属于伙伴系统
 	zero_page = early_alloc(PAGE_SIZE);
 
+	// 检查内存条是否故障，统计各个zone拥有的page数量
 	bootmem_init();
 
+	// 根据zero_page的虚拟地址，得到其page
 	empty_zero_page = virt_to_page(zero_page);
 	__flush_dcache_page(NULL, empty_zero_page);
 }
@@ -1780,7 +1782,166 @@ static inline pte_t *pmd_page_vaddr(pmd_t pmd)
 ```
 
 ### bootmem_init
+```c
+void __init bootmem_init(void)
+{
+	memblock_allow_resize();
+		memblock_can_resize = 1;
 
+	/*
+	 * min_low_pfn : 物理内存起始页帧号
+	 * max_low_pfn : 低端物理内存最大页帧号
+	 * max_pfn : 物理内存最大页帧号
+	 */
+	find_limits(&min_low_pfn, &max_low_pfn, &max_pfn);
+		*max_low = PFN_DOWN(memblock_get_current_limit());
+		*min = PFN_UP(memblock_start_of_DRAM());
+		*max_high = PFN_DOWN(memblock_end_of_DRAM());
+	
+
+	// 检查内存条是否故障
+	early_memtest((phys_addr_t)min_low_pfn << PAGE_SHIFT,
+		      (phys_addr_t)max_low_pfn << PAGE_SHIFT);
+
+	// 统计各个zone拥有的页面
+	zone_sizes_init(min_low_pfn, max_low_pfn, max_pfn);
+		unsigned long max_zone_pfn[MAX_NR_ZONES] = { 0 };
+		max_zone_pfn[ZONE_NORMAL] = max_low;
+#ifdef CONFIG_HIGHMEM
+		max_zone_pfn[ZONE_HIGHMEM] = max_high;
+#endif
+		free_area_init(max_zone_pfn);
+}
+```
+
+#### free_area_init
+
+```c
+/**
+   * free_area_init - 初始化所有的pg_data_t和区域数据
+   * @max_zone_pfn: 每个区域的最大PFN数组
+   *
+   * 这将为系统中的每个活动节点调用free_area_init_node()。
+   * 使用memblock_set_node()提供的页面范围，计算每个节点中每个区域的大小及其空洞。
+   * 如果两个相邻区域之间的最大PFN匹配，则假定该区域为空。
+   * 例如，如果arch_max_dma_pfn == arch_max_dma32_pfn，则假定
+   * arch_max_dma32_pfn没有页面。还假定一个区域从前一个区域结束的地方开始。
+   * 例如，ZONE_DMA32从arch_max_dma_pfn开始。
+   */
+void __init free_area_init(unsigned long *max_zone_pfn)
+{
+	unsigned long start_pfn, end_pfn;
+	int i, nid, zone;
+	bool descending;
+
+	/* Record where the zone boundaries are */
+	memset(arch_zone_lowest_possible_pfn, 0,
+				sizeof(arch_zone_lowest_possible_pfn));
+	memset(arch_zone_highest_possible_pfn, 0,
+				sizeof(arch_zone_highest_possible_pfn));
+
+	start_pfn = find_min_pfn_with_active_regions(); // 物理内存起始页帧号
+	descending = arch_has_descending_max_zone_pfns(); // false
+
+	for (i = 0; i < MAX_NR_ZONES; i++) {
+		if (descending)
+			zone = MAX_NR_ZONES - i - 1;
+		else
+			zone = i;
+
+		if (zone == ZONE_MOVABLE)
+			continue;
+
+		end_pfn = max(max_zone_pfn[zone], start_pfn);
+		arch_zone_lowest_possible_pfn[zone] = start_pfn;
+		arch_zone_highest_possible_pfn[zone] = end_pfn;
+
+		start_pfn = end_pfn;
+	}
+	// 对于NORMAL_ZONE
+	// arch_zone_lowest_possible_pfn[NORMAL_ZONE] = start_pfn
+	// arch_zone_lowest_possible_pfn[NORMAL_ZONE] = max_low_pfn
+	//
+	// 如果没有开启 HIGHMEM
+	// arch_zone_lowest_possible_pfn[HIGHMEM_ZONE] = max_low_pfn
+	// arch_zone_lowest_possible_pfn[HIGHMEM_ZONE] = max_low_pfn 
+	//
+	// 如果开启了 HIGHMEM
+	// arch_zone_lowest_possible_pfn[HIGHMEM_ZONE] = max_low_pfn
+	// arch_zone_lowest_possible_pfn[HIGHMEM_ZONE] = max_high_pfn 
+	//
+
+	/* Find the PFNs that ZONE_MOVABLE begins at in each node */
+	// vexpress板子没有ZONE_MOVABLE
+	memset(zone_movable_pfn, 0, sizeof(zone_movable_pfn));
+	find_zone_movable_pfns_for_nodes();
+
+	/* Print out the zone ranges */
+	pr_info("Zone ranges:\n");
+	for (i = 0; i < MAX_NR_ZONES; i++) {
+		if (i == ZONE_MOVABLE)
+			continue;
+		pr_info("  %-8s ", zone_names[i]);
+		if (arch_zone_lowest_possible_pfn[i] ==
+				arch_zone_highest_possible_pfn[i])
+			pr_cont("empty\n");
+		else
+			pr_cont("[mem %#018Lx-%#018Lx]\n",
+				(u64)arch_zone_lowest_possible_pfn[i]
+					<< PAGE_SHIFT,
+				((u64)arch_zone_highest_possible_pfn[i]
+					<< PAGE_SHIFT) - 1);
+	}
+
+	/* Print out the PFNs ZONE_MOVABLE begins at in each node */
+	pr_info("Movable zone start for each node\n");
+	for (i = 0; i < MAX_NUMNODES; i++) {
+		if (zone_movable_pfn[i])
+			pr_info("  Node %d: %#018Lx\n", i,
+			       (u64)zone_movable_pfn[i] << PAGE_SHIFT);
+	}
+
+	/*
+	 * Print out the early node map, and initialize the
+	 * subsection-map relative to active online memory ranges to
+	 * enable future "sub-section" extensions of the memory map.
+	 */
+	pr_info("Early memory node ranges\n");
+	for_each_mem_pfn_range(i, MAX_NUMNODES, &start_pfn, &end_pfn, &nid) {
+		pr_info("  node %3d: [mem %#018Lx-%#018Lx]\n", nid,
+			(u64)start_pfn << PAGE_SHIFT,
+			((u64)end_pfn << PAGE_SHIFT) - 1);
+		subsection_map_init(start_pfn, end_pfn - start_pfn);
+	}
+
+	/* Initialise every node */
+	mminit_verify_pageflags_layout();
+	setup_nr_node_ids();
+	for_each_online_node(nid) {
+		pg_data_t *pgdat = NODE_DATA(nid);
+		free_area_init_node(nid);
+
+		/* Any memory on that node */
+		if (pgdat->node_present_pages)
+			node_set_state(nid, N_MEMORY);
+		check_for_memory(pgdat, nid);
+	}
+
+	memmap_init();
+}
+```
+
+
+1GB物理内存，2GB内核虚拟内存，没有启动HIGHMEM，起始时打印内容:
+
+```
+Zone ranges:
+  Normal   [mem 0x0000000060000000-0x000000009fffffff]
+Movable zone start for each node
+Early memory node ranges
+  node   0: [mem 0x0000000060000000-0x000000009fffffff]
+Initmem setup node 0 [mem 0x0000000060000000-0x000000009fffffff]
+```
 
 # 伙伴系统
 伙伴系统用于分配连续的物理页，称为 page block。
@@ -1794,159 +1955,30 @@ static inline pte_t *pmd_page_vaddr(pmd_t pmd)
 
 简单说，能合并的page block必须是从相同上级page block分割
 
-
-## 数据结构
+## 从memblock 到伙伴系统
 ```c
-struct zone {
-	/* Read-mostly fields */
+start_kernel
+	setup_arch
+		setup_machine_fdt(atags_vaddr); // 根据设备树初始化memblock
+		adjust_lowmem_bounds(); // 确定高端内存和低端内存，线性映射区
+		arm_memblock_init(mdesc); // 确定memblock.reserved
+		adjust_lowmem_bounds(); // 再次确定高端内存低端内存，线性映射区
+		paging_init(mdesc); // 建立线性映射
 
-	/* zone watermarks, access with *_wmark_pages(zone) macros */
-	unsigned long _watermark[NR_WMARK];
-	unsigned long watermark_boost;
+	mm_init
+		mem_init(void) // 将memblock的内存交给伙伴系统管理
 
-	unsigned long nr_reserved_highatomic;
 
-	/*
-	 * We don't know if the memory that we're going to allocate will be
-	 * freeable or/and it will be released eventually, so to avoid totally
-	 * wasting several GB of ram we must reserve some of the lower zone
-	 * memory (otherwise we risk to run OOM on the lower zones despite
-	 * there being tons of freeable ram on the higher zones).  This array is
-	 * recalculated at runtime if the sysctl_lowmem_reserve_ratio sysctl
-	 * changes.
-	 */
-	long lowmem_reserve[MAX_NR_ZONES];
+```
+### mem_init
+```c
+void __init mem_init(void)
+	memblock_free_all(); // 释放低端内存到normal zone
+	free_highpages(); // 释放高端内存到 highmem zone
+```
 
-#ifdef CONFIG_NEED_MULTIPLE_NODES
-	int node;
-#endif
-	struct pglist_data	*zone_pgdat;
-	struct per_cpu_pageset __percpu *pageset;
-
-#ifndef CONFIG_SPARSEMEM
-	/*
-	 * Flags for a pageblock_nr_pages block. See pageblock-flags.h.
-	 * In SPARSEMEM, this map is stored in struct mem_section
-	 */
-	unsigned long		*pageblock_flags;
-#endif /* CONFIG_SPARSEMEM */
-
-	/* zone_start_pfn == zone_start_paddr >> PAGE_SHIFT */
-	unsigned long		zone_start_pfn;
-
-	/*
-	 * spanned_pages is the total pages spanned by the zone, including
-	 * holes, which is calculated as:
-	 * 	spanned_pages = zone_end_pfn - zone_start_pfn;
-	 *
-	 * present_pages is physical pages existing within the zone, which
-	 * is calculated as:
-	 *	present_pages = spanned_pages - absent_pages(pages in holes);
-	 *
-	 * managed_pages is present pages managed by the buddy system, which
-	 * is calculated as (reserved_pages includes pages allocated by the
-	 * bootmem allocator):
-	 *	managed_pages = present_pages - reserved_pages;
-	 *
-	 * So present_pages may be used by memory hotplug or memory power
-	 * management logic to figure out unmanaged pages by checking
-	 * (present_pages - managed_pages). And managed_pages should be used
-	 * by page allocator and vm scanner to calculate all kinds of watermarks
-	 * and thresholds.
-	 *
-	 * Locking rules:
-	 *
-	 * zone_start_pfn and spanned_pages are protected by span_seqlock.
-	 * It is a seqlock because it has to be read outside of zone->lock,
-	 * and it is done in the main allocator path.  But, it is written
-	 * quite infrequently.
-	 *
-	 * The span_seq lock is declared along with zone->lock because it is
-	 * frequently read in proximity to zone->lock.  It's good to
-	 * give them a chance of being in the same cacheline.
-	 *
-	 * Write access to present_pages at runtime should be protected by
-	 * mem_hotplug_begin/end(). Any reader who can't tolerant drift of
-	 * present_pages should get_online_mems() to get a stable value.
-	 */
-	atomic_long_t		managed_pages;
-	unsigned long		spanned_pages;
-	unsigned long		present_pages;
-
-	const char		*name;
-
-#ifdef CONFIG_MEMORY_ISOLATION
-	/*
-	 * Number of isolated pageblock. It is used to solve incorrect
-	 * freepage counting problem due to racy retrieving migratetype
-	 * of pageblock. Protected by zone->lock.
-	 */
-	unsigned long		nr_isolate_pageblock;
-#endif
-
-#ifdef CONFIG_MEMORY_HOTPLUG
-	/* see spanned/present_pages for more description */
-	seqlock_t		span_seqlock;
-#endif
-
-	int initialized;
-
-	/* Write-intensive fields used from the page allocator */
-	ZONE_PADDING(_pad1_)
-
-	/* free areas of different sizes */
-	struct free_area	free_area[MAX_ORDER];
-
-	/* zone flags, see below */
-	unsigned long		flags;
-
-	/* Primarily protects free_area */
-	spinlock_t		lock;
-
-	/* Write-intensive fields used by compaction and vmstats. */
-	ZONE_PADDING(_pad2_)
-
-	/*
-	 * When free pages are below this point, additional steps are taken
-	 * when reading the number of free pages to avoid per-cpu counter
-	 * drift allowing watermarks to be breached
-	 */
-	unsigned long percpu_drift_mark;
-
-#if defined CONFIG_COMPACTION || defined CONFIG_CMA
-	/* pfn where compaction free scanner should start */
-	unsigned long		compact_cached_free_pfn;
-	/* pfn where compaction migration scanner should start */
-	unsigned long		compact_cached_migrate_pfn[ASYNC_AND_SYNC];
-	unsigned long		compact_init_migrate_pfn;
-	unsigned long		compact_init_free_pfn;
-#endif
-
-#ifdef CONFIG_COMPACTION
-	/*
-	 * On compaction failure, 1<<compact_defer_shift compactions
-	 * are skipped before trying again. The number attempted since
-	 * last failure is tracked with compact_considered.
-	 * compact_order_failed is the minimum compaction failed order.
-	 */
-	unsigned int		compact_considered;
-	unsigned int		compact_defer_shift;
-	int			compact_order_failed;
-#endif
-
-#if defined CONFIG_COMPACTION || defined CONFIG_CMA
-	/* Set to true when the PG_migrate_skip bits should be cleared */
-	bool			compact_blockskip_flush;
-#endif
-
-	bool			contiguous;
-
-	ZONE_PADDING(_pad3_)
-	/* Zone statistics */
-	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];
-	atomic_long_t		vm_numa_stat[NR_VM_NUMA_STAT_ITEMS];
-} ____cacheline_internodealigned_in_smp;
-
+#### memblock_free_all
+```c
 
 ```
 
