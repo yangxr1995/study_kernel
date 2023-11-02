@@ -1494,6 +1494,7 @@ void __init paging_init(const struct machine_desc *mdesc)
 
 	prepare_page_table(); // 清零部分映射
 	map_lowmem(); // 建立线性映射
+	// 设置最大memblock最大分配地址不超过 低端内存
 	memblock_set_current_limit(arm_lowmem_limit);
 	dma_contiguous_remap();
 	early_fixmap_shutdown();
@@ -1503,7 +1504,7 @@ void __init paging_init(const struct machine_desc *mdesc)
 
 	top_pmd = pmd_off_k(0xffff0000);
 
-	/* allocate the zero page. */
+	// 分配zero_page, zero_page不属于伙伴系统
 	zero_page = early_alloc(PAGE_SIZE);
 
 	bootmem_init();
@@ -1549,20 +1550,26 @@ static inline void prepare_page_table(void)
 ```c
 static void __init map_lowmem(void)
 {
+	// 得到内核代码段的物理空间范围
+	// 将内核起始地址_text，转换成物理地址，并按照 SECTION_SIZE大小对齐向下取整
 	phys_addr_t kernel_x_start = round_down(__pa(KERNEL_START), SECTION_SIZE);
+	// 向上取整
 	phys_addr_t kernel_x_end = round_up(__pa(__init_end), SECTION_SIZE);
 	phys_addr_t start, end;
 	u64 i;
 
-	/* Map all the lowmem memory banks. */
+	// 遍历memblock.memory, 遍历所有可用的包括已分配和未分配的物理内存
+	// 映射所有低端物理内存, 建立线性映射
 	for_each_mem_range(i, &start, &end) {
 		struct map_desc map;
 
+		// 映射的物理内存不超过低端内存
 		if (end > arm_lowmem_limit)
 			end = arm_lowmem_limit;
 		if (start >= end)
 			break;
 
+		// 将可执行的部分映射成 RWX，其他映射成RW
 		if (end < kernel_x_start) {
 			map.pfn = __phys_to_pfn(start);
 			map.virtual = __phys_to_virt(start);
@@ -1608,6 +1615,171 @@ static void __init map_lowmem(void)
 }
 ```
 
+#### create_mapping
+
+对内核页表 `init_mm.pgd` 建立映射
+
+```c
+static void __init create_mapping(struct map_desc *md)
+{
+	// 如果要映射的虚拟地址在用户空间，则报错，并返回
+	if (md->virtual != vectors_base() && md->virtual < TASK_SIZE) {
+		pr_warn("BUG: not creating mapping for 0x%08llx at 0x%08lx in user region\n",
+			(long long)__pfn_to_phys((u64)md->pfn), md->virtual);
+		return;
+	}
+
+	// 如果要映射的虚拟地址在VMALLOC区外，则包警告
+	if (md->type == MT_DEVICE &&
+	    md->virtual >= PAGE_OFFSET && md->virtual < FIXADDR_START &&
+	    (md->virtual < VMALLOC_START || md->virtual >= VMALLOC_END)) {
+		pr_warn("BUG: mapping for 0x%08llx at 0x%08lx out of vmalloc space\n",
+			(long long)__pfn_to_phys((u64)md->pfn), md->virtual);
+	}
+
+	__create_mapping(&init_mm, md, early_alloc, false);
+}
+
+static void __init __create_mapping(struct mm_struct *mm, struct map_desc *md,
+				    void *(*alloc)(unsigned long sz),
+				    bool ng)
+{
+	unsigned long addr, length, end;
+	phys_addr_t phys;
+	const struct mem_type *type;
+	pgd_t *pgd;
+
+	// 根据用户输入的type，转换成填充pte的flags
+	type = &mem_types[md->type];
+
+	// 虚拟地址 PAGE 对齐，因为映射是以 page为单位
+	addr = md->virtual & PAGE_MASK;
+	// 得到对齐以page的物理地址
+	phys = __pfn_to_phys(md->pfn);
+	// 映射的长度也以page对齐
+	length = PAGE_ALIGN(md->length + (md->virtual & ~PAGE_MASK));
+
+	if (type->prot_l1 == 0 && ((addr | phys | length) & ~SECTION_MASK)) {
+		pr_warn("BUG: map for 0x%08llx at 0x%08lx can not be mapped using pages, ignoring.\n",
+			(long long)__pfn_to_phys(md->pfn), addr);
+		return;
+	}
+
+	// 得到pgd项
+	pgd = pgd_offset(mm, addr);
+	// 映射虚拟空间的结束地址
+	end = addr + length;
+	// 以pgd为单位进行映射
+	do {
+		// 得到下一个pgd对应的虚拟虚拟地址, 如果大于end，则返回end
+		unsigned long next = pgd_addr_end(addr, end);
+
+		// 分配p4d,并填充pgd项
+		alloc_init_p4d(pgd, addr, next, phys, type, alloc, ng);
+
+		phys += next - addr;
+		addr = next;
+	} while (pgd++, addr != end);
+}
+
+alloc_init_p4d
+alloc_init_pud
+和上面类似跳过
+
+static void __init alloc_init_pmd(pud_t *pud, unsigned long addr,
+				      unsigned long end, phys_addr_t phys,
+				      const struct mem_type *type,
+				      void *(*alloc)(unsigned long sz), bool ng)
+{
+	pmd_t *pmd = pmd_offset(pud, addr); // pmd = pud;
+	unsigned long next;
+
+	do {
+		next = pmd_addr_end(addr, end); // 返回end，因为pmd只有一个pud
+
+		if (type->prot_sect &&
+				((addr | next | phys) & ~SECTION_MASK) == 0) {
+			// 处理段映射
+			__map_init_section(pmd, addr, next, phys, type, ng);
+		} else {
+			// pte页表映射
+			alloc_init_pte(pmd, addr, next,
+				       __phys_to_pfn(phys), type, alloc, ng);
+		}
+
+		phys += next - addr;
+
+	} while (pmd++, addr = next, addr != end);
+}
+
+static void __init alloc_init_pte(pmd_t *pmd, unsigned long addr,
+				  unsigned long end, unsigned long pfn,
+				  const struct mem_type *type,
+				  void *(*alloc)(unsigned long sz),
+				  bool ng)
+{
+	// 如果pte数组没有分配则分配pte数组
+	// 并组合pte数组首元素的地址和 L1表的flags 得到的值，
+	// 填充pmd项
+	// 并返回 addr对应的pte数组第一个元素的虚拟地址
+	// 如果pmd项已经填充，则返回addr对应的pte数组第一个元素的虚拟地址
+	pte_t *pte = arm_pte_alloc(pmd, addr, type->prot_l1, alloc);
+
+	// 填充pte数组
+	// 填充范围，虚拟空间 [addr, end)
+	// 映射方式线性映射
+	// 这里其实填充两个pte数组
+	// 一个arm pte数组，一个linux pte数组
+	do {
+		set_pte_ext(pte, pfn_pte(pfn, __pgprot(type->prot_pte)),
+			    ng ? PTE_EXT_NG : 0);
+		pfn++;
+	} while (pte++, addr += PAGE_SIZE, addr != end);
+}
+
+static pte_t * __init arm_pte_alloc(pmd_t *pmd, unsigned long addr,
+				unsigned long prot,
+				void *(*alloc)(unsigned long sz))
+{
+	// 调用此函数时，pmd项极可能已经填充了，也就是pte数组已经分配
+	// 则直接返回 addr对应的pte项
+	// 如果没有分配，则分配pte数组，并设置pmd，并返回addr对应的pte项
+
+	if (pmd_none(*pmd)) { // pmd项如果没有使用
+						  // 分配pte并填充pmd
+						  // linux arm pte要分配两组pte
+						  // 一组用于arm的 pte flags，一组用于linux pte flags
+		pte_t *pte = alloc(PTE_HWTABLE_OFF + PTE_HWTABLE_SIZE);
+		// 将 MMU flags 和 pte的物理地址组合 成 pmd的值
+		// 填充 pmd项
+		__pmd_populate(pmd, __pa(pte), prot);
+	}
+	BUG_ON(pmd_bad(*pmd));
+	// 从pmd找到pte数组，在找到addr对应的pte项
+	// 返回指向pte项的指针
+	return pte_offset_kernel(pmd, addr);
+}
+
+static inline pte_t *pte_offset_kernel(pmd_t *pmd, unsigned long address)
+{
+	// pmd 指向一个  pmd项
+	// *pmd 存放了 pte数组的基地址和 MMU flags
+	// (pte_t *)pmd_page_vaddr(*pmd):得到pmd项存放的pte数组第一个元素的虚拟地址
+	// pte_index(address) : 得到数组的索引号
+	// 最后返回address对应的指向pte项的指针
+	return (pte_t *)pmd_page_vaddr(*pmd) + pte_index(address);
+}
+
+static inline pte_t *pmd_page_vaddr(pmd_t pmd)
+{
+	// pmd项的值存放和  pte数组的物理基地址和MMU flags
+	// 需要将pte物理基地址取出
+	// 并转换为虚拟地址返回
+	return __va(pmd_val(pmd) & PHYS_MASK & (s32)PAGE_MASK);
+}
+```
+
+### bootmem_init
 
 
 # 伙伴系统
@@ -1779,6 +1951,19 @@ struct zone {
 ```
 
 # 重要的宏和全局变量
+```c
+#define PAGE_OFFSET		UL(CONFIG_PAGE_OFFSET)
+#define TASK_SIZE		(UL(CONFIG_PAGE_OFFSET) - UL(SZ_16M))
+#define MODULES_VADDR		(PAGE_OFFSET - SZ_16M)
+
+#ifdef CONFIG_HIGHMEM
+#define MODULES_END		(PAGE_OFFSET - PMD_SIZE)
+#else
+#define MODULES_END		(PAGE_OFFSET)
+#endif
+
+
+```
 
 | 宏定义符号 | 描述 |
 | VA_START | 内核地址空间的起始地址 |
@@ -1786,4 +1971,5 @@ struct zone {
 | PAGE_OFFSET | kernel image的起始虚拟地址，一般而言也就是系统中RAM的首地址，在该地址TEXT_OFFSET之后保存了kernel image。 |
 | TASK_SIZE	 | 一般而言，用户地址空间从0开始，大小就是TASK_SIZE，因此，这个宏定义的全称应该是task userspace size。对于ARM64的用户空间进程而言，有两种，一种是运行在AArch64状态下，另外一种是运行在AArch32状态，因此，实际上代码中又定义了TASK_SIZE_32和TASK_SIZE_64两个宏定义。 |
 | PHYS_OFFSET | 由于内存和IO统一编址，物理内存的起始地址不是0x0，使用PHYS_OFFSET表示物理空间的起始地址 |
+
 
