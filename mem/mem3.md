@@ -1144,6 +1144,16 @@ start_kernel
 若没有开启`CONFIG_HIGHMEM` ，则高端物理内存无法被映射，将高端物理内存移除 `memblock.memory`
 
 ```c
+/*
+ * vmalloc_min : 虚拟地址，vmalloc 区间的最小开始
+ * VMALLOC_END : 虚拟地址，VMALLOC区的结束地址
+ * (240 << 20) : 240M ，VMALLOC区空间的最小大小
+ * VMALLOC_OFFSET : 线性映射区和VMALLOC区之间有一个间隔，大小为VMALLOC_OFFSET, 16MB
+ */
+static void * __initdata vmalloc_min =
+  (void *)(VMALLOC_END - (240 << 20) - VMALLOC_OFFSET);
+
+
 void __init adjust_lowmem_bounds(void)
 {
 	phys_addr_t block_start, block_end, memblock_limit = 0;
@@ -1226,6 +1236,94 @@ void __init adjust_lowmem_bounds(void)
 当虚拟内存不足时，无法线性映射的物理内存区域做高端内存，vmalloc优先映射高端内存.
 
 ![](./pic/69.jpg)
+
+## 物理内存不同大小情况下，内核的虚拟内存布局
+
+### 未开启开端内存
+256MB 物理内存 ，内核空间1GB
+
+lowmem 最大只能为256MB，剩余内核空间几乎都给了vmalloc
+
+所有物理内存都为Normal zone
+```
+Virtual kernel memory layout:
+    fixmap  : 0xffc80000 - 0xfff00000   (2560 kB)
+    vmalloc : 0xd0800000 - 0xff800000   ( 752 MB)
+    lowmem  : 0xc0000000 - 0xd0000000   ( 256 MB)
+    modules : 0xbf000000 - 0xc0000000   (  16 MB)
+      .text : 0x(ptrval) - 0x(ptrval)   (9184 kB)
+      .init : 0x(ptrval) - 0x(ptrval)   (1024 kB)
+      .data : 0x(ptrval) - 0x(ptrval)   ( 620 kB)
+       .bss : 0x(ptrval) - 0x(ptrval)   ( 192 kB)
+```
+
+512MB 物理内存 ，内核空间1GB
+
+lowmem 最大只能为512MB，剩余内核空间几乎都给了vmalloc
+
+所有物理内存都为Normal zone
+```
+Virtual kernel memory layout:
+    fixmap  : 0xffc80000 - 0xfff00000   (2560 kB)
+    vmalloc : 0xe0800000 - 0xff800000   ( 496 MB)
+    lowmem  : 0xc0000000 - 0xe0000000   ( 512 MB)
+    modules : 0xbf000000 - 0xc0000000   (  16 MB)
+      .text : 0x(ptrval) - 0x(ptrval)   (9184 kB)
+      .init : 0x(ptrval) - 0x(ptrval)   (1024 kB)
+      .data : 0x(ptrval) - 0x(ptrval)   ( 620 kB)
+       .bss : 0x(ptrval) - 0x(ptrval)   ( 192 kB)
+```
+
+1G 物理内存 ，内核空间1GB
+
+lowmem 最大只能为768MB，剩余内核空间几乎都给了vmalloc
+
+所有物理内存都为Normal zone
+
+```
+Zone ranges:
+  Normal   [mem 0x0000000060000000-0x000000008fffffff]
+
+Virtual kernel memory layout:
+    fixmap  : 0xffc80000 - 0xfff00000   (2560 kB)
+    vmalloc : 0xf0800000 - 0xff800000   ( 240 MB)
+    lowmem  : 0xc0000000 - 0xf0000000   ( 768 MB)
+    modules : 0xbf000000 - 0xc0000000   (  16 MB)
+      .text : 0x(ptrval) - 0x(ptrval)   (9184 kB)
+      .init : 0x(ptrval) - 0x(ptrval)   (1024 kB)
+      .data : 0x(ptrval) - 0x(ptrval)   ( 620 kB)
+       .bss : 0x(ptrval) - 0x(ptrval)   ( 192 kB)
+```
+
+综上可知，内核虚拟空间高端映射区有个底线，最少划分256M给高端映射区，
+
+这会导致线性映射区可能不能映射所有物理内存，比如上面1G物理内存，1G内核虚拟内存，
+
+线性映射区最大只能为768M，导致部分物理内存无法被映射
+
+### 开启高端内存
+1G 物理内存 ，内核空间1GB
+
+由于VMALLOC区至少需要240MB，导致线性映射区不足 768MB
+
+所以物理内存有部分不能线性映射，所以被划分成高端内存
+
+```
+Zone ranges:
+  Normal   [mem 0x0000000060000000-0x000000008fffffff] 767MB
+  HighMem  [mem 0x0000000090000000-0x000000009fffffff] 255MB
+
+Virtual kernel memory layout:
+    fixmap  : 0xffc80000 - 0xfff00000   (2560 kB)
+    vmalloc : 0xf0800000 - 0xff800000   ( 240 MB)
+    lowmem  : 0xc0000000 - 0xf0000000   ( 768 MB)
+    pkmap   : 0xbfe00000 - 0xc0000000   (   2 MB)
+    modules : 0xbf000000 - 0xbfe00000   (  14 MB)
+      .text : 0x(ptrval) - 0x(ptrval)   (9184 kB)
+      .init : 0x(ptrval) - 0x(ptrval)   (1024 kB)
+      .data : 0x(ptrval) - 0x(ptrval)   ( 621 kB)
+       .bss : 0x(ptrval) - 0x(ptrval)   ( 213 kB)
+```
 
 # 内存映射
 ## mm_struct
