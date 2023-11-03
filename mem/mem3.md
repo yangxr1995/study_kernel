@@ -1955,6 +1955,193 @@ Initmem setup node 0 [mem 0x0000000060000000-0x000000009fffffff]
 
 简单说，能合并的page block必须是从相同上级page block分割
 
+## 分配标志
+
+GFP标志控制分配器的行为。它们告诉我们哪些内存区域可以被使用，分配器应该多努力寻 找空闲的内存，这些内存是否可以被用户空间访问等等
+
+* GFP_KERNEL : 分配内核数据结构的内存，DMA可用内存，inode 缓存。注意，使用 GFP_KERNEL 意味着 GFP_RECLAIM ，这意味着在有内存压力的情况下可能会触发直接回收；调用上 下文必须允许睡眠。
+
+* GFP_NOWAIT : 如果分配是从一个原子上下文中进行的，例如中断处理程序，使用 GFP_NOWAIT 。这个 标志可以防止直接回收和IO或文件系统操作。因此，在内存压力下， GFP_NOWAIT 分配 可能会失败。有合理退路的分配应该使用 GFP_NOWARN 。
+
+* GFP_ATOMIC : 如果你认为访问保留内存区是合理的，并且除非分配成功，否则内核会有压力，你可以使用 GFP_ATOMIC 。
+
+* 用户空间的分配应该使用 GFP_USER 、 GFP_HIGHUSER 或 GFP_HIGHUSER_MOVABLE 中的一个标志。标志名称越长，限制性越小。
+
+* GFP_HIGHUSER_MOVABLE 不要求分配的内存将被内核直接访问，并意味着数据是可迁移的。
+
+* GFP_HIGHUSER 意味着所分配的内存是不可迁移的，但也不要求它能被内核直接访问(优先从高端内存分配)。举个 例子就是一个硬件分配内存，这些数据直接映射到用户空间，但没有寻址限制。
+
+* GFP_USER 意味着分配的内存是不可迁移的，它必须被内核直接访问。
+
+详细查看 ： https://www.kernel.org/doc/html/latest/translations/zh_CN/core-api/memory-allocation.html
+
+### 分配标志确定zone
+```
+
+#define ___GFP_DMA		0x01u     // 从 ZONE_DMA分配
+#define ___GFP_HIGHMEM		0x02u // 从 ZONE_HIGHMEM
+#define ___GFP_DMA32		0x04u // ZONE_DMA32
+#define ___GFP_MOVABLE		0x08u // ZONE_NORMAL
+
+#define GFP_ZONE_TABLE ( \
+	(ZONE_NORMAL << 0 * GFP_ZONES_SHIFT)				       \
+	| (OPT_ZONE_DMA << ___GFP_DMA * GFP_ZONES_SHIFT)		       \
+	| (OPT_ZONE_HIGHMEM << ___GFP_HIGHMEM * GFP_ZONES_SHIFT)	       \
+	| (OPT_ZONE_DMA32 << ___GFP_DMA32 * GFP_ZONES_SHIFT)		       \
+	| (ZONE_NORMAL << ___GFP_MOVABLE * GFP_ZONES_SHIFT)		       \
+	| (OPT_ZONE_DMA << (___GFP_MOVABLE | ___GFP_DMA) * GFP_ZONES_SHIFT)    \
+	| (ZONE_MOVABLE << (___GFP_MOVABLE | ___GFP_HIGHMEM) * GFP_ZONES_SHIFT)\
+	| (OPT_ZONE_DMA32 << (___GFP_MOVABLE | ___GFP_DMA32) * GFP_ZONES_SHIFT)\
+)
+
+static inline enum zone_type gfp_zone(gfp_t flags)
+{
+	enum zone_type z;
+	int bit = (__force int) (flags & GFP_ZONEMASK);
+
+	z = (GFP_ZONE_TABLE >> (bit * GFP_ZONES_SHIFT)) &
+					 ((1 << GFP_ZONES_SHIFT) - 1);
+	VM_BUG_ON((GFP_ZONE_BAD >> bit) & 1);
+	return z;
+}
+
+// 返回的zone_type
+
+enum zone_type {
+	ZONE_DMA,
+	ZONE_DMA32,
+	ZONE_NORMAL,
+	ZONE_HIGHMEM,
+	ZONE_MOVABLE,
+	ZONE_DEVICE,
+	__MAX_NR_ZONES
+};
+
+```
+
+## 备用区域列表
+如果指定的ZONE不满足分配请求，可以从备用ZONE借用page
+
+借用必须满足一些规则：
+* 一个内存的某个zone可以从另一个节点的相同类型的zone借用物理页
+* 高zone可以从低zone借用page，如 ZONE_NORMAL可以从ZONE_DMA借用，ZONE_HIGHMEM可以从ZONE_NORMAL借用
+* 低zone不能从高zone借用，如ZONE_NORMAL不能从ZONE_HIGHMEM借用
+
+包含所有节点的备用区域列表有两种排序方法：
+- 节点优先顺序: 先根据节点距离从小到达排序，然后在每个节点里再根据区域内存从高到底排序
+	- 优点: 选择就近内存
+	- 缺点: 容易耗尽高区域
+- 区域优先顺序: 先根据区域类型从高到低排序，然后在每个区域类型里再根据节点距离从小到大排序
+	- 优点: 减少高区域被耗尽的概率
+	- 缺点: 不能保证就近使用内存
+
+默认的排序算法是根据系统环境自动选择排序算法，如果是64位系统，ZONE DMA相对少，则使用节点优先，如果是32位系统，则使用区域优先
+
+
+```c
+typedef struct pglist_data {
+	// 本节点的zone
+	struct zone node_zones[MAX_NR_ZONES];
+	
+	// 备用区域列表, 对于UMA，包含所有内存节点的所有zone
+	struct zonelist node_zonelists[MAX_ZONELISTS];
+
+	// 本节点zone数量
+	int nr_zones; 
+
+} pg_data_t;
+
+// 继续解释 备用区域列表
+enum {
+	ZONELIST_FALLBACK,	// 包含所有内存节点的
+#ifdef CONFIG_NUMA
+	/*
+	 * The NUMA zonelists are doubled because we need zonelists that
+	 * restrict the allocations to a single node for __GFP_THISNODE.
+	 */
+	ZONELIST_NOFALLBACK,	/* zonelist without fallback (__GFP_THISNODE) */
+#endif
+	MAX_ZONELISTS
+};
+
+struct zonelist {
+	// 此数组包含有所有的节点的所有zone
+	struct zoneref _zonerefs[MAX_ZONES_PER_ZONELIST + 1];
+};
+
+struct zoneref {
+	struct zone *zone;	/* Pointer to actual zone */
+	int zone_idx;		/* zone_idx(zoneref->zone) */
+};
+
+#define MAX_ZONES_PER_ZONELIST (MAX_NUMNODES * MAX_NR_ZONES)
+
+```
+
+## 区域水线
+首选zone什么时候向备用zone借用内存，根据水线
+
+- `_watermark[WMARK_MIN]`
+	-  申请内存时，若首选内存区域的内存少于最低水位，则从备用内存区域借用内存，如果失败，则唤醒所有的内存回收线程，以异步的方式回收内存
+- `_watermark[WMARK_LOW]`
+	- 
+- `_watermark[WMARK_HIGH]`
+
+
+```c
+#define min_wmark_pages(z) (z->_watermark[WMARK_MIN] + z->watermark_boost)
+#define low_wmark_pages(z) (z->_watermark[WMARK_LOW] + z->watermark_boost)
+#define high_wmark_pages(z) (z->_watermark[WMARK_HIGH] + z->watermark_boost)
+#define wmark_pages(z, i) (z->_watermark[i] + z->watermark_boost)
+
+enum zone_watermarks {
+	WMARK_MIN,
+	WMARK_LOW,
+	WMARK_HIGH,
+	NR_WMARK
+};
+
+struct zone {
+	unsigned long _watermark[NR_WMARK]; // 记录zone的三个水线
+	unsigned long watermark_boost;
+
+	/*
+	 * spanned_pages是区域涵盖的总页数，包括空洞，计算方式为：
+	 * spanned_pages = zone_end_pfn - zone_start_pfn;
+	 *
+	 * present_pages是区域内存在的物理页数，计算方式为：
+	 * present_pages = spanned_pages - absent_pages（空洞中的页数）;
+	 *
+	 * managed_pages是由伙伴系统管理的存在的页数，计算方式为（reserved_pages包括由bootmem分配器分配的页）：
+	 * managed_pages = present_pages - reserved_pages;
+	 *
+	 * 因此，present_pages可以被内存热插拔或内存电源管理逻辑用来通过检查（present_pages - managed_pages）来确定未管理的页。
+	 * managed_pages应该被页面分配器和虚拟内存扫描器用来计算各种水印和阈值。
+	 *
+	 * 锁定规则：
+	 *
+	 * zone_start_pfn和spanned_pages受span_seqlock保护。
+	 * 它是一个序列锁，因为它必须在zone->lock之外进行读取，并且在主要的分配器路径中完成。但是，它的写入频率相当低。
+	 *
+	 * span_seqlock与zone->lock一起声明，因为它经常在接近zone->lock的地方进行读取。
+	 * 他们有机会位于同一个缓存行中是有好处的。
+	 *
+	 * 运行时对present_pages的写访问应该由mem_hotplug_begin/end()进行保护。
+	 * 任何无法容忍present_pages漂移的读者应该使用get_online_mems()来获取稳定的值。
+	 */
+	atomic_long_t		managed_pages;
+	unsigned long		spanned_pages;
+	unsigned long		present_pages;
+```
+
+```c
+
+unsigned long nr_free_buffer_pages(void)
+
+static unsigned long nr_free_zone_pages(int offset)
+
+```
+
 ## 从memblock 到伙伴系统
 ```c
 start_kernel
@@ -1967,20 +2154,357 @@ start_kernel
 
 	mm_init
 		mem_init(void) // 将memblock的内存交给伙伴系统管理
-
+			memblock_free_all(); // 释放memblock.memory非保留的低端内存到伙伴系统
+			free_highpages(); // 释放memblock.memory非保留的高端内存到伙伴系统
 
 ```
-### mem_init
+### memblock_free_all 释放低端内存
 ```c
-void __init mem_init(void)
-	memblock_free_all(); // 释放低端内存到normal zone
-	free_highpages(); // 释放高端内存到 highmem zone
-```
+atomic_long_t _totalram_pages __read_mostly;
 
-#### memblock_free_all
+unsigned long __init memblock_free_all(void)
+{
+	unsigned long pages;
+
+	// 将所有node的所有zone的 managed_pages 清零
+	// managed_pages 记录zone管理的page数量
+	reset_all_zones_managed_pages();
+
+	// 释放低端内存到伙伴系统
+	pages = free_low_memory_core_early();
+	totalram_pages_add(pages);
+		atomic_long_add(count, &_totalram_pages); // 增加计数器
+
+	// 返回释放的page数量
+	return pages;
+}
+
+static unsigned long __init free_low_memory_core_early(void)
+{
+	unsigned long count = 0;
+	phys_addr_t start, end;
+	u64 i;
+
+	memblock_clear_hotplug(0, -1);
+
+	// 将memblock.resered的页面标记为 PageReserved
+	// 不参与伙伴系统
+	for_each_reserved_mem_range(i, &start, &end)
+		reserve_bootmem_region(start, end);
+
+	// 将属于 memblock.memory 但不属于memblock.reserved的页面加入伙伴系统
+	// 只释放低端内存
+	for_each_free_mem_range(i, NUMA_NO_NODE, MEMBLOCK_NONE, &start, &end,
+				NULL)
+		count += __free_memory_core(start, end);
+
+	// 返回加入伙伴系统的page数量
+	return count;
+}
+
+static unsigned long __init __free_memory_core(phys_addr_t start,
+				 phys_addr_t end)
+{
+	unsigned long start_pfn = PFN_UP(start);
+	// 最大释放内存不超过 低端内存最大值
+	// 即只释放低端内存
+	unsigned long end_pfn = min_t(unsigned long,
+				      PFN_DOWN(end), max_low_pfn);
+
+	if (start_pfn >= end_pfn)
+		return 0;
+
+	// 加入伙伴系统
+	__free_pages_memory(start_pfn, end_pfn);
+
+	// 返回加入和多少个page
+	return end_pfn - start_pfn;
+}
+
+static void __init __free_pages_memory(unsigned long start, unsigned long end)
+{
+	int order;
+
+	while (start < end) {
+		// 计算最大order值，最大值不超过MAX_ORDER - 1, 这里是10
+		// __ffs 返回二进制数字第一个为1的bit的位置
+		order = min(MAX_ORDER - 1UL, __ffs(start));
+
+		// (1 << order) : 此order下 page block的大小
+		// 如果 start + (1 << order) > end 
+		// 说明 [start, end) 大小不足够放到此order
+		// 一直循环找到最大的order值
+		while (start + (1UL << order) > end)
+			order--;
+
+		// 将 start开始，2^order大小的 page block 释放到伙伴系统
+		memblock_free_pages(pfn_to_page(start), start, order);
+
+		// 如果 [start, end) 还有剩余，则进行释放
+		start += (1UL << order);
+	}
+}
+```
+### memblock_free_pages
 ```c
+void __init memblock_free_pages(struct page *page, unsigned long pfn,
+							unsigned int order)
+	__free_pages_core(page, order);
 
+void __free_pages_core(struct page *page, unsigned int order)
+{
+	// 根据阶数，获得page block的 page数量
+	unsigned int nr_pages = 1 << order;
+	struct page *p = page; //指向第一个page
+	unsigned int loop;
+
+	/*
+	 * When initializing the memmap, __init_single_page() sets the refcount
+	 * of all pages to 1 ("allocated"/"not free"). We have to set the
+	 * refcount of all involved pages to 0.
+	 */
+	prefetchw(p);
+	// 清除pages的 PageReserved标志，并将page->_refcount引用计数置零
+	for (loop = 0; loop < (nr_pages - 1); loop++, p++) {
+		prefetchw(p + 1);
+		__ClearPageReserved(p);
+		set_page_count(p, 0);
+	}
+	__ClearPageReserved(p);
+	set_page_count(p, 0);
+
+	// 增加zone管理page的计数
+	atomic_long_add(nr_pages, &page_zone(page)->managed_pages);
+
+	/*
+	 * Bypass PCP and place fresh pages right to the tail, primarily
+	 * relevant for memory onlining.
+	 */
+	__free_pages_ok(page, order, FPI_TO_TAIL);
+}
+
+static void __free_pages_ok(struct page *page, unsigned int order,
+			    fpi_t fpi_flags)
+{
+	unsigned long flags;
+	int migratetype;
+	unsigned long pfn = page_to_pfn(page);
+
+	// 完成准备工作
+	if (!free_pages_prepare(page, order, true))
+		return;
+
+	// 得到迁移类型
+	migratetype = get_pfnblock_migratetype(page, pfn);
+	local_irq_save(flags);
+	__count_vm_events(PGFREE, 1 << order);
+	// 添加
+	free_one_page(page_zone(page), page, pfn, order, migratetype,
+		      fpi_flags);
+		__free_one_page(page, pfn, zone, order, migratetype, fpi_flags);
+	local_irq_restore(flags);
+}
 ```
+
+#### __free_one_page
+```c
+/*
+ * 伙伴系统分配器的释放函数。
+ *
+ * 伙伴系统的概念是维护一个直接映射的表（包含位值），用于不同"阶数"的内存块。
+ * 底层表包含最小可分配单位（这里是页面）的映射，而每个上层表描述了来自下层的单位对，因此称为"伙伴"。
+ * 在高层次上，这里发生的所有事情都是将底层的表项标记为可用，并根据需要向上传播更改，以及一些与VM系统的其他部分协调所需的账户处理。
+ * 在每个级别上，我们保持一个页面列表，这些页面是长度为（1 << order）的连续空闲页面的头部，并标记为PageBuddy。
+ * 页面的阶数记录在page_private(page)字段中。
+ * 因此，当我们分配或释放一个页面时，我们可以推导出另一个页面的状态。
+ * 也就是说，如果我们分配了一个小块，并且两个页面都是空闲的，那么剩余区域必须被分割成块。
+ * 如果一个块被释放，并且它的伙伴也是空闲的，那么这将触发合并成一个更大尺寸的块。
+ *
+ * -- nyc
+ */
+
+// pfn 必须保证为 2^order 的倍数
+static inline void __free_one_page(struct page *page,
+		unsigned long pfn,
+		struct zone *zone, unsigned int order,
+		int migratetype, fpi_t fpi_flags)
+{
+	struct capture_control *capc = task_capc(zone);
+	unsigned long buddy_pfn;
+	unsigned long combined_pfn;
+	unsigned int max_order;
+	struct page *buddy;
+	bool to_tail;
+
+	max_order = min_t(unsigned int, MAX_ORDER - 1, pageblock_order);
+
+	VM_BUG_ON(!zone_is_initialized(zone));
+	VM_BUG_ON_PAGE(page->flags & PAGE_FLAGS_CHECK_AT_PREP, page);
+
+	VM_BUG_ON(migratetype == -1);
+	// 更新统计计数
+	if (likely(!is_migrate_isolate(migratetype)))
+		__mod_zone_freepage_state(zone, 1 << order, migratetype);
+
+	VM_BUG_ON_PAGE(pfn & ((1 << order) - 1), page);
+	VM_BUG_ON_PAGE(bad_range(zone, page), page);
+
+continue_merging:
+	// 示例
+	// 注意 pfn 只能为 m * 2^order
+	// 当前 order 2 , pfn 4，buddy_pfn则是 0
+	// 合并后 combined_pfn  = 4 & 0 = 0
+	//        page = page + (0 - 4) , 则指向 mem_map + 0
+	while (order < max_order) {
+		if (compaction_capture(capc, page, order, migratetype)) {
+			__mod_zone_freepage_state(zone, -(1 << order),
+								migratetype);
+			return;
+		}
+		// 得到伙伴的pfn
+		buddy_pfn = __find_buddy_pfn(pfn, order);
+		// 得到伙伴的page *
+		buddy = page + (buddy_pfn - pfn);
+
+		if (!pfn_valid_within(buddy_pfn)) // 恒为1
+			goto done_merging;
+		// 现在已经找到了伙伴，但需要确定他是否空闲
+		// 如果没有伙伴，则跳转到合并完毕
+		if (!page_is_buddy(page, buddy, order))
+			goto done_merging;
+
+		// 如果伙伴可以合并则将他从链表取下来，并合并, order++
+		// 然后继续找当前order是否还能合并
+		if (page_is_guard(buddy))
+			clear_page_guard(zone, buddy, order, migratetype);
+		else
+			del_page_from_free_list(buddy, zone, order);
+		combined_pfn = buddy_pfn & pfn;
+		page = page + (combined_pfn - pfn);
+		pfn = combined_pfn;
+		order++;
+	}
+	if (order < MAX_ORDER - 1) {
+		/*
+		 * 如果我们到达这里，意味着阶数大于等于pageblock_order。
+		 * 我们希望防止在隔离的pageblock和普通的pageblock之间进行合并。
+		 * 如果没有这个限制，pageblock的隔离可能会导致错误的freepage或CMA计算。
+		 *
+		 * 对于更频繁的低阶合并，我们不希望触发这段代码。
+		 */
+		if (unlikely(has_isolate_pageblock(zone))) {
+			int buddy_mt;
+
+			buddy_pfn = __find_buddy_pfn(pfn, order);
+			buddy = page + (buddy_pfn - pfn);
+			buddy_mt = get_pageblock_migratetype(buddy);
+
+			if (migratetype != buddy_mt
+					&& (is_migrate_isolate(migratetype) ||
+						is_migrate_isolate(buddy_mt)))
+				goto done_merging;
+		}
+		// 如果不是隔离pageblock则没任何影响，回到continue_merging后会
+		// 发现找不到buddy而立即跳到 done_merging
+		max_order = order + 1;
+		goto continue_merging;
+	}
+
+done_merging:
+	// 标记pageblock的第一个page为buddy
+	// page->private = order
+	set_buddy_order(page, order);
+
+	// 使用头插还是尾插加入 zone->free_area[order][migratetype] 链表
+	if (fpi_flags & FPI_TO_TAIL)
+		to_tail = true;
+	else if (is_shuffle_order(order))
+		to_tail = shuffle_pick_tail();
+	else
+		to_tail = buddy_merge_likely(pfn, buddy_pfn, page, order);
+
+	if (to_tail)
+		add_to_free_list_tail(page, zone, order, migratetype);
+	else
+		add_to_free_list(page, zone, order, migratetype);
+
+	/* Notify page reporting subsystem of freed page */
+	if (!(fpi_flags & FPI_SKIP_REPORT_NOTIFY))
+		page_reporting_notify_free(order);
+}
+
+/*
+ * 此函数检查一个页面是否空闲，并且是我们可以合并的伙伴。
+ * 如果满足以下条件，我们可以合并一个页面和它的伙伴：
+ * (a) 伙伴不在一个空洞中（在调用之前进行检查！）&&
+ * (b) 伙伴在伙伴系统中 &&
+ * (c) 一个页面和它的伙伴具有相同的阶数 &&
+ * (d) 一个页面和它的伙伴在同一个区域中。
+ *
+ * 为了记录一个页面是否在伙伴系统中，我们设置PageBuddy标志。
+ * 设置、清除和测试PageBuddy标志由zone->lock进行串行化。
+ *
+ * 为了记录页面的阶数，我们使用page_private(page)。
+ */
+static inline bool page_is_buddy(struct page *page, struct page *buddy,
+							unsigned int order)
+{
+	// 只有buddy也做pageblock的第一个page才可能为buddy
+	// 也就是 buddy->private == order
+	//        PageBuddy(buddy) == true
+
+	if (!page_is_guard(buddy) && !PageBuddy(buddy))
+		return false;
+
+	if (buddy_order(buddy) != order)
+		return false;
+
+	// 并且在同一个zone
+	if (page_zone_id(page) != page_zone_id(buddy))
+		return false;
+
+	VM_BUG_ON_PAGE(page_count(buddy) != 0, buddy);
+
+	return true;
+}
+
+/*
+ * 定位我们成对的伙伴（buddy1）及其组合成的O(n+1)页面（page）的struct page。
+ *
+ * 1) 任何伙伴B1都有一个满足以下方程的阶数O的双胞胎B2：
+ *     B2 = B1 ^ (1 << O)
+ * 例如，如果起始伙伴（buddy2）是#8，它的阶数1的伙伴是#10：
+ *     B2 = 8 ^ (1 << 1) = 8 ^ 2 = 10
+ *
+ * 2) 任何伙伴B都有一个满足以下方程的阶数O+1的父节点P：
+ *     P = B & ~(1 << O)
+ *
+ * 假设：*_mem_map至少在MAX_ORDER处是连续的。
+ */
+static inline unsigned long
+__find_buddy_pfn(unsigned long page_pfn, unsigned int order)
+{
+	return page_pfn ^ (1 << order);
+}
+
+static inline void del_page_from_free_list(struct page *page, struct zone *zone,
+					   unsigned int order)
+{
+	/* clear reported state and update reported page count */
+	if (page_reported(page))
+		__ClearPageReported(page);
+
+	// 从链表中移除
+	list_del(&page->lru);
+	// 只有pageblock第一个page才设置 buddy标记和 page->private = order
+	__ClearPageBuddy(page); // 清除buddy标记
+	set_page_private(page, 0); // 清除 page->private
+	zone->free_area[order].nr_free--; //  此链表减少个pageblock
+}
+```
+
+## 伙伴系统核心 __alloc_pages_nodemask
+
 
 # 重要的宏和全局变量
 ```c
