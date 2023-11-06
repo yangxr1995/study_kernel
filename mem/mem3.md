@@ -3605,6 +3605,144 @@ got_pg:
 # slab
 ## 数据结构
 
+## 核心函数分析
+### kmem_cache_create
+
+kmem_cache_create 会尝试复用现有kmem_cache，如果失败则创建 kmem_cache 和相关数据结构，并根据obj的大小初始化重要字段，如order，batchcount等，创建的数据结构关系如下
+
+![](./pic/73.jpg)
+
+新创建的kmem_cache并没有分配实际的slab，只是创建了整个框架和计算出重要字段
+
+```c
+struct kmem_cache *
+kmem_cache_create(const char *name, unsigned int size, unsigned int align,
+		slab_flags_t flags, void (*ctor)(void *))
+	return kmem_cache_create_usercopy(name, size, align, flags, 0, 0,
+					  ctor);
+		// 尝试复用现有slab
+		s = __kmem_cache_alias(name, size, align, flags, ctor);
+		if (s)
+			return s;
+		// 如果没有可复用的slab
+		// 创建 kmem_cache
+		s = create_cache(cache_name, size,
+				 calculate_alignment(flags, align, size),
+				 flags, useroffset, usersize, ctor, NULL);
+		return s;
+
+
+static struct kmem_cache *create_cache(const char *name,
+		unsigned int object_size, unsigned int align,
+		slab_flags_t flags, unsigned int useroffset,
+		unsigned int usersize, void (*ctor)(void *),
+		struct kmem_cache *root_cache)
+	// 从 slab-kmem_cache 分配一个 kmem_cache
+	s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
+	s->name = name;
+	s->size = s->object_size = object_size;
+	s->align = align;
+	s->ctor = ctor;
+	s->useroffset = useroffset;
+	s->usersize = usersize;
+
+	// 通过计算设置 kmem_cache的各个字段的值
+	err = __kmem_cache_create(s, flags);
+		cachep->align = ralign;
+		cachep->colour_off = cache_line_size();
+
+		set_objfreelist_slab_cache(cachep, size, flags);
+			cachep->num = 0;
+			left = calculate_slab_order(cachep, size,
+					flags | CFLGS_OBJFREELIST_SLAB);
+				...
+				cachep->num = num;
+				cachep->gfporder = gfporder;
+				return left // left就是一个slab使用多少字节填充color
+			cachep->colour = left / cachep->colour_off;
+
+		// slab的freelist占用多少字节
+		cachep->freelist_size = cachep->num * sizeof(freelist_idx_t);
+		// 创建 array_cache
+		err = setup_cpu_cache(cachep, gfp);
+			cachep->cpu_cache = alloc_kmem_cache_cpus(cachep, 1, 1);
+				size = sizeof(void *) * entries + sizeof(struct array_cache);
+				cpu_cache = __alloc_percpu(size, sizeof(void *));
+				for_each_possible_cpu(cpu) {
+					init_arraycache(per_cpu_ptr(cpu_cache, cpu),
+							entries, batchcount);
+						ac->avail = 0;
+						ac->limit = limit;
+						ac->batchcount = batch;
+						ac->touched = 0;
+				}
+
+			// 创建 kmem_cache_node
+			for_each_online_node(node) {
+				cachep->node[node] = kmalloc_node(
+					sizeof(struct kmem_cache_node), gfp, node);
+				BUG_ON(!cachep->node[node]);
+				kmem_cache_node_init(cachep->node[node]);
+			}
+
+			cpu_cache_get(cachep)->avail = 0;
+			cpu_cache_get(cachep)->limit = BOOT_CPUCACHE_ENTRIES;
+			cpu_cache_get(cachep)->batchcount = 1;
+			cpu_cache_get(cachep)->touched = 0;
+			cachep->batchcount = 1;
+			cachep->limit = BOOT_CPUCACHE_ENTRIES;
+			return 0;
+
+	s->refcount = 1;
+	// 所有的kmem_cache由 slab_caches 管理
+	list_add(&s->list, &slab_caches);
+
+	return s;
+```
+
+### kmem_cache_alloc
+```c
+void *kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags)
+	void *ret = slab_alloc(cachep, flags, _RET_IP_);
+		objp = __do_cache_alloc(cachep, flags);
+			return ____cache_alloc(cachep, flags);
+
+static inline void *____cache_alloc(struct kmem_cache *cachep, gfp_t flags)
+{
+	void *objp;
+	struct array_cache *ac;
+
+	check_irq_off();
+
+	// 获得本地CPU obj缓存池
+	ac = cpu_cache_get(cachep);
+	if (likely(ac->avail)) {
+		// 如果本地CPU obj缓存池有剩余对象
+		// 则标记该缓冲池最近被分配
+		// 且从中取出一个obj，返回
+		ac->touched = 1;
+		objp = ac->entry[--ac->avail];
+
+		STATS_INC_ALLOCHIT(cachep);
+		goto out;
+	}
+
+	STATS_INC_ALLOCMISS(cachep);
+	// 从共享obj缓存池，或slab链表，搬运一些obj到本地obj缓存池
+	// 再分配objs
+	objp = cache_alloc_refill(cachep, flags);
+	// ac可能被 cache_alloc_refill 更新，所以需要重新获得
+	ac = cpu_cache_get(cachep);
+
+out:
+	if (objp)
+		kmemleak_erase(&ac->entry[ac->avail]);
+	return objp;
+}
+```
+
+#### cache_alloc_refill
+
 
 # 重要的宏和全局变量
 ```c
