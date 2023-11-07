@@ -3731,6 +3731,7 @@ static inline void *____cache_alloc(struct kmem_cache *cachep, gfp_t flags)
 	// 从共享obj缓存池，或slab链表，搬运一些obj到本地obj缓存池
 	// 再分配objs
 	objp = cache_alloc_refill(cachep, flags);
+	// 由于kmemleak_erase会使用ac
 	// ac可能被 cache_alloc_refill 更新，所以需要重新获得
 	ac = cpu_cache_get(cachep);
 
@@ -3742,6 +3743,344 @@ out:
 ```
 
 #### cache_alloc_refill
+
+本地缓存没有空闲的obj对象，尝试共享缓存或slab节点搬运batchcount个obj到本地缓存，并分配一个obj
+
+```c
+static void *cache_alloc_refill(struct kmem_cache *cachep, gfp_t flags)
+{
+	int batchcount;
+	struct kmem_cache_node *n;
+	struct array_cache *ac, *shared;
+	int node;
+	void *list = NULL;
+	struct page *page;
+
+	check_irq_off();
+	node = numa_mem_id();
+
+	// 获得本地obj缓存
+	ac = cpu_cache_get(cachep);
+	batchcount = ac->batchcount;
+	if (!ac->touched && batchcount > BATCHREFILL_LIMIT) {
+		/*
+		 * 如果最近对此缓存的活动很少，那么只进行部分补充。
+		 * 否则，我们可能会生成补充反弹。
+		 */
+		batchcount = BATCHREFILL_LIMIT;
+	}
+	// 获得本地节点缓存,节点缓存中会共享obj缓存，和slab链表
+	n = get_node(cachep, node);
+
+	BUG_ON(ac->avail > 0 || !n);
+	// 获得节点共享obj缓存
+	shared = READ_ONCE(n->shared);
+	// 如果本节点没有空闲的obj
+	if (!n->free_objects && (!shared || !shared->avail))
+		goto direct_grow;
+
+	spin_lock(&n->list_lock);
+	shared = READ_ONCE(n->shared);
+
+	// 如果共享缓存存在
+	// 尝试从共享缓存最多搬运batchcount个obj到本地缓存
+	if (shared && transfer_objects(ac, shared, batchcount)) {
+		// 成功搬运部分obj到本地缓存，可以从本地缓存分配一个obj了
+		// 跳到分配处
+		shared->touched = 1;
+		goto alloc_done;
+	}
+
+	// 如果共享缓存为空，则尝试从slab链表搬运obj
+	while (batchcount > 0) {
+		// 从部分满或全部空闲的slab链表中获得slab
+		page = get_first_slab(n, false);
+		if (!page)
+			goto must_grow;
+
+		check_spinlock_acquired(cachep);
+
+		// 将slab中的obj搬运到本地缓存
+		batchcount = alloc_block(cachep, ac, page, batchcount);
+		// 由于slab节点被使用的obj又改变了，所以调整slab的状态
+		// 将slab节点加入满链表，或部分满链表
+		fixup_slab_list(cachep, n, page, &list);
+	}
+
+must_grow:
+	// 由于调用此函数前ac->avail为0，所以现在从节点n分配了
+	// ac->avail 个obj
+	n->free_objects -= ac->avail;
+alloc_done:
+	spin_unlock(&n->list_lock);
+	fixup_objfreelist_debug(cachep, &list);
+
+direct_grow:
+	if (unlikely(!ac->avail)) {
+		// 本节点slab链表和obj共享缓存都没有足够的 obj用于分配
+		if (sk_memalloc_socks()) {
+			void *obj = cache_alloc_pfmemalloc(cachep, n, flags);
+
+			if (obj)
+				return obj;
+		}
+
+		page = cache_grow_begin(cachep, gfp_exact_node(flags), node);
+
+		/*
+		 * cache_grow_begin() can reenable interrupts,
+		 * then ac could change.
+		 */
+		ac = cpu_cache_get(cachep);
+		// 从slab对象page分配batchcount个obj对象到本地缓存ac
+		if (!ac->avail && page)
+			alloc_block(cachep, ac, page, batchcount);
+		// 将slab节点加入合适的slab链表，并更新kmem_cache的各个计数器
+		cache_grow_end(cachep, page);
+
+		if (!ac->avail)
+			return NULL;
+	}
+	ac->touched = 1;
+
+	// 分配一个obj
+	return ac->entry[--ac->avail];
+}
+```
+
+##### transfer_objects
+
+
+```c
+	// 从共享缓存取batchcount个obj对象到本地缓存
+	if (shared && transfer_objects(ac, shared, batchcount)) {
+
+static int transfer_objects(struct array_cache *to,
+		struct array_cache *from, unsigned int max)
+{
+	/* Figure out how many entries to transfer */
+	// 计算本次最多可以搬运多少个obj
+	// from->avail : 共享缓存可用的空闲obj数量
+	// max : 最多一次取多少个obj
+	// to->limit - to->avail : 本地缓存最多还能存放多少个obj
+	int nr = min3(from->avail, max, to->limit - to->avail);
+
+	if (!nr)
+		return 0;
+
+	// 进行搬运
+	// 可见entry是指针数组
+	memcpy(to->entry + to->avail, from->entry + from->avail -nr,
+			sizeof(void *) *nr);
+
+	// 更新计数
+	from->avail -= nr;
+	to->avail += nr;
+	return nr;
+}
+```
+
+##### get_first_slab
+
+当共享缓存没有空闲的obj，尝试从slab链表分配obj
+
+```c
+	// 如果共享缓存为空, 尝试从slab链表分配obj
+	while (batchcount > 0) {
+		// 从部分满或全部空闲的slab链表中获得slab
+		page = get_first_slab(n, false);
+
+static struct page *get_first_slab(struct kmem_cache_node *n, bool pfmemalloc)
+{
+	struct page *page;
+
+	assert_spin_locked(&n->list_lock);
+	// 先尝试从部分空闲链表取slab，失败则从全部空闲链表取slab
+	page = list_first_entry_or_null(&n->slabs_partial, struct page,
+					slab_list);
+	if (!page) {
+		n->free_touched = 1;
+		page = list_first_entry_or_null(&n->slabs_free, struct page,
+						slab_list);
+		if (page)
+			n->free_slabs--;
+	}
+
+	if (sk_memalloc_socks())
+		page = get_valid_first_slab(n, page, pfmemalloc);
+
+	return page;
+}
+```
+
+##### alloc_block
+
+成功从slab获得带空闲obj的slab对象后，从slab对象搬运obj到本地缓存
+
+```c
+		// 将slab中的obj搬运到本地缓存
+		batchcount = alloc_block(cachep, ac, page, batchcount);
+
+static __always_inline int alloc_block(struct kmem_cache *cachep,
+		struct array_cache *ac, struct page *page, int batchcount)
+{
+	/*
+	 * There must be at least one object available for
+	 * allocation.
+	 */
+	BUG_ON(page->active >= cachep->num);
+
+	// page->active : 本slab有多少个obj忙
+	// cachep->num  : 本kmem_cache每个slab有多少个obj
+	// batchcount : 最多搬运多少个obj
+	// 当本slab有空闲obj对象，进行搬运
+	while (page->active < cachep->num && batchcount--) {
+		STATS_INC_ALLOCED(cachep);
+		STATS_INC_ACTIVE(cachep);
+		STATS_SET_HIGH(cachep);
+
+		ac->entry[ac->avail++] = slab_get_obj(cachep, page);
+			void *objp;
+			// get_free_obj(page, page->active) : 获得freelist数组第一个元素，他的值是slab中s_mem数组的下标
+			index_to_obj : 根据数组首元素的地址 page->s_mem + 下标 返回空闲的obj的地址
+			objp = index_to_obj(cachep, page, get_free_obj(page, page->active));
+			// freelist数组减少一个元素
+			page->active++;
+			return objp;
+
+	}
+
+	return batchcount;
+}
+
+static inline void *index_to_obj(struct kmem_cache *cache, struct page *page,
+				 unsigned int idx)
+{
+	return page->s_mem + cache->size * idx;
+}
+
+static inline freelist_idx_t get_free_obj(struct page *page, unsigned int idx)
+{
+	return ((freelist_idx_t *)page->freelist)[idx];
+}
+```
+
+##### fixup_slab_list
+
+从slab节点中搬运了部分obj到本地缓存后，将slab移动到合适的 `slabs_full` 或 `slabs_partial` 链表
+
+```c
+		fixup_slab_list(cachep, n, page, &list);
+static inline void fixup_slab_list(struct kmem_cache *cachep,
+				struct kmem_cache_node *n, struct page *page,
+				void **list)
+{
+	/* move slabp to correct slabp list: */
+	// 将slab节点移除当前链表
+	list_del(&page->slab_list);
+	// 如果slab节点全部节点都被使用了, 则加入slabs_full
+	if (page->active == cachep->num) {
+		list_add(&page->slab_list, &n->slabs_full);
+		if (OBJFREELIST_SLAB(cachep))
+			page->freelist = NULL;
+	} else // 否则加入 slabs_partial
+		list_add(&page->slab_list, &n->slabs_partial);
+}
+```
+
+##### cache_grow_begin
+
+如果内存节点的共享空闲obj缓存和slab链表都没有空闲的obj，则从伙伴系统分配page做slab节点 
+
+```c
+		// 从伙伴系统分配page，并初始化为slab
+		page = cache_grow_begin(cachep, gfp_exact_node(flags), node);
+
+static struct page *cache_grow_begin(struct kmem_cache *cachep,
+				gfp_t flags, int nodeid)
+{
+	void *freelist;
+	size_t offset;
+	gfp_t local_flags;
+	int page_node;
+	struct kmem_cache_node *n;
+	struct page *page;
+
+	// 从nodeid内存节点分配slab
+	page = kmem_getpages(cachep, local_flags, nodeid);
+		// 分配 2^cachep->gfporder 大小的page block
+		page = __alloc_pages_node(nodeid, flags, cachep->gfporder);
+		// 更新统计计数
+		account_slab_page(page, cachep->gfporder, cachep);
+		// 标记page做slab
+		__SetPageSlab(page);
+		return page;
+
+	page_node = page_to_nid(page);
+	n = get_node(cachep, page_node);
+
+	// 计算objs数组在page中的偏移值
+	// 确保每个slab在的colour错开
+	n->colour_next++;
+	if (n->colour_next >= cachep->colour)
+		n->colour_next = 0;
+
+	offset = n->colour_next;
+	if (offset >= cachep->colour)
+		offset = 0;
+
+	offset *= cachep->colour_off;
+
+	// 格式化slab节点
+
+	// 确定objs区和freelist区
+	freelist = alloc_slabmgmt(cachep, page, offset,
+			local_flags & ~GFP_CONSTRAINT_MASK, page_node);
+
+		void *freelist;
+		void *addr = page_address(page);
+		// 确定objs区
+		page->s_mem = addr + colour_off; // offset
+		// 当前objs全空闲 
+		page->active = 0;
+		// 确定freelist区在page block尾端
+		freelist = addr + (PAGE_SIZE << cachep->gfporder) -
+				cachep->freelist_size;
+		return freelist;
+
+	slab_map_pages(cachep, page, freelist);
+		page->slab_cache = cache;
+		page->freelist = freelist;
+
+	// 初始化本slab所有obj
+	// 如果有构造函数，则对所有obj对象调用构造函数
+	cache_init_objs(cachep, page);
+		for (i = 0; i < cachep->num; i++) {
+			// 得到第 i 个 obj的地址
+			objp = index_to_obj(cachep, page, i);
+
+			// 如果有构造函数，则调用构造函数
+			if (DEBUG == 0 && cachep->ctor)
+				cachep->ctor(objp);
+		}
+
+		// freelist数组成员记录对应obj的下标
+		set_free_obj(page, i, i);
+			((freelist_idx_t *)(page->freelist))[idx] = val;
+
+	if (gfpflags_allow_blocking(local_flags))
+		local_irq_disable();
+
+	return page;
+
+opps1:
+	kmem_freepages(cachep, page);
+failed:
+	if (gfpflags_allow_blocking(local_flags))
+		local_irq_disable();
+	return NULL;
+}
+```
 
 
 # 重要的宏和全局变量
