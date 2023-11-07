@@ -3605,12 +3605,15 @@ got_pg:
 # slab
 ## 数据结构
 
+![](./pic/74.jpg)
+
 ## 核心函数分析
 ### kmem_cache_create
 
-kmem_cache_create 会尝试复用现有kmem_cache，如果失败则创建 kmem_cache 和相关数据结构，并根据obj的大小初始化重要字段，如order，batchcount等，创建的数据结构关系如下
+kmem_cache_create 会尝试复用现有kmem_cache，如果失败则创建 kmem_cache 和相关数据结构，并根据obj的大小初始化重要字段，如order，batchcount等，
 
-![](./pic/73.jpg)
+并创建 kmem_cache , kmem_cache_node , array_cache ,但不会分配slab节点
+
 
 新创建的kmem_cache并没有分配实际的slab，只是创建了整个框架和计算出重要字段
 
@@ -3665,33 +3668,78 @@ static struct kmem_cache *create_cache(const char *name,
 		cachep->freelist_size = cachep->num * sizeof(freelist_idx_t);
 		// 创建 array_cache
 		err = setup_cpu_cache(cachep, gfp);
-			cachep->cpu_cache = alloc_kmem_cache_cpus(cachep, 1, 1);
-				size = sizeof(void *) * entries + sizeof(struct array_cache);
-				cpu_cache = __alloc_percpu(size, sizeof(void *));
-				for_each_possible_cpu(cpu) {
-					init_arraycache(per_cpu_ptr(cpu_cache, cpu),
-							entries, batchcount);
-						ac->avail = 0;
-						ac->limit = limit;
-						ac->batchcount = batch;
-						ac->touched = 0;
-				}
+			if (slab_state >= FULL)
+				return enable_cpucache(cachep, gfp);
+					// 根据经验值计算出 limit , shared , batchcount
+					...
+					batchcount = (limit + 1) / 2;
+					err = do_tune_cpucache(cachep, limit, batchcount, shared, gfp);
+						// 创建本地obj缓存，并设置limit batchcount
+						cpu_cache = alloc_kmem_cache_cpus(cachep, limit, batchcount);
+							size = sizeof(void *) * entries + sizeof(struct array_cache);
+							cpu_cache = __alloc_percpu(size, sizeof(void *));
+							for_each_possible_cpu(cpu) {
+								init_arraycache(per_cpu_ptr(cpu_cache, cpu),
+										entries, batchcount);
+									ac->avail = 0;
+									ac->limit = limit;
+									ac->batchcount = batch;
+									ac->touched = 0;
+							}
+					// 获得之前的本地obj缓存，第一次创建prev为NULL
+					prev = cachep->cpu_cache;
+					// 设置当前本地obj缓存
+					cachep->cpu_cache = cpu_cache;
 
-			// 创建 kmem_cache_node
-			for_each_online_node(node) {
-				cachep->node[node] = kmalloc_node(
-					sizeof(struct kmem_cache_node), gfp, node);
-				BUG_ON(!cachep->node[node]);
-				kmem_cache_node_init(cachep->node[node]);
-			}
+					shared = 0;
+					// 只有允许多核且obj大小小于一个页时，才允许使用内存节点共享obj缓存
+					if (cachep->size <= PAGE_SIZE && num_possible_cpus() > 1)
+						shared = 8;
 
-			cpu_cache_get(cachep)->avail = 0;
-			cpu_cache_get(cachep)->limit = BOOT_CPUCACHE_ENTRIES;
-			cpu_cache_get(cachep)->batchcount = 1;
-			cpu_cache_get(cachep)->touched = 0;
-			cachep->batchcount = 1;
-			cachep->limit = BOOT_CPUCACHE_ENTRIES;
-			return 0;
+					// slab描述符记录batchcount limit shared
+					cachep->batchcount = batchcount;
+					cachep->limit = limit;
+					cachep->shared = shared;
+
+					// 如果是第一次创建则直接跳转到初始化kmem_cache_node
+					if (!prev)
+						goto setup_node;
+
+					.. // 如果之前创建过，则释放上次的本地obj缓存
+
+				setup_node:
+					return setup_kmem_cache_nodes(cachep, gfp);
+						
+						// 给每个内存节点分配一个 kmem_cache_node
+						for_each_online_node(node) {
+							// 创建，并初始化 kmem_cache_node
+							ret = setup_kmem_cache_node(cachep, node, gfp, true);
+
+								// 只有kmem_cache开启共享时，才使用共享obj缓存
+								// 创建共享obj缓存
+								if (cachep->shared) {
+									new_shared = alloc_arraycache(node,
+										cachep->shared * cachep->batchcount, 0xbaadf00d, gfp);
+								}
+
+								// 创建kmem_cache_node
+								ret = init_cache_node(cachep, node, gfp);
+									n = kmalloc_node(sizeof(struct kmem_cache_node), gfp, node);
+									n->next_reap = jiffies + REAPTIMEOUT_NODE +
+											((unsigned long)cachep) % REAPTIMEOUT_NODE;
+									n->free_limit =
+										(1 + nr_cpus_node(node)) * cachep->batchcount + cachep->num;
+									cachep->node[node] = n;
+
+								// 将共享obj缓存绑定到kmem_cache_node
+								if (!n->shared || force_change) {
+									old_shared = n->shared;
+									n->shared = new_shared;
+									new_shared = NULL;
+								}
+
+						}
+						return 0;
 
 	s->refcount = 1;
 	// 所有的kmem_cache由 slab_caches 管理
@@ -3991,7 +4039,6 @@ static inline void fixup_slab_list(struct kmem_cache *cachep,
 ##### cache_grow_begin
 
 如果内存节点的共享空闲obj缓存和slab链表都没有空闲的obj，则从伙伴系统分配page做slab节点 
-
 ```c
 		// 从伙伴系统分配page，并初始化为slab
 		page = cache_grow_begin(cachep, gfp_exact_node(flags), node);
@@ -4081,6 +4128,44 @@ failed:
 	return NULL;
 }
 ```
+
+##### cache_grow_end
+```c
+static void cache_grow_end(struct kmem_cache *cachep, struct page *page)
+{
+	struct kmem_cache_node *n;
+	void *list = NULL;
+
+	check_irq_off();
+
+	if (!page)
+		return;
+
+	INIT_LIST_HEAD(&page->slab_list);
+	n = get_node(cachep, page_to_nid(page));
+
+	spin_lock(&n->list_lock);
+	// 内存节点slab缓存 所有slab节点计数增加
+	n->total_slabs++;
+	// 如果当前page全部obj空闲，则加入slabs_free，否则加入slabs_full 或 slabs_partial
+	if (!page->active) {
+		list_add_tail(&page->slab_list, &n->slabs_free);
+		n->free_slabs++;
+	} else
+		fixup_slab_list(cachep, n, page, &list);
+
+	STATS_INC_GROWN(cachep);
+	// cachep->num : 一个slab节点有cachep->num个obj
+	// page->active : 当前slab节点使用了page->active个obj
+	// 更新节点空闲的objs数量
+	n->free_objects += cachep->num - page->active;
+	spin_unlock(&n->list_lock);
+
+	fixup_objfreelist_debug(cachep, &list);
+}
+```
+
+### kmem_cache_free
 
 
 # 重要的宏和全局变量
