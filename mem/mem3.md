@@ -3604,6 +3604,127 @@ got_pg:
 
 # slab
 ## 数据结构
+### kmem_cache
+```c
+struct kmem_cache {
+	// CPU本地obj缓存
+	struct array_cache __percpu *cpu_cache;
+
+/* 1) Cache tunables. Protected by slab_mutex */
+	// 当本地CPU缓存为空时一次从共享obj缓存或slab链表中获得最多batchcount个obj
+	// 释放时最多也是batchcount个 obj
+	unsigned int batchcount;
+	// 当本地obj缓存或共享obj缓存空闲数量超过limit时，释放最多batchcount个obj
+	unsigned int limit;
+	// 是否是多核，只有shared大于0，表示为多核共享obj缓存时，才创建共享obj缓存池
+	unsigned int shared;
+
+	// 一个obj的大小
+	unsigned int size;
+	struct reciprocal_value reciprocal_buffer_size;
+/* 2) touched by every alloc & free from the backend */
+
+	slab_flags_t flags;		/* constant flags */
+	// 每个slab对象有多少个obj
+	unsigned int num;		
+
+/* 3) cache_grow/shrink */
+	// 每个slab占用 order 阶的page
+	unsigned int gfporder;
+
+	/* force GFP flags, e.g. GFP_DMA */
+	gfp_t allocflags;
+
+	size_t colour;			/* cache colouring range */
+	unsigned int colour_off;	/* colour offset */
+	// 如果是off-slab的场景，freelist_cache指向一个通用slab cache，用来分配page->freelist的空间
+    // 如果是on-slab的场景，freelist_cache是空，page->freelist指向slab的尾部
+	struct kmem_cache *freelist_cache;
+	// slab对象中freelist占用的大小
+	unsigned int freelist_size;
+
+	// obj构造函数, 当新建slab时，会尝试对所有obj调用此构造函数
+	void (*ctor)(void *obj);
+
+/* 4) cache creation/removal */
+	// slab名称
+	const char *name;
+	// 所有slab连入 slab_caches 链表
+	struct list_head list;
+	int refcount;
+	int object_size;
+	int align;
+
+/* 5) statistics */
+	unsigned int useroffset;	/* Usercopy region offset */
+	unsigned int usersize;		/* Usercopy region size */
+
+	// slab内存节点
+	struct kmem_cache_node *node[MAX_NUMNODES];
+};
+```
+### kmem_cache_ndoe
+```c
+struct kmem_cache_node {
+	spinlock_t list_lock;
+
+	// slab链表
+	struct list_head slabs_partial;	
+	struct list_head slabs_full;
+	struct list_head slabs_free;
+
+	// 三个链表中slab的总数
+	unsigned long total_slabs;	
+
+	// slabs_free链表中slab的数量
+	unsigned long free_slabs;	
+
+	// 此内存节点空闲的objs，包括slab链表中的obj和 shared共享缓存中的obj
+	unsigned long free_objects; 
+	// 当slab内存节点空闲的obj数量超过free_limit时，尝试从slabs_free链表中释放slab对象到伙伴系统
+	unsigned int free_limit;
+	unsigned int colour_next;	/* Per-node cache coloring */
+	// 共享obj缓存
+	struct array_cache *shared;	/* shared per node */
+	struct alien_cache **alien;	/* on other nodes */
+	// 用于被动slab回收
+	unsigned long next_reap;	/* updated without locking */
+	int free_touched;		/* updated without locking */
+};
+```
+### array_cache
+```c
+// obj缓存池
+struct array_cache {
+	// 本obj缓存空闲的obj数量
+	unsigned int avail; 
+	// 当空闲obj数量超过limit，释放batchcount个obj
+	unsigned int limit;
+	// 一次移动时最多操作batchcount个obj
+	unsigned int batchcount;
+	// 为1，表示最近为用户分配过obj
+	unsigned int touched;
+	// obj指针数组， entry[0, avail)存储空闲的obj的指针
+	void *entry[];	
+};
+```
+
+### slab
+```c
+struct page {
+	// 用于连入 kmem_cache_node 的三个slab链表
+	struct list_head slab_list; 
+	// 指向所属的kmem_cache
+	struct kmem_cache *slab_cache;
+	// freelist数组，freelist数组元素是char类型，存放obj数组空闲obj元素的索引号
+	void *freelist;		/* first free object */ 
+	// obj数组
+	void *s_mem;
+	// 如果为slab，会加上slab类型标记
+	unsigned int page_type;
+	// 被使用的obj数量，和freelist数组配合使用
+	unsigned int active;
+```
 
 ![](./pic/74.jpg)
 
@@ -4388,6 +4509,91 @@ static inline void set_free_obj(struct page *page,
 }
 
 ```
+
+# kmalloc
+```c
+static __always_inline void *kmalloc(size_t size, gfp_t flags)
+	return __kmalloc(size, flags);
+
+
+#define PAGE_SHIFT		12
+#define KMALLOC_SHIFT_HIGH	(PAGE_SHIFT + 1)
+#define KMALLOC_MAX_CACHE_SIZE	(1UL << KMALLOC_SHIFT_HIGH)
+
+void *__kmalloc(size_t size, gfp_t flags)
+{
+	struct kmem_cache *s;
+	void *ret;
+
+	// 当分配大小为两个page，直接从伙伴系统分配
+	if (unlikely(size > KMALLOC_MAX_CACHE_SIZE))
+		return kmalloc_large(size, flags);
+
+	// 否则从kmalloc-slab从分配
+
+	// 首先根据分配大小，找到合适的kmem_cache
+	s = kmalloc_slab(size, flags);
+
+	if (unlikely(ZERO_OR_NULL_PTR(s)))
+		return s;
+
+	// 然后从此kmem_cache中分配obj
+	ret = slab_alloc(s, flags, _RET_IP_);
+
+	trace_kmalloc(_RET_IP_, ret, size, s->size, flags);
+
+	ret = kasan_kmalloc(s, ret, size, flags);
+
+	return ret;
+}
+```
+
+## kmalloc_large
+
+```c
+
+#define page_address(page) lowmem_page_address(page)
+
+static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
+	// 根据分配大小得到合适阶层
+	unsigned int order = get_order(size);
+	return kmalloc_order_trace(size, flags, order);
+		void *ret = kmalloc_order(size, flags, order);
+			// 分配物理页，返回物理地址
+			page = alloc_pages(flags, order);
+			if (likely(page)) {
+				ret = page_address(page); // 转换为虚拟地址
+				mod_lruvec_page_state(page, NR_SLAB_UNRECLAIMABLE_B,
+							  PAGE_SIZE << order);
+			}
+		// 返回虚拟地址
+		return ret;
+```
+## kmalloc_slab
+```c
+struct kmem_cache *kmalloc_slab(size_t size, gfp_t flags)
+{
+	unsigned int index;
+
+	if (size <= 192) {
+		if (!size)
+			return ZERO_SIZE_PTR;
+		// size_index
+		index = size_index[size_index_elem(size)];
+	} else {
+		if (WARN_ON_ONCE(size > KMALLOC_MAX_CACHE_SIZE))
+			return NULL;
+		index = fls(size - 1);
+	}
+
+	return kmalloc_caches[kmalloc_type(flags)][index];
+}
+```
+
+# vmalloc
+```c
+```
+
 
 # 重要的宏和全局变量
 ```c
