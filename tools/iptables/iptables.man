@@ -206,9 +206,7 @@ OPTIONS
        The following additional options can be specified:
 
        -w, --wait [seconds]
-              Wait  for  the  xtables  lock.   To  prevent multiple instances of the program from running concurrently, an attempt will be made to obtain an exclusive lock at
-              launch.  By default, the program will exit if the lock cannot be obtained.  This option will make the program wait (indefinitely or for optional seconds)  until
-              the exclusive lock can be obtained.
+		   等待xtables锁。为了防止多个程序实例同时运行，程序在启动时会尝试获取独占锁。默认情况下，如果无法获取锁定，程序将退出。此选项将使程序等待（无限期或可选秒数），直到获取到独占锁为止。
 
        -n, --numeric
 	   		显示IP和端口号
