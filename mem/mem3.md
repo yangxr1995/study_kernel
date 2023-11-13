@@ -4591,8 +4591,443 @@ struct kmem_cache *kmalloc_slab(size_t size, gfp_t flags)
 ```
 
 # vmalloc
+## 核心数据结构
 ```c
+
+// vmalloc的顶层分配对象
+// 记录虚拟空间vmap_area和物理page
+struct vm_struct {
+	struct vm_struct	*next;   // 暂未看见使用
+	void			*addr;       // 起始虚拟地址
+	unsigned long		size;    // 虚拟空间大小
+	unsigned long		flags;
+	struct page		**pages;       // pages指针数组, 记录离散的page
+	unsigned int		nr_pages;  // pages指针数组元素个数
+	phys_addr_t		phys_addr;     // 起始物理地址
+	const void		*caller;       //用于debug记录哪个函数调用分配的vm_struct
+};
+
+// 用于内核空间，记录空闲的或非空闲的虚拟空间
+struct vmap_area {
+	unsigned long va_start;
+	unsigned long va_end;   
+
+	struct rb_node rb_node;    
+	struct list_head list;  
+
+	/*
+	 * The following three variables can be packed, because
+	 * a vmap_area object is always one of the three states:
+	 *    1) in "free" tree (root is vmap_area_root)
+	 *    2) in "busy" tree (root is free_vmap_area_root)
+	 *    3) in purge list  (head is vmap_purge_list)
+	 */
+	union {
+		// 当vmap_area表示空间的虚拟空间时
+		// 他会被加入 free_vmap_area_root树中
+		// 此字段表示 subtree_max_size
+		unsigned long subtree_max_size; /* in "free" tree */
+		// 当vmap_area表示被占用的虚拟空间时，
+		// 使用 vmap_area->vm 记录对应的 vm_struct
+		struct vm_struct *vm;           /* in "busy" tree */
+		// 当vmap_area被释放时，会先释放到 vmap_purge_list
+		// 应该是方便虚拟空间的合并，当 vmap_purge_list 满了，
+		// 统一释放 vmap_purge_list中的 vmap_area 到 
+		// free_vmap_area_root 树
+		struct llist_node purge_list;   /* in purge list */
+	};
+};
+
+// 记录了被占用的虚拟空间对应的vmap_area
+LIST_HEAD(vmap_area_list);
+static struct rb_root vmap_area_root = RB_ROOT;
+
+
+// 空闲的虚拟空间的vmap_area
+static struct rb_root free_vmap_area_root = RB_ROOT;
 ```
+
+## 已分配的vmap_area示意图
+![](./pic/75.jpg)
+
+## 核心函数分析
+### vmalloc_init
+```c
+static void __init mm_init(void)
+	vmalloc_init();
+
+void __init vmalloc_init(void)
+{
+	struct vmap_area *va;
+	struct vm_struct *tmp;
+	int i;
+
+	// 创建 struct vmap_area 的slab
+	vmap_area_cachep = KMEM_CACHE(vmap_area, SLAB_PANIC);
+
+	for_each_possible_cpu(i) {
+		struct vmap_block_queue *vbq;
+		struct vfree_deferred *p;
+
+		vbq = &per_cpu(vmap_block_queue, i);
+		spin_lock_init(&vbq->lock);
+		INIT_LIST_HEAD(&vbq->free);
+		p = &per_cpu(vfree_deferred, i);
+		init_llist_head(&p->list);
+		INIT_WORK(&p->wq, free_work);
+	}
+
+	/* Import existing vmlist entries. */
+	// 有些vmap_area是静态分配或在本函数调用前就提前分配了的
+	// 那些预先分配的vmap_area存放在 vmlist中
+	// 现在将他们添加到 vmap_area_root 和 vmap_area_list 中, 统一管理
+	for (tmp = vmlist; tmp; tmp = tmp->next) {
+		va = kmem_cache_zalloc(vmap_area_cachep, GFP_NOWAIT);
+		if (WARN_ON_ONCE(!va))
+			continue;
+
+		va->va_start = (unsigned long)tmp->addr;
+		va->va_end = va->va_start + tmp->size;
+		va->vm = tmp;
+		insert_vmap_area(va, &vmap_area_root, &vmap_area_list);
+	}
+
+	// 创建vmap_area节点记录空闲的虚拟空间范围，加入 free_vmap_area_root
+	vmap_init_free_space();
+	vmap_initialized = true;
+}
+
+static void vmap_init_free_space(void)
+{
+	unsigned long vmap_start = 1;
+	const unsigned long vmap_end = ULONG_MAX;
+	struct vmap_area *busy, *free;
+
+	// vmap_area_list 记录了被占用的虚拟空间的范围
+	// 将 1 - ULONG_MAX 的虚拟空间中空闲的虚拟空间加入free_vmap_area_root
+
+	list_for_each_entry(busy, &vmap_area_list, list) {
+		if (busy->va_start - vmap_start > 0) {
+			free = kmem_cache_zalloc(vmap_area_cachep, GFP_NOWAIT);
+			if (!WARN_ON_ONCE(!free)) {
+				free->va_start = vmap_start;
+				free->va_end = busy->va_start;
+
+				insert_vmap_area_augment(free, NULL,
+					&free_vmap_area_root,
+						&free_vmap_area_list);
+			}
+		}
+
+		vmap_start = busy->va_end;
+	}
+
+	if (vmap_end - vmap_start > 0) {
+		free = kmem_cache_zalloc(vmap_area_cachep, GFP_NOWAIT);
+		if (!WARN_ON_ONCE(!free)) {
+			free->va_start = vmap_start;
+			free->va_end = vmap_end;
+
+			insert_vmap_area_augment(free, NULL,
+				&free_vmap_area_root,
+					&free_vmap_area_list);
+		}
+	}
+}
+```
+
+### vmalloc
+```c
+void *vmalloc(unsigned long size)
+	return __vmalloc_node(size, 1, GFP_KERNEL, NUMA_NO_NODE,
+				__builtin_return_address(0));
+
+void *__vmalloc_node(unsigned long size, unsigned long align,
+			    gfp_t gfp_mask, int node, const void *caller)
+{
+	// 从 虚拟地址范围为[VMALLOC_START, VMALLOC_END)中分配size大小对齐align的虚拟空间
+	// 并分配page，建立映射
+	return __vmalloc_node_range(size, align, VMALLOC_START, VMALLOC_END,
+				gfp_mask, PAGE_KERNEL, 0, node, caller);
+}
+```
+
+```c
+void *__vmalloc_node_range(unsigned long size, unsigned long align,
+			unsigned long start, unsigned long end, gfp_t gfp_mask,
+			pgprot_t prot, unsigned long vm_flags, int node,
+			const void *caller)
+{
+	struct vm_struct *area;
+	void *addr;
+	unsigned long real_size = size;
+
+	size = PAGE_ALIGN(size);
+	if (!size || (size >> PAGE_SHIFT) > totalram_pages())
+		goto fail;
+
+	// 从 free_vmap_area_root 管理的空闲虚拟空间中
+	// 切割分配虚拟空间，并用 vmap_area 记录
+	// 然后分配 vm_struct 记录 vmap_area，并返回 vm_struct 
+	area = __get_vm_area_node(real_size, align, VM_ALLOC | VM_UNINITIALIZED |
+				vm_flags, start, end, node, gfp_mask, caller);
+	if (!area)
+		goto fail;
+
+	// 根据分配的虚拟空间大小，计算对于应数据页的数量
+	// 创建 page 指针数组，使用order为0，一个页一个页
+	// 从伙伴系统中分配page，并记录到page指针数组
+	// 将page指针数组记录到vm_struct
+	// 根据init_mm->gpd获得内核页表，修改内存页表
+	// 建立 page指针数据中所有page和分配虚拟空间之间映射关系
+	addr = __vmalloc_area_node(area, gfp_mask, prot, node);
+	if (!addr)
+		return NULL;
+
+	return addr;
+
+fail:
+	warn_alloc(gfp_mask, NULL,
+			  "vmalloc: allocation failure: %lu bytes", real_size);
+	return NULL;
+}
+```
+
+#### __get_vm_area_node
+```c
+static struct vm_struct *__get_vm_area_node(unsigned long size,
+		unsigned long align, unsigned long flags, unsigned long start,
+		unsigned long end, int node, gfp_t gfp_mask, const void *caller)
+{
+	struct vmap_area *va;
+	struct vm_struct *area;
+	unsigned long requested_size = size;
+
+	BUG_ON(in_interrupt());
+	size = PAGE_ALIGN(size);
+	if (unlikely(!size))
+		return NULL;
+
+	if (flags & VM_IOREMAP)
+		align = 1ul << clamp_t(int, get_count_order_long(size),
+				       PAGE_SHIFT, IOREMAP_MAX_ORDER);
+
+	// 从slab从分配vm_struct
+	area = kzalloc_node(sizeof(*area), gfp_mask & GFP_RECLAIM_MASK, node);
+	if (unlikely(!area))
+		return NULL;
+
+	// 每个vmalloc块有一个page大小的隔离
+	if (!(flags & VM_NO_GUARD))
+		size += PAGE_SIZE;
+
+	// 从 free_vmap_area_root中分配虚拟空间，并创建vmap_area va记录得到的虚拟空间
+	// 并将 va 加入使用中的vmap_area管理结构 : vmap_area_list 和 vmap_area_root
+	// 最后返回vmap_area
+	va = alloc_vmap_area(size, align, start, end, node, gfp_mask);
+	if (IS_ERR(va)) {
+		kfree(area);
+		return NULL;
+	}
+
+	kasan_unpoison_vmalloc((void *)va->va_start, requested_size);
+
+	// 将 vmap_area 装到 vm_struct 里
+	setup_vmalloc_vm(area, va, flags, caller);
+		vm->flags = flags;
+		vm->addr = (void *)va->va_start;
+		vm->size = va->va_end - va->va_start;
+		vm->caller = caller;
+		va->vm = vm;
+
+	// 返回vm_struct
+	return area;
+}
+```
+#### __vmalloc_area_node
+```c
+static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+				 pgprot_t prot, int node)
+{
+	const gfp_t nested_gfp = (gfp_mask & GFP_RECLAIM_MASK) | __GFP_ZERO;
+	unsigned int nr_pages = get_vm_area_size(area) >> PAGE_SHIFT;
+	unsigned int array_size = nr_pages * sizeof(struct page *), i;
+	struct page **pages;
+
+	gfp_mask |= __GFP_NOWARN;
+	if (!(gfp_mask & (GFP_DMA | GFP_DMA32)))
+		gfp_mask |= __GFP_HIGHMEM;
+
+	// 准备 page 指针数组
+	if (array_size > PAGE_SIZE) {
+		pages = __vmalloc_node(array_size, 1, nested_gfp, node,
+					area->caller);
+	} else {
+		pages = kmalloc_node(array_size, nested_gfp, node);
+	}
+
+	if (!pages) {
+		remove_vm_area(area->addr);
+		kfree(area);
+		return NULL;
+	}
+
+	area->pages = pages;
+	area->nr_pages = nr_pages;
+
+	// 分配物理空间，并将相关page记录到vm_struct->pages指针数组中
+	for (i = 0; i < area->nr_pages; i++) {
+		struct page *page;
+
+		if (node == NUMA_NO_NODE)
+			page = alloc_page(gfp_mask);
+		else
+			page = alloc_pages_node(node, gfp_mask, 0);
+
+		if (unlikely(!page)) {
+			/* Successfully allocated i pages, free them in __vfree() */
+			area->nr_pages = i;
+			atomic_long_add(area->nr_pages, &nr_vmalloc_pages);
+			goto fail;
+		}
+		area->pages[i] = page;
+		if (gfpflags_allow_blocking(gfp_mask))
+			cond_resched();
+	}
+	atomic_long_add(area->nr_pages, &nr_vmalloc_pages);
+
+	// 在init_mm的页表建立映射关系
+	if (map_kernel_range((unsigned long)area->addr, get_vm_area_size(area),
+			prot, pages) < 0)
+		goto fail;
+
+	return area->addr;
+
+fail:
+	warn_alloc(gfp_mask, NULL,
+			  "vmalloc: allocation failure, allocated %ld of %ld bytes",
+			  (area->nr_pages*PAGE_SIZE), area->size);
+	__vfree(area->addr);
+	return NULL;
+}
+```
+
+### vfree
+```c
+void vfree(const void *addr)
+	__vfree(addr);
+		__vunmap(addr, 1);
+
+static void __vunmap(const void *addr, int deallocate_pages)
+{
+	struct vm_struct *area;
+
+	if (!addr)
+		return;
+
+	if (WARN(!PAGE_ALIGNED(addr), "Trying to vfree() bad address (%p)\n",
+			addr))
+		return;
+
+	// 根据目标addr从 vmap_area_root 中找到对于的vmap_area
+	// 返回 vmap_area->vm ，即 vm_struct
+	area = find_vm_area(addr);
+	if (unlikely(!area)) {
+		WARN(1, KERN_ERR "Trying to vfree() nonexistent vm area (%p)\n",
+				addr);
+		return;
+	}
+
+	// 释放 area->vmap_area, 将内核页表对应项清空
+	vm_remove_mappings(area, deallocate_pages);
+
+	if (deallocate_pages) {
+		int i;
+		// 释放所有物理内存到伙伴系统
+		for (i = 0; i < area->nr_pages; i++) {
+			struct page *page = area->pages[i];
+
+			BUG_ON(!page);
+			__free_pages(page, 0);
+		}
+		atomic_long_sub(area->nr_pages, &nr_vmalloc_pages);
+
+		kvfree(area->pages);
+	}
+
+	// 释放vm_struct 到slab
+	kfree(area);
+	return;
+}
+```
+
+# VMA vm_area_struct
+vm_area_struct 表示用户空间的虚拟空间
+
+vmap_area 表示内核空间的虚拟内存, 包括 VMALLOC区 fixmap区..
+
+## 数据结构
+```c
+
+```
+
+## VMA 操作
+### find_vma
+查找指定用户进程的第一个满足 `addr < vm_end` 的vma
+
+返回的vma有两种情况
+```
+优先返回 addr 在 [vm_start, vm_end] 中的vma
+	       addr	
+            |
+vm_start    |        vm_end
+ |---------------------|
+
+如果没有上面情况，则返回addr在vma前
+     addr                               
+	  |						   
+      |     vm_start             vm_end    
+ -------------|---------------------|------------
+```  
+
+```c
+struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
+{
+	struct rb_node *rb_node;
+	struct vm_area_struct *vma;
+
+	// 先从缓存中查询
+	vma = vmacache_find(mm, addr);
+	if (likely(vma))
+		return vma;
+
+	// 如果没有缓存，则 vma == NULL
+	// 再从 mm->mm_rb 中查询
+
+	rb_node = mm->mm_rb.rb_node;
+
+	while (rb_node) {
+		struct vm_area_struct *tmp;
+
+		tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);
+
+		if (tmp->vm_end > addr) {
+			vma = tmp;
+			if (tmp->vm_start <= addr)
+				break;
+			rb_node = rb_node->rb_left;
+		} else
+			rb_node = rb_node->rb_right;
+	}
+
+	// 如果找到了添加到缓存
+	if (vma)
+		vmacache_update(addr, vma);
+	return vma;
+}
+```
+
+# brk
 
 
 # 重要的宏和全局变量
