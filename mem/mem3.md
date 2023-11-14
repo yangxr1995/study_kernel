@@ -5028,8 +5028,447 @@ struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
 ```
 
 # brk
+```c
+SYSCALL_DEFINE1(brk, unsigned long, brk)
+{
+	unsigned long retval;
+	unsigned long newbrk, oldbrk, origbrk;
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *next;
+	unsigned long min_brk;
+	bool populate;
+	bool downgraded = false;
+	LIST_HEAD(uf);
+
+	if (mmap_write_lock_killable(mm))
+		return -EINTR;
+
+	origbrk = mm->brk;
+
+	// 确保新brk不小于堆空间最小范围
+	min_brk = mm->start_brk;
+	if (brk < min_brk)
+		goto out;
+
+	// 确保不超过资源限制
+	if (check_data_rlimit(rlimit(RLIMIT_DATA), brk, mm->start_brk,
+			      mm->end_data, mm->start_data))
+		goto out;
+
+	newbrk = PAGE_ALIGN(brk);
+	oldbrk = PAGE_ALIGN(mm->brk);
+	if (oldbrk == newbrk) {
+		mm->brk = brk;
+		goto success;
+	}
+
+	if (brk <= mm->brk) {
+		int ret;
+		// 当新brk小于当前brk时，则收缩用户进程的堆空间
+		mm->brk = brk;
+		// 解除 [newbrk, oldbrk] 覆盖的vma的映射
+		// 并释放相关vma
+		// uf == NULL
+		// 成功返回 1 ,因为 downgraded == true
+		ret = __do_munmap(mm, newbrk, oldbrk-newbrk, &uf, true);
+		if (ret < 0) {
+			mm->brk = origbrk;
+			goto out;
+		} else if (ret == 1) { // 解除映射成功
+			downgraded = true;
+		}
+		goto success;
+	}
+
+	// ?
+	next = find_vma(mm, oldbrk);
+	if (next && newbrk + PAGE_SIZE > vm_start_gap(next))
+		goto out;
+
+	// 扩大用户进程的堆虚拟空间
+	if (do_brk_flags(oldbrk, newbrk-oldbrk, 0, &uf) < 0)
+		goto out;
+	// 修改进程堆空间范围 
+	mm->brk = brk;
+
+success:
+	// 如果虚拟空间堆增大，且使用 VM_LOCKED,则需要立即分配物理内存，
+	// 并建立映射关系
+	populate = newbrk > oldbrk && (mm->def_flags & VM_LOCKED) != 0;
+	if (downgraded)
+		mmap_read_unlock(mm);
+	else
+		mmap_write_unlock(mm);
+	userfaultfd_unmap_complete(mm, &uf);
+	// 分配物理内存并建立映射关系
+	if (populate)
+		mm_populate(oldbrk, newbrk - oldbrk);
+	// 如果没有使用VM_LOCKED直接使用brk，则
+	// 只分配虚拟空间，不分配物理页
+	return brk;
+
+out:
+	retval = origbrk;
+	mmap_write_unlock(mm);
+	return retval;
+}
+```
+## __do_munmap
+当堆空间收缩时，调用此函数解除部分vma的映射
+
+```c
+		ret = __do_munmap(mm, newbrk, oldbrk-newbrk, &uf, true);
+
+int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
+		struct list_head *uf, bool downgrade)
+{
+	unsigned long end;
+	struct vm_area_struct *vma, *prev, *last;
+
+	// 如果start没有按照page大小对齐
+	// 或 start 超过了用户空间范围
+	// 或 len 超过了剩余的用户空间
+	// 则返回错误
+	if ((offset_in_page(start)) || start > TASK_SIZE || len > TASK_SIZE-start)
+		return -EINVAL;
+
+	len = PAGE_ALIGN(len);
+	end = start + len;
+	if (len == 0)
+		return -EINVAL;
+
+	/* Find the first overlapping VMA */
+	vma = find_vma(mm, start);
+	if (!vma)
+		return 0;
+	prev = vma->vm_prev;
+
+//      start end                            
+//       |	  |				   
+//       |    | vm_start             vm_end    
+//  -------------|---------------------|------------
+	// 当要unmap的虚拟空间不在管理的vma中时，直接返回
+	if (vma->vm_start >= end)
+		return 0;
+
+// 以下有三种情况
+//       start            end 
+//        |				   |	   
+//        |     vm_start   |          vm_end    
+//   -------------|---------------------|------------
+// 
+//                        start  end 
+//        				   |	  |
+//              vm_start   |      |    vm_end    
+//   -------------|---------------------|------------
+//
+//                        start                end
+//        				   |	                |
+//              vm_start   |           vm_end   |
+//   -------------|---------------------|------------
+
+	if (start > vma->vm_start) { 
+		int error;
+
+// 下面这种情况unmap后会增加一个 vma
+//
+//                        start  end 
+//        				   |	  |
+//              vm_start   |      |    vm_end    
+//   -------------|---------------------|------------
+//
+//  下面这种情况unmap后vma数量不变
+//
+//                        start                end
+//        				   |	                |
+//              vm_start   |           vm_end   |
+//   -------------|---------------------|------------
+
+		// 增加vma的情况，需要保证不超过资源限制 
+		if (end < vma->vm_end && mm->map_count >= sysctl_max_map_count)
+			return -ENOMEM;
+
+// case 1
+//                        start  end 
+//        				   |	  |
+//              vm_start   |      |    vm_end    
+//   -------------|---------------------|------------
+//
+//	split 后
+//                        start  end 
+//        				   |	  |
+//              vm_start   |      |    vm_end    
+//   -------------|---------------------|------------
+//                |        |            |
+//            vmastart  vmaend
+//                       newstart     newend
+// 
+// case 2
+//
+//                        start                end
+//        				   |	                |
+//              vm_start   |           vm_end   |
+//   -------------|---------------------|------------
+//
+//                        start                end
+//        				   |	                |
+//              vm_start   |           vm_end   |
+//   -------------|---------------------|------------
+//                |        |            |
+//            prevstart   prevend      
+//                        newstart     newend
+		// 以start为分界线，将vma分成两个vma 和 newvma
+		// 都加入到mm 的vma管理结构
+		error = __split_vma(mm, vma, start, 0);
+		if (error)
+			return error;
+		prev = vma;
+	}
 
 
+// 对于以下情况
+//
+//                               end 
+//        				          |
+//                     newstart   |    newend    
+//                         |      |     |
+//   -------------|--------|------------|------------
+//                |        |            
+//            vmastart  vmaend
+//
+//   find_vma(mm, end)  会找到 newvma 
+//
+//   再对newvma以end为分界线分割为两个vma
+//
+	last = find_vma(mm, end);
+	if (last && end > last->vm_start) {
+		int error = __split_vma(mm, last, end, 1);
+		if (error)
+			return error;
+	}
+
+	// 不论是case1 case2 prev->next都是需要删除的vma
+	vma = vma_next(mm, prev);
+
+	if (unlikely(uf)) {
+		int error = userfaultfd_unmap_prep(vma, start, end, uf); // 此函数为空
+		if (error)
+			return error;
+	}
+
+	// 释放vma前，对锁进行释放	
+	if (mm->locked_vm) {
+		struct vm_area_struct *tmp = vma;
+		while (tmp && tmp->vm_start < end) {
+			if (tmp->vm_flags & VM_LOCKED) {
+				mm->locked_vm -= vma_pages(tmp);
+				munlock_vma_pages_all(tmp);
+			}
+
+			tmp = tmp->vm_next;
+		}
+	}
+
+	/* Detach vmas from rbtree */
+	// 从树中detach vma 节点和他后面的节点
+	// 直到 vma->va_start >= end
+	// 所有被detach的节点构成一个链表，
+	// 链表头记录在 prev->next
+	if (!detach_vmas_to_be_unmapped(mm, vma, prev, end))
+		downgrade = false;
+
+	if (downgrade)
+		mmap_write_downgrade(mm);
+
+	// 修改页表，解除vma链表中所有vma的映射
+	unmap_region(mm, vma, prev, start, end);
+
+	/* Fix up all other VM information */
+	// 释放所有vma
+	remove_vma_list(mm, vma);
+
+	return downgrade ? 1 : 0;
+}
+```
+### detach_vmas_to_be_unmapped
+
+```c
+static bool
+detach_vmas_to_be_unmapped(struct mm_struct *mm, struct vm_area_struct *vma,
+	struct vm_area_struct *prev, unsigned long end)
+{
+	struct vm_area_struct **insertion_point;
+	struct vm_area_struct *tail_vma = NULL;
+
+	insertion_point = (prev ? &prev->vm_next : &mm->mmap);
+	vma->vm_prev = NULL;
+	// 从树中删除所有符合条件的节点
+	do {
+		// 从树中删除vma节点，并对树进行再平衡
+		vma_rb_erase(vma, &mm->mm_rb);
+		mm->map_count--;
+		tail_vma = vma;
+		vma = vma->vm_next;
+	} while (vma && vma->vm_start < end);
+	// 将vma链表挂在 prev->vm_next 上
+	*insertion_point = vma;
+	if (vma) {
+		vma->vm_prev = prev;
+		vma_gap_update(vma);
+	} else
+		mm->highest_vm_end = prev ? vm_end_gap(prev) : 0;
+	tail_vma->vm_next = NULL;
+
+	/* Kill the cache */
+	vmacache_invalidate(mm);
+
+	if (vma && (vma->vm_flags & VM_GROWSDOWN))
+		return false;
+	if (prev && (prev->vm_flags & VM_GROWSUP))
+		return false;
+	return true;
+}
+```
+### unmap_region
+```c
+static void unmap_region(struct mm_struct *mm,
+		struct vm_area_struct *vma, struct vm_area_struct *prev,
+		unsigned long start, unsigned long end)
+{
+	struct vm_area_struct *next = vma_next(mm, prev);
+	struct mmu_gather tlb;
+	struct vm_area_struct *cur_vma;
+
+	lru_add_drain();
+	tlb_gather_mmu(&tlb, mm, start, end);
+	update_hiwater_rss(mm);
+	// 对vma链表覆盖的虚拟内存进行 解除页表映射
+	unmap_vmas(&tlb, vma, start, end);
+
+	// 刷新mmu
+	for (cur_vma = vma; cur_vma; cur_vma = cur_vma->vm_next) {
+		if ((cur_vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) != 0) {
+			tlb_flush_mmu(&tlb);
+			break;
+		}
+	}
+
+	free_pgtables(&tlb, vma, prev ? prev->vm_end : FIRST_USER_ADDRESS,
+				 next ? next->vm_start : USER_PGTABLES_CEILING);
+	tlb_finish_mmu(&tlb, start, end);
+}
+```
+### remove_vma_list
+```c
+static void remove_vma_list(struct mm_struct *mm, struct vm_area_struct *vma)
+{
+	unsigned long nr_accounted = 0;
+
+	/* Update high watermark before we lower total_vm */
+	update_hiwater_vm(mm);
+	do {
+		long nrpages = vma_pages(vma);
+
+		if (vma->vm_flags & VM_ACCOUNT)
+			nr_accounted += nrpages;
+		vm_stat_account(mm, vma->vm_flags, -nrpages);
+		vma = remove_vma(vma);
+	} while (vma);
+	vm_unacct_memory(nr_accounted);
+	validate_mm(mm);
+}
+
+static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
+{
+	struct vm_area_struct *next = vma->vm_next;
+
+	might_sleep();
+	if (vma->vm_ops && vma->vm_ops->close)
+		vma->vm_ops->close(vma);
+	if (vma->vm_file)
+		fput(vma->vm_file);
+	mpol_put(vma_policy(vma));
+	vm_area_free(vma);
+		kmem_cache_free(vm_area_cachep, vma);
+	return next;
+}
+```
+## do_brk_flags
+```c
+static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long flags, struct list_head *uf)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma, *prev;
+	struct rb_node **rb_link, *rb_parent;
+	pgoff_t pgoff = addr >> PAGE_SHIFT;
+	int error;
+	unsigned long mapped_addr;
+
+	/* Until we need other flags, refuse anything except VM_EXEC. */
+	if ((flags & (~VM_EXEC)) != 0)
+		return -EINVAL;
+	flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
+
+	// 检查虚拟地址空间是否能满足 分配 addr, addr + len 的虚拟地址
+	mapped_addr = get_unmapped_area(NULL, addr, len, 0, MAP_FIXED);
+	if (IS_ERR_VALUE(mapped_addr))
+		return mapped_addr;
+
+	error = mlock_future_check(mm, mm->def_flags, len);
+	if (error)
+		return error;
+
+	/* Clear old maps, set up prev, rb_link, rb_parent, and uf */
+	// 解除以前对 [addr, addr + len]虚拟地址的映射
+	if (munmap_vma_range(mm, addr, len, &prev, &rb_link, &rb_parent, uf))
+		return -ENOMEM;
+
+	/* Check against address space limits *after* clearing old maps... */
+	// 检查用户进程虚拟空间限制
+	if (!may_expand_vm(mm, flags, len >> PAGE_SHIFT))
+		return -ENOMEM;
+
+	if (mm->map_count > sysctl_max_map_count)
+		return -ENOMEM;
+
+	if (security_vm_enough_memory_mm(mm, len >> PAGE_SHIFT))
+		return -ENOMEM;
+
+	/* Can we just expand an old private anonymous mapping? */
+	// 新增映射区如果可以和原有vma合并，则直接扩展原有vma，返回原有vma
+	vma = vma_merge(mm, prev, addr, addr + len, flags,
+			NULL, NULL, pgoff, NULL, NULL_VM_UFFD_CTX);
+	if (vma)
+		goto out;
+
+	// 如果不能合并，则创建新的vma
+	/*
+	 * create a vma struct for an anonymous mapping
+	 */
+	vma = vm_area_alloc(mm);
+	if (!vma) {
+		vm_unacct_memory(len >> PAGE_SHIFT);
+		return -ENOMEM;
+	}
+
+	vma_set_anonymous(vma);
+	vma->vm_start = addr;
+	vma->vm_end = addr + len;
+	vma->vm_pgoff = pgoff;
+	vma->vm_flags = flags;
+	vma->vm_page_prot = vm_get_page_prot(flags);
+	// 加入mm 对vma管理结构
+	vma_link(mm, vma, prev, rb_link, rb_parent);
+out:
+	perf_event_mmap(vma);
+	mm->total_vm += len >> PAGE_SHIFT;
+	mm->data_vm += len >> PAGE_SHIFT;
+	if (flags & VM_LOCKED)
+		mm->locked_vm += (len >> PAGE_SHIFT);
+	vma->vm_flags |= VM_SOFTDIRTY;
+	return 0;
+}
+```
 # 重要的宏和全局变量
 ```c
 #define PAGE_OFFSET		UL(CONFIG_PAGE_OFFSET)
