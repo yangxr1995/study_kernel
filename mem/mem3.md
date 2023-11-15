@@ -4968,7 +4968,70 @@ vmap_area 表示内核空间的虚拟内存, 包括 VMALLOC区 fixmap区..
 
 ## 数据结构
 ```c
+struct vm_area_struct {
+	/* The first cache line has the info for VMA tree walking. */
 
+	// 在所属的 struct mm_struct 中表示的虚拟空间中的起始地址和结束地址
+	unsigned long vm_start;		/* Our start address within vm_mm. */
+	unsigned long vm_end;		/* The first byte after our end address
+					   within vm_mm. */
+
+	/* linked list of VM areas per task, sorted by address */
+	// 连入mm_struct->mmap 链表
+	struct vm_area_struct *vm_next, *vm_prev;
+
+	// 连入 mm_struct->mm_rb 树
+	struct rb_node vm_rb;
+
+	/*
+	 * Largest free memory gap in bytes to the left of this VMA.
+	 * Either between this VMA and vma->vm_prev, or between one of the
+	 * VMAs below us in the VMA rbtree and its ->vm_prev. This helps
+	 * get_unmapped_area find a free area of the right size.
+	 */
+	unsigned long rb_subtree_gap;
+
+	/* Second cache line starts here. */
+	// 所属的 mm_struct
+	struct mm_struct *vm_mm;	/* The address space we belong to. */
+
+	/*
+	 * Access permissions of this VMA.
+	 * See vmf_insert_mixed_prot() for discussion.
+	 */
+	// 访问权限
+	// 主要用于设置覆盖的pte的flags
+	pgprot_t vm_page_prot;
+	// 表示访问权限，共享，私有...
+	// 用于程序员使用
+	unsigned long vm_flags;		/* Flags, see mm.h. */
+
+	/*
+	 * For areas with an address space and backing store,
+	 * linkage into the address_space->i_mmap interval tree.
+	 */
+	struct {
+		struct rb_node rb;
+		unsigned long rb_subtree_last;
+	} shared;
+
+	struct list_head anon_vma_chain; /* Serialized by mmap_lock &
+					  * page_table_lock */
+	struct anon_vma *anon_vma;	/* Serialized by page_table_lock */
+
+	const struct vm_operations_struct *vm_ops;
+
+	// 以page为单位的此vma的起始地址相对于xx的偏移值
+	// 如果vma是page cache ，则是相对文件的0字节开始的偏移值
+	// 如果是私有匿名映射，则是相对于整个虚拟地址空间，0地址开始的偏移值
+	// 如果是共享匿名映射，则是0
+	unsigned long vm_pgoff;		/* Offset (within vm_file) in PAGE_SIZE
+					   units */
+	// 如果是文件映射，所属的文件会话
+	struct file * vm_file;		/* File we map to (can be NULL). */
+	void * vm_private_data;		/* was vm_pte (shared mem) */
+
+} __randomize_layout;
 ```
 
 ## VMA 操作
@@ -5470,6 +5533,8 @@ out:
 }
 ```
 
+# mmap
+
 # 缺页中断
 为什么需要缺页中断？
 
@@ -5517,6 +5582,213 @@ static struct fsr_info fsr_info[] = {
 
 ```
 
+## do_page_fault
+```c
+static int __kprobes
+do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+{
+	struct task_struct *tsk;
+	struct mm_struct *mm;
+	int sig, code;
+	vm_fault_t fault;
+	unsigned int flags = FAULT_FLAG_DEFAULT;
+
+	// 处理用户空间缺页中断
+
+	if (kprobe_page_fault(regs, fsr))
+		return 0;
+
+	// arm32用户空间和内核空间共用一个页表
+	tsk = current;
+	mm  = tsk->mm;
+
+	/* Enable interrupts if they were enabled in the parent context. */
+	if (interrupts_enabled(regs))
+		local_irq_enable();
+
+	/*
+	 * If we're in an interrupt or have no user
+	 * context, we must not take the fault..
+	 */
+	if (faulthandler_disabled() || !mm)
+		goto no_context;
+
+	if (user_mode(regs))
+		flags |= FAULT_FLAG_USER;
+	if ((fsr & FSR_WRITE) && !(fsr & FSR_CM))
+		flags |= FAULT_FLAG_WRITE;
+
+	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
+
+	/*
+	 * As per x86, we may deadlock here.  However, since the kernel only
+	 * validly references user space from well defined areas of the code,
+	 * we can bug out early if this is from code which shouldn't.
+	 */
+	if (!mmap_read_trylock(mm)) {
+		if (!user_mode(regs) && !search_exception_tables(regs->ARM_pc))
+			goto no_context;
+retry:
+		mmap_read_lock(mm);
+	} else {
+		/*
+		 * The above down_read_trylock() might have succeeded in
+		 * which case, we'll have missed the might_sleep() from
+		 * down_read()
+		 */
+		might_sleep();
+#ifdef CONFIG_DEBUG_VM
+		if (!user_mode(regs) &&
+		    !search_exception_tables(regs->ARM_pc))
+			goto no_context;
+#endif
+	}
+
+	fault = __do_page_fault(mm, addr, fsr, flags, tsk, regs);
+
+	/* If we need to retry but a fatal signal is pending, handle the
+	 * signal first. We do not need to release the mmap_lock because
+	 * it would already be released in __lock_page_or_retry in
+	 * mm/filemap.c. */
+	// 如果需要重试处理缺页，但已经有挂起的信号，则先处理信号
+	if (fault_signal_pending(fault, regs)) {
+		if (!user_mode(regs))
+			goto no_context;
+		return 0;
+	}
+
+	if (!(fault & VM_FAULT_ERROR) && flags & FAULT_FLAG_ALLOW_RETRY) {
+		if (fault & VM_FAULT_RETRY) {
+			flags |= FAULT_FLAG_TRIED;
+			goto retry;
+		}
+	}
+
+	mmap_read_unlock(mm);
+
+	/*
+	 * Handle the "normal" case first - VM_FAULT_MAJOR
+	 */
+	if (likely(!(fault & (VM_FAULT_ERROR | VM_FAULT_BADMAP | VM_FAULT_BADACCESS))))
+		return 0;
+
+	/*
+	 * If we are in kernel mode at this point, we
+	 * have no context to handle this fault with.
+	 */
+	if (!user_mode(regs))
+		goto no_context;
+
+	if (fault & VM_FAULT_OOM) {
+		/*
+		 * We ran out of memory, call the OOM killer, and return to
+		 * userspace (which will retry the fault, or kill us if we
+		 * got oom-killed)
+		 */
+		pagefault_out_of_memory();
+		return 0;
+	}
+
+	if (fault & VM_FAULT_SIGBUS) {
+		/*
+		 * We had some memory, but were unable to
+		 * successfully fix up this page fault.
+		 */
+		sig = SIGBUS;
+		code = BUS_ADRERR;
+	} else {
+		/*
+		 * Something tried to access memory that
+		 * isn't in our memory map..
+		 */
+		sig = SIGSEGV;
+		code = fault == VM_FAULT_BADACCESS ?
+			SEGV_ACCERR : SEGV_MAPERR;
+	}
+
+	__do_user_fault(addr, fsr, sig, code, regs);
+	return 0;
+
+no_context:
+	__do_kernel_fault(mm, addr, fsr, regs);
+	return 0;
+}
+```
+### __do_page_fault
+```c
+static vm_fault_t __kprobes
+__do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned int fsr,
+		unsigned int flags, struct task_struct *tsk,
+		struct pt_regs *regs)
+{
+	struct vm_area_struct *vma;
+	vm_fault_t fault;
+
+	// 在用户空间管理结构vma找到对应vma
+	vma = find_vma(mm, addr);
+	fault = VM_FAULT_BADMAP;
+	// 如果没有vma说明没有分配相关虚拟内存，
+	// 或者是内核空间, 则都不予处理
+	if (unlikely(!vma))
+		goto out;
+	// 如果 addr不在 vma覆盖范围
+	// 注意 addr是要求vma向下生长
+	if (unlikely(vma->vm_start > addr))
+		goto check_stack;
+
+	/*
+	 * Ok, we have a good vm_area for this
+	 * memory access, so we can handle it.
+	 */
+good_area:
+	// 检查是否符合访问权限
+	if (access_error(fsr, vma)) {
+		fault = VM_FAULT_BADACCESS;
+		goto out;
+	}
+
+	// 符合访问权限
+
+	return handle_mm_fault(vma, addr & PAGE_MASK, flags, regs);
+
+check_stack:
+	/* Don't allow expansion below FIRST_USER_ADDRESS */
+	// 如果vma可以向下生长，且 addr没有越过用户空间允许映射的最低
+	// 地址，那么说明是栈空间
+	// 则对栈进行增长, 如果增长成功则再次进行缺页处理
+	if (vma->vm_flags & VM_GROWSDOWN &&
+	    addr >= FIRST_USER_ADDRESS && !expand_stack(vma, addr))
+		goto good_area;
+out:
+	return fault;
+}
+```
+
+#### handle_mm_fault
+```c
+vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+			   unsigned int flags, struct pt_regs *regs)
+{
+	vm_fault_t ret;
+
+	__set_current_state(TASK_RUNNING);
+
+	...
+
+	// 如果是巨页，还是普通页
+	if (unlikely(is_vm_hugetlb_page(vma)))
+		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
+	else
+		ret = __handle_mm_fault(vma, address, flags);
+
+	...
+
+	// 更新统计信息
+	mm_account_fault(regs, address, flags, ret);
+
+	return ret;
+}
+```
 
 # 重要的宏和全局变量
 ```c
