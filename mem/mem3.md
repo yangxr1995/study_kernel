@@ -5469,6 +5469,55 @@ out:
 	return 0;
 }
 ```
+
+# 缺页中断
+为什么需要缺页中断？
+
+为了是实现按需分配内存，在没有缺页中断时，运行某个程序需要将程序所有内容加载到内存，导致内存浪费，和频繁的磁盘IO，所以出现了分段机制，后来又出现了分页机制。他们的实现基础就是缺页中断。
+
+## 硬件基础
+ARM32中MMU有两个与存储访问失效相关的寄存器
+* 失效状态寄存器 FSR
+* 失效地址寄存器 FAR
+
+## 中断基础
+ARMv7缺页中断发生时：
+
+_vectors_start -> Vector_dabt -> _dabt_usr/_dabt_svc -> dabt_helper -> v7_early_abort
+
+v7_early_abort 会去读FSR FAR，获得缺页异常的地址和类型。
+
+然后会查询 fsr_info 数组，以获得处理函数
+```c
+static struct fsr_info fsr_info[] = {
+	{ do_bad,		SIGSEGV, 0,		"vector exception"		   },
+	{ do_bad,		SIGBUS,	 BUS_ADRALN,	"alignment exception"		   },
+	{ do_bad,		SIGKILL, 0,		"terminal exception"		   },
+	{ do_bad,		SIGBUS,	 BUS_ADRALN,	"alignment exception"		   },
+	{ do_bad,		SIGBUS,	 0,		"external abort on linefetch"	   },
+	{ do_translation_fault,	SIGSEGV, SEGV_MAPERR,	"section translation fault"	   },// L1页面转换失效
+	{ do_bad,		SIGBUS,	 0,		"external abort on linefetch"	   },
+	{ do_page_fault,	SIGSEGV, SEGV_MAPERR,	"page translation fault"	   },   // L2页面转换失败
+	{ do_bad,		SIGBUS,	 0,		"external abort on non-linefetch"  },
+	{ do_bad,		SIGSEGV, SEGV_ACCERR,	"section domain fault"		   },
+	{ do_bad,		SIGBUS,	 0,		"external abort on non-linefetch"  },
+	{ do_bad,		SIGSEGV, SEGV_ACCERR,	"page domain fault"		   },
+	{ do_bad,		SIGBUS,	 0,		"external abort on translation"	   },
+	{ do_sect_fault,	SIGSEGV, SEGV_ACCERR,	"section permission fault"	   },
+	{ do_bad,		SIGBUS,	 0,		"external abort on translation"	   },
+	{ do_page_fault,	SIGSEGV, SEGV_ACCERR,	"page permission fault"		   }, // 访问权限失效
+	....
+};
+```
+
+## do_translation_fault
+如果是1级页表转换地址失败，由此函数处理
+
+```c
+
+```
+
+
 # 重要的宏和全局变量
 ```c
 #define PAGE_OFFSET		UL(CONFIG_PAGE_OFFSET)
