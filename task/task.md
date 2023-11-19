@@ -6,14 +6,14 @@
 struct task_struct {
 
 /* these are hardcoded - don't touch */
-	// 调度相关
+	// 1. 调度相关
 	// 进程状态
 	long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
 	// 调度时间片 和 优先级
 	long counter;
 	long priority;
 
-	// 信号相关
+	// 2. 信号相关
 	// 抵达的信号
 	long signal;
 	// 处理信号的方法
@@ -24,8 +24,12 @@ struct task_struct {
 /* various fields */
 	// 进程退出原因
 	int exit_code;
+
+	// 3. 虚拟内存
+	// 虚拟空间代码段，数据段，堆栈范围
 	unsigned long start_code,end_code,end_data,brk,start_stack;
 
+	// 4. 进程间关系
 	// 进程号，父进程号，组进程号，会话号，组长
 	long pid,father,pgrp,session,leader;
 	// 进程所属的权限
@@ -33,16 +37,18 @@ struct task_struct {
 	// 进程组所属的权限
 	unsigned short gid,egid,sgid;
 
+	// 5. 定时器
 	// 定时器计数器，当为0时标记 SIGALRM
 	long alarm;
 
+	// 6. 运行时间 
 	// 运行时间等
 	long utime,stime,cutime,cstime,start_time;
 
 	unsigned short used_math;
 
 /* file system info */
-	// 文件管理相关
+	// 7. 文件相关
 	// 绑定的终端
 	int tty;		/* -1 if no tty, so it must be signed */
 	// 创建文件使用的umask
@@ -58,12 +64,12 @@ struct task_struct {
 	struct file * filp[NR_OPEN];
 
 /* ldt for this task 0 - zero 1 - cs 2 - ds&ss */
-	// 内存管理相关
+	// 8. 内存管理相关
 	// 页表
 	struct desc_struct ldt[3];
 
 /* tss for this task */
-	// 进程上下文
+	// 9. 进程上下文
 	struct tss_struct tss;
 };
 ```
@@ -100,6 +106,47 @@ se : 普通进程调度实体
 rt : 实时进程调度实体
 dl : deadline 进程调度实体
 prolicy : 进程类型，如普通进程还是实时进程
+
+
+# 进程的运行状态
+```c
+/* Used in tsk->state: */
+// 进程正在运行，或进程在就绪队列
+#define TASK_RUNNING			0x0000
+// 进程因等待资源被挂起，但可以被信号打断挂起状态
+#define TASK_INTERRUPTIBLE		0x0001
+// 进程因等待资源被挂起，但不可以被信号打断
+#define TASK_UNINTERRUPTIBLE		0x0002
+// 进程暂停
+#define __TASK_STOPPED			0x0004
+#define __TASK_TRACED			0x0008
+/* Used in tsk->exit_state: */
+// 进程退出
+#define EXIT_DEAD			0x0010
+// 进程退出，但task_struct没有被回收
+#define EXIT_ZOMBIE			0x0020
+```
+
+## 设置进程状态
+```c
+#define set_current_state(state_value)				\
+	do {							\
+		WARN_ON_ONCE(is_special_task_state(state_value));\
+		current->task_state_change = _THIS_IP_;		\
+		smp_store_mb(current->state, (state_value));	\
+	} while (0)
+```
+
+# 进程的PID
+* pid是进程的唯一编号
+* pid的类型是int，默认最大32768
+* 内核使用bitmap机制管理已分配的PID和空闲的PID,以循环使用pid
+* 线程组使用组长的pid为自己pid
+
+# init_task的初始化
+```c
+
+```
 
 
 # 进程的调度
