@@ -85,29 +85,6 @@ struct task_struct {
  - 文件资源 : umask pwd root close_on_exec filp
  - 内存资源 : ldt
 
-## Linux5.10
-### 进程属性相关
-* state
-* pid
-* flag
-* exit_code 进程终止值
-* exit_signal  终止信号
-* pdeath_signal 父进程死亡时发出的信号
-* comm 程序名
-* real_cred cred  进程认证信息
-
-## 调度相关
-prio : 进程动态优先级，调度类优先考虑
-static_prio : 静态优先级，内存不存储 nice值，而是 static_prio
-normal_prio :  基于 static_prio 和调度策略计算出的优先级
-rt_priority : 实时进程的优先级
-sched_class : 调度类
-se : 普通进程调度实体
-rt : 实时进程调度实体
-dl : deadline 进程调度实体
-prolicy : 进程类型，如普通进程还是实时进程
-
-
 # 进程的运行状态
 ```c
 /* Used in tsk->state: */
@@ -143,11 +120,140 @@ prolicy : 进程类型，如普通进程还是实时进程
 * 内核使用bitmap机制管理已分配的PID和空闲的PID,以循环使用pid
 * 线程组使用组长的pid为自己pid
 
-# init_task的初始化
-```c
+# task_struct 和内核栈
+![](./pic/1.jpg)
+struct pt_reg : 用于保存进程上下文
+sp : 指向当前栈顶
+current : 早期指向task_struct，后来由于task_struct越来越大，为了不占用过多内核栈，则指向thread_info
 
+## 如何从sp找到task_struct
+将sp指针按照THREAD_SIZE 8KB对齐，则获得current
+
+```c
+#define get_current() (current_thread_info()->task)
+#define current get_current()
+
+static inline struct thread_info *current_thread_info(void) __attribute_cons  t__;
+
+static inline struct thread_info *current_thread_info(void)
+{
+  return (struct thread_info *)
+	  (current_stack_pointer & ~(THREAD_SIZE - 1));
+}
 ```
 
+# 进程创建
+## fork
+```asm
+.align 2
+_sys_fork:
+	call find_empty_process
+	testl %eax,%eax
+	js 1f
+	push %gs
+	pushl %esi
+	pushl %edi
+	pushl %ebp
+	pushl %eax
+	call copy_process
+	addl $20,%esp
+1:	ret
+
+// 获得空闲pid
+int find_empty_process(void)
+{
+	int i;
+
+	repeat:
+		if ((++last_pid)<0) last_pid=1;
+		for(i=0 ; i<NR_TASKS ; i++)
+			if (task[i] && task[i]->pid == last_pid) goto repeat;
+	for(i=1 ; i<NR_TASKS ; i++)
+		if (!task[i])
+			return i;
+	return -EAGAIN;
+}
+
+int copy_process(int nr,long ebp,long edi,long esi,long gs,long none,
+		long ebx,long ecx,long edx,
+		long fs,long es,long ds,
+		long eip,long cs,long eflags,long esp,long ss)
+{
+	struct task_struct *p;
+	int i;
+	struct file *f;
+
+	// 获得4KB的物理空间
+	// 将4KB物理空间起始地址开始部分存放新进程的task_struct
+	p = (struct task_struct *) get_free_page();
+	if (!p)
+		return -EAGAIN;
+	// 占用一个位置
+	task[nr] = p;
+	// 将父进程的task_struct复制给子进程
+	*p = *current;	/* NOTE! this doesn't copy the supervisor stack */
+	// 设置子进程task_struct
+	p->state = TASK_UNINTERRUPTIBLE;
+	p->pid = last_pid;
+	p->father = current->pid;
+	p->counter = p->priority;
+	p->signal = 0;
+	p->alarm = 0;
+	p->leader = 0;		/* process leadership doesn't inherit */
+	p->utime = p->stime = 0;
+	p->cutime = p->cstime = 0;
+	p->start_time = jiffies;
+	// 设置上下文
+	p->tss.back_link = 0;
+	// 设置子进程的栈顶
+	p->tss.esp0 = PAGE_SIZE + (long) p;
+	p->tss.ss0 = 0x10;
+	p->tss.eip = eip;
+	p->tss.eflags = eflags;
+	p->tss.eax = 0;
+	p->tss.ecx = ecx;
+	p->tss.edx = edx;
+	p->tss.ebx = ebx;
+	p->tss.esp = esp;
+	p->tss.ebp = ebp;
+	p->tss.esi = esi;
+	p->tss.edi = edi;
+	p->tss.es = es & 0xffff;
+	p->tss.cs = cs & 0xffff;
+	p->tss.ss = ss & 0xffff;
+	p->tss.ds = ds & 0xffff;
+	p->tss.fs = fs & 0xffff;
+	p->tss.gs = gs & 0xffff;
+	p->tss.ldt = _LDT(nr);
+	p->tss.trace_bitmap = 0x80000000;
+	if (last_task_used_math == current)
+		__asm__("clts ; fnsave %0"::"m" (p->tss.i387));
+	// 复制页表
+	if (copy_mem(nr,p)) {
+		task[nr] = NULL;
+		free_page((long) p);
+		return -EAGAIN;
+	}
+	for (i=0; i<NR_OPEN;i++)
+		if (f=p->filp[i])
+			f->f_count++;
+	if (current->pwd)
+		current->pwd->i_count++;
+	if (current->root)
+		current->root->i_count++;
+	if (current->executable)
+		current->executable->i_count++;
+	set_tss_desc(gdt+(nr<<1)+FIRST_TSS_ENTRY,&(p->tss));
+	set_ldt_desc(gdt+(nr<<1)+FIRST_LDT_ENTRY,&(p->ldt));
+	// 子进程可运行
+	p->state = TASK_RUNNING;	/* do this last, just in case */
+	return last_pid;
+}
+```
+### vfork
+
+
+## exec
 
 # 进程的调度
 
