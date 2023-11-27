@@ -256,6 +256,122 @@ int copy_process(int nr,long ebp,long edi,long esi,long gs,long none,
 ## exec
 
 # 进程的调度
+linux0.11 - linux2.4 的调度算法都是 O(n) 的，即每次调度要扫描所有进程，找到时间片最大的进程进行切换。
+
+## schedule 
+```c
+void schedule(void)
+{
+	int i,next,c;
+	struct task_struct ** p;
+
+/* check alarm, wake up any interruptible tasks that have got a signal */
+
+	for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
+		if (*p) {
+			if ((*p)->alarm && (*p)->alarm < jiffies) {
+					(*p)->signal |= (1<<(SIGALRM-1));
+					(*p)->alarm = 0;
+				}
+			if (((*p)->signal & ~(_BLOCKABLE & (*p)->blocked)) &&
+			(*p)->state==TASK_INTERRUPTIBLE)
+				(*p)->state=TASK_RUNNING;
+		}
+
+/* this is the scheduler proper: */
+
+	while (1) {
+		c = -1;
+		next = 0;
+		i = NR_TASKS;
+		// 找到剩余时间片最大的进程
+		p = &task[NR_TASKS];
+		while (--i) {
+			if (!*--p)
+				continue;
+			if ((*p)->state == TASK_RUNNING && (*p)->counter > c)
+				c = (*p)->counter, next = i;
+		}
+		// 如果找到了，则进行切换
+		if (c) break;
+		// 如果没有，则说明所有进程的时间片都使用完了，则将所有
+		// 进程的时间片复位
+		for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
+			if (*p)
+				(*p)->counter = ((*p)->counter >> 1) +
+						(*p)->priority;
+	}
+	switch_to(next);
+}
+```
+
+### 时钟中断，时间片递减
+每次时钟中断，调用 `_timer_interrupt` 处理，
+
+`_timer_interrupt`调用 `do_timer`
+
+```c
+.align 2
+_timer_interrupt:
+	push %ds		# save ds,es and put kernel data space
+	push %es		# into them. %fs is used by _system_call
+	push %fs
+	pushl %edx		# we save %eax,%ecx,%edx as gcc doesn't
+	pushl %ecx		# save those across function calls. %ebx
+	pushl %ebx		# is saved as we use that in ret_sys_call
+	pushl %eax
+	movl $0x10,%eax
+	mov %ax,%ds
+	mov %ax,%es
+	movl $0x17,%eax
+	mov %ax,%fs
+	incl _jiffies
+	movb $0x20,%al		# EOI to interrupt controller #1
+	outb %al,$0x20
+	movl CS(%esp),%eax
+	andl $3,%eax		# %eax is CPL (0 or 3, 0=supervisor)
+	pushl %eax
+	call _do_timer		# 'do_timer(long CPL)' does everything from
+	addl $4,%esp		# task switching to accounting ...
+	jmp ret_from_sys_call
+```
+
+#### do_timer
+```c
+void do_timer(long cpl)
+{
+	extern int beepcount;
+	extern void sysbeepstop(void);
+
+	if (beepcount)
+		if (!--beepcount)
+			sysbeepstop();
+
+	if (cpl)
+		current->utime++;
+	else
+		current->stime++;
+
+	if (next_timer) {
+		next_timer->jiffies--;
+		while (next_timer && next_timer->jiffies <= 0) {
+			void (*fn)(void);
+			
+			fn = next_timer->fn;
+			next_timer->fn = NULL;
+			next_timer = next_timer->next;
+			(fn)();
+		}
+	}
+	if (current_DOR & 0xf0)
+		do_floppy_timer();
+	// 将当前进程的时间片递减，如果时间片为0，则进行进程调度
+	if ((--current->counter)>0) return;
+	current->counter=0;
+	if (!cpl) return;
+	schedule();
+}
+```
 
 # PID
 ## 线程组的PID
