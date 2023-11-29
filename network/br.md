@@ -191,6 +191,51 @@ another_round:
 					}
 				}
 
+				if (unlikely(skb_vlan_tag_present(skb)) && !netdev_uses_dsa(skb->dev)) {
+check_vlan_id:
+					if (skb_vlan_tag_get_id(skb)) {
+						/* Vlan id is non 0 and vlan_do_receive() above couldn't
+						 * find vlan device.
+						 */
+						// 如果本机没有vlan，但是接受的包带vlan，则将skb标记为发送给其他主机
+						// 的报文，可以认为 vlanid 是 mac地址的扩展，
+						// 当数据包带vlanid时，skb的mac地址为 mac + vlanid
+						// 所以驱动过滤mac地址不相等的skb，剩余的skb在l2层vlan处理时
+						// 根据vlan id 进行过滤，只有vlan id 能在对应端口上找到的skb才被
+						// 认为是发送给本机的数据包
+						skb->pkt_type = PACKET_OTHERHOST;
+					} else if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
+						   skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
+						/* Outer header is 802.1P with vlan 0, inner header is
+						 * 802.1Q or 802.1AD and vlan_do_receive() above could
+						 * not find vlan dev for vlan id 0.
+						 */
+						__vlan_hwaccel_clear_tag(skb);
+						skb = skb_vlan_untag(skb);
+						if (unlikely(!skb))
+							goto out;
+						if (vlan_do_receive(&skb))
+							/* After stripping off 802.1P header with vlan 0
+							 * vlan dev is found for inner header.
+							 */
+							goto another_round;
+						else if (unlikely(!skb))
+							goto out;
+						else
+							/* We have stripped outer 802.1P vlan 0 header.
+							 * But could not find vlan dev.
+							 * check again for vlan id to set OTHERHOST.
+							 */
+							goto check_vlan_id;
+					}
+					/* Note: we might in the future use prio bits
+					 * and set skb->priority like in vlan_do_receive()
+					 * For the time being, just ignore Priority Code Point
+					 */
+					__vlan_hwaccel_clear_tag(skb);
+				}
+
+
 				// 根据数据帧type字段，将skb传递给上层协议
 				type = skb->protocol;
 

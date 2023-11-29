@@ -242,9 +242,13 @@ root@u22:/# ip neigh show
 192.168.3.1 dev ens33 lladdr 00:50:56:c0:00:01 REACHABLE
 
 ```
-删除ARP项
+
 ```shell
+# 删除ARP项
 ip neigh delete <IP> dev <dev_name>
+
+# 添加ARP项
+ip neigh add 192.168.111.100 lladdr 00:0c:29:c0:5a:ef dev enp0s3
  ```
 
 ### 策略路由
