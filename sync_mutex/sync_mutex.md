@@ -43,15 +43,83 @@ static sszie_t gpio_drv_open(struct inode *inode, struct file *file)
 
 ### armv6之前的版本
 对于arm版本小于v6的版本，不支持smp，只有单CPU，所以通过关闭中断的方式可以实现互斥
+![](./pic/3.jpg)
 
 ### armv6之后的版本
-对于arm版本大于等于v6 : 要考虑多核情况，通过关闭中断只能防止本CPU不会调度导致冲突，只能通过arm内存标记指令
-```c
+对于arm版本大于等于v6 : 要考虑多核情况，通过关闭中断只能防止本CPU不会调度导致冲突，通过ldrex strex 指令实现互斥
+![](./pic/4.jpg)
+- ldrex r0, [r1]
+  - 读取 r1 所指内存的数据，存入 r0；并且标记 r1 所指内存为“独占访问”。
+  - 如果有其他程序再次执行“ldrex r0, [r1]”，一样会成功，一样会标记 r1 所指内存为“独占访问”。
+- 修改 r0 的值
+- 写入：strex r2, r0, [r1]：
+  - 如果 r1 的“独占访问”标记还存在，则把 r0 的新值写入 r1 所指内存，并且清除“独占访问”的标记，
+  - 把 r2 设为 0 表示成功。
+  - 如果 r1 的“独占访问”标记不存在了，就不会更新内存，并且把 r2 设为 1 表示失败。
 
+
+## Linux实现的原子操作 
+| 函数名 | 作用 |
+| --- | --- |
+| atomic_read(v)  | 读出原子变量的值，即 v->counter |
+| atomic_set(v,i)  | 设置原子变量的值，即 v->counter = i |
+| atomic_inc(v) | v->counter++ |
+| atomic_dec(v) | v->counter-- |
+| atomic_add(i,v) | v->counter += i |
+| atomic_sub(i,v) | v->counter -= i |
+| atomic_inc_and_test(v) | 先加 1，再判断新值是否等于 0；等于 0 的话，返回值为 1 |
+| atomic_dec_and_test(v) |  先减 1，再判断新值是否等于 0；等于 0 的话，返回值为 1 |
+
+使用原子操作实现驱动独占
+
+```c
+static atomic_t valid = ATOMIC_INIT(1);
+
+static ssize_t gpio_key_drv_open (struct inode *node, struct file *file)
+{
+    if (atomic_dec_and_test(&valid))
+        return 0;
+
+    atomic_inc(&valid);
+    return -EBUSY;
+}
+
+static int gpio_key_drv_close (struct inode *node, struct file *file)
+{
+    atomic_inc(&valid);
+    return 0;
+}
 ```
+
+原子位操作
+
+| 函数名 | 作用 |
+| --- | --- |
+| set_bit(nr,p) | 设置(\*p)的 bit nr 为 1 |
+| clear_bit(nr,p)  | 清除(\*p)的 bit nr 为 0 |
+| change_bit(nr,p) |  改变(\*p)的 bit nr，从 1 变为 0，或是从 0 变为 1 |
+| test_and_set_bit(nr,p) | 设置(\*p)的 bit nr 为 1，返回该位的老值 |
+| test_and_clear_bit(nr,p) | 清除(\*p)的 bit nr 为 0，返回该位的老值 |
+| test_and_change_bit(nr,p) | 改变(\*p)的 bit nr，从 1 变为 0，或是从 0 变为 1；返回该位的老值 |
+
 # 锁
 ## 自旋锁
 
+无法获得锁时，不会休眠，会一直循环等待
+
+| 自旋锁 | 描述 |
+| --- | --- |
+| raw_spinlock_t | 原始自旋锁(后面讲解) |
+| bit spinlocks | 位自旋锁(似乎没什么意义) |
+
+自旋锁的加锁、解锁函数是：spin_lock、spin_unlock，还可以加上各种后缀，这表示在加锁或解锁的
+同时，还会做额外的事情
+
+| 后缀 | 描述 |
+| --- | --- |
+| \_bh() | 加锁时禁止下半部(软中断)，解锁时使能下半部(软中断) |
+| \_irq() |  加锁时禁止中断，解锁时使能中断 |
+| \_irqsave/restore() | 加锁时禁止并中断并记录状态，解锁时恢复中断为所记录的状态 |
 
 ### 多CPU
 ![](./pic/2.jpg)
@@ -66,6 +134,163 @@ static sszie_t gpio_drv_open(struct inode *inode, struct file *file)
 
 所以新的内核支持内核态的进程调度（中断除外），当发生时间中断，如果有更高优先级的进程，则会进行调度（抢占）
 
+### 函数
+| 函数名 | 作用 |
+| --- | --- |
+| spin_lock_init(\_lock) | 初始化自旋锁为 unlock 状态 |
+| void spin_lock(spinlock_t \*lock) | 获取自旋锁(加锁)，返回后肯定获得了锁 |
+| int spin_trylock(spinlock_t \*lock) | 尝试获得自旋锁，成功获得锁则返回 1，否则返回 0 |
+| void spin_unlock(spinlock_t \*lock) |  释放自旋锁，或称解锁 |
+| int spin_is_locked(spinlock_t \*lock) | 返回自旋锁的状态，已加锁返回 1，否则返回 0 |
+
+| 后缀 | 描述 |
+| --- | --- |
+| \_bh() | 加锁时禁止下半部(软中断)，解锁时使能下半部(软中断) |
+| \_irq() | 加锁时禁止中断，解锁时使能中断 |
+| \_irqsave/restore() | 加锁时禁止并中断并记录状态，解锁时恢复中断为所记录的状态 |
 
 ## 睡眠锁
+无法获得锁时，当前线程就会休眠
+
+| 休眠锁 | 描述 |
+| --- | --- |
+| mutex | mutual exclusion，彼此排斥，即互斥锁(后面讲解) |
+| rt_mutex | |
+| semaphore | 信号量、旗语(后面讲解) |
+| rw_semaphore | 读写信号量，读写互斥，但是可以多人同时读 |
+| ww_mutex | |
+| percpu_rw_semaphore | 对 rw_semaphore 的改进，性能更优 |
+
+### 信号量 semaphore
+
+| 函数名 | 作用 |
+| --- | --- |
+| DEFINE_SEMAPHORE(name) | 定义一个 struct semaphore name 结构体，count 值设置为 1 |
+| void sema_init(struct semaphore \*sem, int val) | 初始化 semaphore |
+| void down(struct semaphore \*sem) | 获得信号量，如果暂时无法获得就会休眠 , 在休眠过程中无法被唤醒，即使有信号发给这个进程也不处理 |
+| int down_interruptible(struct semaphore \*sem) | 获得信号量，如果暂时无法获得就会休眠，休眠过程有可能收到信号而被唤醒， <br>要判断返回值：<br>0：获得了信号量 <br>-EINTR：被信号打断 |
+| int down_killable(struct semaphore \*sem) | 跟 down_interruptible 类似，down_interruptible 可以被任意信号唤醒，但 down_killable 只能被“fatal signal”唤醒<br> 返回值： <br> 0：获得了信号量 <br> -EINTR：被信号打断 |
+| int down_trylock(struct semaphore \*sem) | 尝试获得信号量，不会休眠<br>返回值：<br>0：获得了信号量<br>1：没能获得信号量|
+| int down_timeout(struct semaphore \*sem, long jiffies) | 获得信号量，如果不成功，休眠一段时间<br>返回值: <br>0：获得了信号量<br>-ETIME：这段时间内没能获取信号量，超时返回 |
+| down_timeout | 休眠过程中，它不会被信号唤醒 |
+| void up(struct semaphore \*sem) | 释放信号量，唤醒其他等待信号量的进程 |
+
+
+### 互斥量mutex
+| 函数名 | 作用 |
+| --- | --- |
+| mutex_init(mutex) | 初始化一个 struct mutex 指针 |
+| DEFINE_MUTEX(mutexname) | 初始化 struct mutex mutexname |
+| int mutex_is_locked(struct mutex \*lock) | 判断 mutex 的状态 <br>1：被锁了(locked)<br>0：没有被锁 |
+| void mutex_lock(struct mutex \*lock) | 获得 mutex，如果暂时无法获得，休眠返回之时必定是已经获得了 mutex |
+| int mutex_lock_interruptible(struct mutex\*lock) | 获得 mutex，如果暂时无法获得，休眠; 休眠过程中可以被信号唤醒，返回值：<br>0：成功获得了 mutex<br>-EINTR：被信号唤醒了 |
+| int mutex_lock_killable(struct mutex \*lock) | 跟 mutex_lock_interruptible 类似，mutex_lock_interruptible 可以被任意信号唤醒，但 mutex_lock_killable 只能被“fatal signal”唤醒，<br> 返回值：<br>0：获得了 mutex<br>-EINTR：被信号打断|
+| int mutex_trylock(struct mutex \*lock) | 尝试获取 mutex，如果无法获得，不会休眠，<br>返回值：<br>1：获得了 mutex，<br>0：没有获得<br>注意，这个返回值含义跟一般的 mutex 函数相反 |
+| void mutex_unlock(struct mutex \*lock) | 释放 mutex，会唤醒其他等待同一个 mutex 的线程 |
+| int atomic_dec_and_mutex_lock(atomic_t \*cnt, struct mutex \*lock) | 让原子变量的值减 1，如果减 1 后等于 0，则获取 mutex，<br>返回值：<br>1：原子变量等于 0 并且获得了 mutex<br>0：原子变量减 1 后并不等于 0，没有获得 mutex |
+
+### semaphore 和 mutex的区别 
+semaphore 中可以指定 count 为任意值
+
+mutex 的值只能设置为 1 或 0
+
+mutex 定义
+![](./pic/5.jpg)
+
+struct task_struct \*owner”, 指向某个进程。一个 mutex 只能在进程上下文中使用：谁给 mutex 加锁，就只能由谁来解锁。
+
+semaphore 的锁定与释放，并不限定为同一个进程
+
+| |semaphore | mutex|
+| --- | --- | --- |
+| 几把锁 | 任意, 可设置 | 1 |
+| 谁能解锁 | 别的程序、中断等都可以 | 谁加锁，就得由谁解锁 |
+| 多次解锁 | 可以 | 不可以，因为只有 1 把锁 |
+| 循环加锁 | 可以 | 不可以，因为只有 1 把锁 |
+| 任务在持有锁的期间可否退出 | 可以 | 不建议，容易导致死锁 |
+| 硬件中断、软件中断上下文中使用 | 可以 | 不可以 |
+
+# 背景知识
+## 内核抢占
+早期的的 Linux 内核是“不可抢占”的，假设有 A、B 两个程序在运行，当前是程序 A 在运行，什么时候轮到程序 B 运行呢？
+- 程序 A 主动放弃 CPU：
+  - 比如它调用某个系统调用、调用某个驱动，进入内核态后执行了 schedule()主动启动一次调度。
+- 程序 A 调用系统函数进入内核态，从内核态返回用户态的前夕：
+  - 这时内核会判断是否应该切换程序。
+- 程序 A 正在用户态运行，发生了中断：
+  - 内核处理完中断，继续执行程序 A 的用户态指令的前夕，它会判断是否应该切换程序。
+
+从这个过程可知，对于“不可抢占”的内核，当程序 A 运行内核态代码时进程是无法切换的(除非程序
+A 主动放弃)，比如执行某个系统调用、执行某个驱动时，进程无法切换。
+这会导致 2 个问题：
+- 优先级反转：
+  - 一个低优先级的程序，因为它正在内核态执行某些很耗时的操作，在这一段时间内更高优先级的程序也无法运行。
+- 在内核态发生的中断不会导致进程切换
+
+为了让系统的实时性更佳，Linux 内核引入了“抢占”(preempt)的功能：进程运行于内核态时，进程调度也是可以发生的。
+
+回到上面的例子，程序 A 调用某个驱动执行耗时的操作，在这一段时间内系统是可以切换去执行更高优先级的程序。
+
+对于可抢占的内核，编写驱动程序时要时刻注意：你的驱动程序随时可能被打断、随时是可以被另一个进程来重新执行。对于可抢占的内核，在驱动程序中要考虑对临界资源加锁。
+
+# 使用示例
+## 进程上下文 和 进程上下文
+
+假设只有程序 A、程序 B 会抢占资源，这 2 个程序都是可以休眠的，所以可以使用信号量，代码如下：
+```c
+// 资源自由一个
+static DEFINE_SPINLOCK(clock_lock); // 或 struct semaphore sem; sema_init(&sem, 1);
+
+// 如果被中断打断则会返回 -EINTR
+if (down_interruptible(&sem)) // if (down_trylock(&sem))
+{
+    /* 获得了信号量 */
+}
+
+/* 释放信号量 */
+up(&sem);
+```
+
+使用互斥量
+```c
+static DEFINE_MUTEX(mutex); //或 static struct mutex mutex; mutex_init(&mutex);
+mutex_lock(&mutex);
+/* 临界区 */
+mutex_unlock(&mutex)
+```
+
+一般来说在同一个函数里调用 mutex_lock 或 mutex_unlock，不会长期持有它。这只是惯例，如果你使用 mutex 来实现驱动程序只能由一个进程打开，在 drv_open 中调用 mutex_lock，在 drv_close 中调用 mutex_unlock，这也完全没问题
+
+### 进程上下文 和 Softirq
+
+假设这么一种情况：程序 A 运行到内核态时，正在访问一个临界资源；这时发生了某个硬件中断，在硬件中断处理完后会处理 Softirq，而某个 Softirq 也会访问这个临界资源。
+
+怎么办？
+
+在程序 A 访问临界资源之前，干脆禁止 Softirq 好了！
+
+可以使用 spin_lock_bh 函数，它会先禁止本地 CPU 的中断下半部即 Softirq，这样本地 Softirq 就不会跟它竞争了；假设别的 CPU 也想获得这个资源，它也会调用 spin_lock_bh 禁止它自己的 Softirq。这 2个 CPU 都禁止自己的 Softirq，然后竞争 spinlock，谁抢到谁就先执行。可见，在执行临界资源的过程中，本地 CPU 的 Softirq、别的 CPU 的 Softirq 都无法来抢占当前程序的临界资源。
+
+释放锁的函数是 spin_unlock_bh。
+
+spin_lock_bh/spin_unlock_bh 的后缀是“\_bh”，表示“Bottom Halves”，中断下半部，这是软件中断的老名字。这些函数改名为 spin_lock_softirq 也许更恰当，请记住：spin_lock_bh 会禁止 Softirq，而不仅仅是禁止“中断下半部”(timer、tasklet 里等都是 Softirq，中断下半部只是 Softirq 的一种)。
+
+```c
+static DEFINE_SPINLOCK(lock); // static spinlock_t lock; spin_lock_init(&lock);
+spin_lock_bh(&lock);
+/* 临界区 */
+spin_unlock_bh(&lock);
+```
+
+如果是CPU1上的进程调用 spin_lock_bh，CPU2发生中断，到处理软中断，也会调用 spin_lock_bh，这时会进行自旋，CPU1上的进程使用完临界区后，调用 spin_unlock_bh，CPU2便可以获得临界区
+
+### 进程上下文 和 Tasklet 之间
+Tasklet 也是 Softirq 的一种，所以跟前面是“在用户上下文与 Softirqs 之间加锁”完全一样。
+
+### 进程上下文 和 Timer 之间
+Timer 也是 Softirq 的一种，所以跟前面是“在用户上下文与 Softirqs 之间加锁”完全一样。
+
+
+
+
 
