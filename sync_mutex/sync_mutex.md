@@ -107,26 +107,46 @@ static int gpio_key_drv_close (struct inode *node, struct file *file)
 
 无法获得锁时，不会休眠，会一直循环等待
 
-| 自旋锁 | 描述 |
-| --- | --- |
-| raw_spinlock_t | 原始自旋锁(后面讲解) |
-| bit spinlocks | 位自旋锁(似乎没什么意义) |
+自旋锁是为SMP系统设计的，当CPU0获得了自旋锁，CPU1也尝试获得锁，CPU1的进程不会挂起而是原地等待，CPU0用完资源释放锁，CPU1获得锁。
 
-自旋锁的加锁、解锁函数是：spin_lock、spin_unlock，还可以加上各种后缀，这表示在加锁或解锁的
-同时，还会做额外的事情
+如此希望获得锁的进程就不需要被调度，相对睡眠锁，有很高的效率。
 
-| 后缀 | 描述 |
-| --- | --- |
-| \_bh() | 加锁时禁止下半部(软中断)，解锁时使能下半部(软中断) |
-| \_irq() |  加锁时禁止中断，解锁时使能中断 |
-| \_irqsave/restore() | 加锁时禁止并中断并记录状态，解锁时恢复中断为所记录的状态 |
+### 多CPU如何实现自旋锁
+![](./pic/7.jpg)
+所有SMP系统的自旋锁都会调用到arch_spin_lock
 
-### 多CPU
-![](./pic/2.jpg)
-未获得锁的进程会自旋等待，而非睡眠调度，所以优点效率高，但临界资源要短
+使用 ldrex, strex 指令实现互斥。进而实现自旋锁
 
-### 单CPU
+#### 公平原则
+当锁被CPU0占用，CPU1和CPU2都等待锁，则哪个CPU先获得锁呢？
+
+显然先排队的CPU应该先获得锁。
+
+自旋锁如何实现公平呢？
+
+![](./pic/8.jpg)
+spinlock的核心属性是 u16 next, 和u16 owner
+
+next 表示下一个可获得锁的ID
+owner 表示当前使用锁的ID
+
+![](./pic/7.jpg)
+1. next owner 各占16bit，所以一次ldrex获得两个属性
+2. 将next加1，并将结果(next owner)保存到临时变量lockval
+3. 并尝试将lockval 写回lock，如果发生冲突，则重新尝试 
+4. 否则，获得了自己的ID
+5. 循环检查当前ID是否到自己了
+6. 如果到自己了，则说明获得了锁，可以使用临界区
+
+
+![](./pic/9.jpg)
+unlock时，将owner++即可
+
+### 单CPU如何实现自旋锁
+![](./pic/11.jpg)
 单CPU时不存在并发执行，但是高版本的内核存在抢占，所以spin_lock会进行禁止抢占。
+
+如果Linux版本很低没有抢占，则自旋锁为空
 
 什么是抢占 preempt
 
@@ -162,7 +182,33 @@ static int gpio_key_drv_close (struct inode *node, struct file *file)
 | percpu_rw_semaphore | 对 rw_semaphore 的改进，性能更优 |
 
 ### 信号量 semaphore
+信号量的定义
+![](./pic/13.jpg)
 
+
+#### down 原理
+![](./pic/12.jpg)
+
+信号量是利用互斥锁实现的，
+
+因为信号量有两个临界资源，counter，wait_list
+
+- 调用down的进程首先获得互斥锁
+- 检查counter是大于0，等于0则需要等待
+- 将进程挂到wait_list，并设置进程状态为 interrupt 或 uninterrupt
+- 释放自旋锁，后调度
+- 当再被调度时，说明被其他进程唤醒，首先获得自旋锁
+- 检查释放获得机会，如果没有则再次睡眠
+
+#### up原理
+![](./pic/14.jpg)
+
+- 首先获得自旋锁
+- 如果有进程等待资源则将资源交给他，并将他踢出等待队列，并唤醒(设置他的状态为可调度 )他
+- 如果没有进程等待，则将资源增加
+- 然后释放锁
+
+#### 函数
 | 函数名 | 作用 |
 | --- | --- |
 | DEFINE_SEMAPHORE(name) | 定义一个 struct semaphore name 结构体，count 值设置为 1 |
@@ -177,6 +223,52 @@ static int gpio_key_drv_close (struct inode *node, struct file *file)
 
 
 ### 互斥量mutex
+![](./pic/15.jpg)
+
+mutx和semaphore一样是睡眠锁，但mutex只能有一个资源。
+
+#### owner优化mutex性能
+
+mutex的owner属性是可选的，用于优化性能。
+
+在SMP系统，当CPU0获得了mutex，这时CPU1也想获得mutex，此时mutex->owner为CPU0的进程，通过此进程可以知道mutex在哪个CPU，所以CPU1的进程就知道了mutex在CPU0上占用，并且当前只有自己在等mutex，所以他可以自旋等待，而非睡眠。
+
+kernel对mutex做了很多优化
+
+所以mutex的性能比semaphore高。
+
+#### lock实现
+![](./pic/15.jpg)
+
+counter
+- 0 : locked
+- 1 : unlocked
+- 负数 : locked，并且还有其他进程在等待
+
+![](./pic/16.jpg)
+
+![](./pic/17.jpg)
+大部分情况下，mutex当前值都是1，所以通过fastpath函数可以非常快速地获得mutex。
+
+![](./pic/18.jpg)
+如果mutex当前值是0或负数，则需要调用\__mutex_lock_slowpath慢慢处理：可能会休眠等待。
+
+
+##### slowpath
+![](./pic/19.jpg)
+![](./pic/20.jpg)
+![](./pic/21.jpg)
+![](./pic/22.jpg)
+![](./pic/23.jpg)
+
+#### unlock实现
+![](./pic/24.jpg)
+![](./pic/25.jpg)
+![](./pic/26.jpg)
+![](./pic/27.jpg)
+
+
+#### 函数
 | 函数名 | 作用 |
 | --- | --- |
 | mutex_init(mutex) | 初始化一个 struct mutex 指针 |
@@ -290,6 +382,40 @@ Tasklet 也是 Softirq 的一种，所以跟前面是“在用户上下文与 So
 ### 进程上下文 和 Timer 之间
 Timer 也是 Softirq 的一种，所以跟前面是“在用户上下文与 Softirqs 之间加锁”完全一样。
 
+
+### Tasklet 和 Timer
+假设在 Tasklet 中访问临界资源，另一个 CPU 会不会同时运行这个 Tasklet？不会的，所以如果只是在某个 Tasklet 中访问临界资源，无需上锁。
+
+假设在 Timer 中访问临界资源，另一个 CPU 会不会同时运行这个 timer？不会的，所以如果只是在某个Timer 中访问临界资源，无需上锁
+
+如果在有 2 个不同的 Tasklet 或 Timer 都会用到一个临界资源，那么可以使用 spin_lock()、spin_unlock()来保护临界资源。不需要用 spin_lock_bh()，因为一旦当前 CPU 已经处于 Tasklet 或 Timer中，同一个 CPU 不会同时再执行其他 Tasklet 或 Timer。
+
+### 在 Softirq 之间加锁
+这里讲的 softirq 不含 tasklet、timer。
+
+同一个 Softirq 是有可能在不同 CPU 上同时运行的，所以可以使用 spin_lock()、spin_unlock()来访问临界区。如果追求更高的性能，可以使用“per-CPU array”
+
+不同的 Softirq 之间，可以使用 spin_lock()、spin_unlock()来访问临界区。
+
+### 硬中断上下文
+
+假设一个硬件中断服务例程与一个 Softirq 共享数据，需要考虑 2 点：
+- Softirq 执行的过程中，可能会被硬件中断打断；
+- 临界区可能会被另一个 CPU 上的硬件中断进入。
+
+怎么办？
+
+在 Softirq 获得锁之前，禁止当前 CPU 的中断。
+
+在硬件中断服务例程中不需要使用 spin_lock_irq()，因为当它在执行的时间 Softirq 是不可能执行的；它可以使用 spin_lock()用来防止别的 CPU 抢占。
+
+如果硬件中断 A、硬件中断 B 都要访问临界资源，怎么办？这篇文章里说要使用 spin_lock_irq()：
+
+但是我认为使用 spin_lock()就足够了。因为 Linux 不支持中断嵌套，即当前 CPU 正在处理中断 A 时，中断 B 不可能在当前 CPU 上被处理，不需要再次去禁止中断；当前 CPU 正在处理中断 A 时，假如有另一个CPU 正在处理中断 B，它们使用 spin_lock()实现互斥访问临界资源就可以了。
+
+spin_lock_irq()/spin_unlock_irq() 会禁止 / 使能中断，
+
+另一套函数是spin_lock_irqsave()/spin_unlock_irqrestore()，spin_lock_irqsave()会先保存当前中断状态(使能还是禁止)，再禁止中断；spin_unlock_irqrestore()会恢复之前的中断状态(不一定是使能中断，而是恢复成之前的状态)。
 
 
 
