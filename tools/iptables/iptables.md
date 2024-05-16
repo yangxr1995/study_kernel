@@ -1728,6 +1728,17 @@ ULOG目标用于提供匹配数据包的用户空间日志记录。如果匹配�
 | 示例 | iptables -A INPUT -p TCP --dport 22 -j ULOG --ulog-qthreshold 10 |
 | 说明 | --ulog-qthreshold选项告诉ULOG目标在将数据发送到用户空间之前在内核中排队多少个数据包。例如，如果我们将阈值设置为10，内核将首先在内核中累积10个数据包，然后将其作为一个单一的netlink多部分消息传输到用户空间。默认值为1，因为为了向后兼容而使用了多部分消息之前，用户空间守护程序以前不知道如何处理多部分消息。 |
 
+### NFLOG
+用于将匹配的数据包发送到一个网络日志（Netlink）接口，从而允许用户空间程序对这些数据包进行进一步处理和记录。通过使用 NFLOG 目标，用户可以捕获特定匹配规则的数据包，以便进一步分析、记录或调试网络流量。
+
+tcpdump 通常在netfilter前进行抓包，使用NFLOG可以在netfilter 种或netfilter后进行抓包
+
+```shell
+sudo iptables -A INPUT -p tcp --dport 22 -j NFLOG --nflog-prefix "SSH_Traffic"
+
+sudo tcpdump -i nflog -nn -e -vv
+```
+
 # Debug你的脚本
 对于受限防火墙的最佳预防措施之一是使用cron定时任务添加一个脚本，每隔5分钟运行一次以重置防火墙，然后在确保安装正常工作后删除该cron行。cron行可以类似下面的方式，使用命令crontab -e输入。
 ```
