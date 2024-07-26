@@ -249,26 +249,29 @@ ip neigh delete <IP> dev <dev_name>
 
 # 添加ARP项
 ip neigh add 192.168.111.100 lladdr 00:0c:29:c0:5a:ef dev enp0s3
- ```
+```
 
 ### 策略路由
 
 #### 查看策略
-```shell
+```
 root@u22:/mnt/share/study_kernel/network# ip rule list
 0:      from all lookup local
 220:    from all lookup 220
 32766:  from all lookup main
 32767:  from all lookup default
-```
 其中 main 表就是 ip route 默认操作的表
+```
 
 #### 示例 简单的源策略路由
+```
 有两个moden,希望源地址为 10.0.0.10的数据包走 ppp2
 ppp0 212.64.94.251 -  212.64.94.1
 ppp2 212.64.78.148 - 195.96.98.253
+```
 
 # 当前main表有两个默认路由 ppp2 ppp0
+```
 ip route list table main
 195.96.98.253 dev ppp2 proto kernel scope link src 212.64.78.148
 212.64.94.1 dev ppp0 proto kernel scope link src 212.64.94.251
@@ -293,6 +296,7 @@ ip route add default via 195.96.98.253 dev ppp2 table John
 
 # 刷新路由缓存
 ip route flush cache
+```
 
 #### 示例 wireguard的路由
 ```shell
@@ -323,39 +327,39 @@ root@u22:~/linux-2.6.29.6# ip rule list
 32767:  from all lookup default
 ```
 wireguard 加了两个策略
-```shell
 
-# 对于所有报文，并且 suppress_prefixlength 0 为真使用 main 表
-# suppress_prefixlength 可以通过 man ip-rule
-#              suppress_prefixlength NUMBER
-#                     reject routing decisions that have a prefix length of
-#                     NUMBER or less.
-#                     拒绝路由条目其前缀长度小于等于NUMBER
-# 所以 suppress_prefixlength 0 就是拒绝 xx.xx.xx.xx/0 的路由条目，也就是默认路由条目
+```shell
+ 对于所有报文，并且 suppress_prefixlength 0 为真使用 main 表
+ suppress_prefixlength 可以通过 man ip-rule
+              suppress_prefixlength NUMBER
+                     reject routing decisions that have a prefix length of
+                     NUMBER or less.
+                     拒绝路由条目其前缀长度小于等于NUMBER
+ 所以 suppress_prefixlength 0 就是拒绝 xx.xx.xx.xx/0 的路由条目，也就是默认路由条目
 
 218:    from all lookup main suppress_prefixlength 0
 
-# 所以main表中除了默认路由都能生效，比如用户设置的内网路由
-# 所以当发送一个到外网的数据包时首先使用 main 表，但是由于默认路由都被拒绝了，所以main表匹配不到，走下面的表
+所以main表中除了默认路由都能生效，比如用户设置的内网路由
+所以当发送一个到外网的数据包时首先使用 main 表，但是由于默认路由都被拒绝了，所以main表匹配不到，走下面的表
 
-# 除掉fwmark 0xca6c 的数据包都匹配策略，查询 51820 表
-# wireguard口出来的包都会被打上 0xca6c的fwmark
+除掉fwmark 0xca6c 的数据包都匹配策略，查询 51820 表
+wireguard口出来的包都会被打上 0xca6c的fwmark
 219:    not from all fwmark 0xca6c lookup 51820
 
-# 所以一般的数据包会匹配此策略，并查询 51820 表
+所以一般的数据包会匹配此策略，并查询 51820 表
 
-# 51820 表包含一条默认路由，将所有数据包走 wg0 设备
-# wg0将数据包封装，目的地址为VPN服务器地址，通常是外网地址
+51820 表包含一条默认路由，将所有数据包走 wg0 设备
+wg0将数据包封装，目的地址为VPN服务器地址，通常是外网地址
 root@u22:~/linux-2.6.29.6# ip route show table 51820
 default dev wg0 scope link
 
-# 然后再次查询路由，由于需要默认路由，且被标记了 0xca6c，
-# 所以策略 218 219 都不匹配，220 是空，最终匹配策略 32766
+然后再次查询路由，由于需要默认路由，且被标记了 0xca6c，
+所以策略 218 219 都不匹配，220 是空，最终匹配策略 32766
 32766:  from all lookup main
 
-# 所以封装的数据包使用默认路由发送给网关，最终发送到VPN服务器
-# VPN服务器去除封装，得到原始数据包，
-# 然后基于原始数据包目的IP查询路由，确定是转发，还是本机
+所以封装的数据包使用默认路由发送给网关，最终发送到VPN服务器
+VPN服务器去除封装，得到原始数据包，
+然后基于原始数据包目的IP查询路由，确定是转发，还是本机
 root@u22:~/linux-2.6.29.6# ip route show table main
 default via 192.168.4.2 dev ens38 proto dhcp metric 101
 default via 192.168.3.1 dev ens33 proto static metric 20100
@@ -409,10 +413,10 @@ ip link show
 14: veth1@veth0: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
     link/ether 76:81:60:aa:2d:a2 brd ff:ff:ff:ff:ff:ff
 
-# 删除veth0 veth1 虚拟网卡对
+删除veth0 veth1 虚拟网卡对
 ip link del veth0
 
-# 指定名称的方式添加
+指定名称的方式添加
 ip link add veth01 type veth peer name veth10
 
 ip link show
@@ -467,25 +471,31 @@ linux对vlan的实现效果和很多交换机有所不同，linux只实现了基
 ## 示例
 主机有网卡eth0
 ```shell
-# 1. 保证eth0没有IP
+1. 保证eth0没有IP
 
-# 2. 添加vlan
+2. 添加vlan
 sudo ip link add link eth0 name eth0.10 type vlan id 10
 
 sudo ip link add link eth0 name eth0.20 type vlan id 20
 
-# 3. 给vlan设备添加ip
+3. 给vlan设备添加ip
 ip addr add 172.1.1.10/24 dev eth0.10
 ip addr add 172.1.1.20/24 dev eth0.20
 
-# 4. 启动设备
+4. 启动设备
 ip link set eth0 up
 ip link set eth0.10 up
 ip link set eth0.20 up
 
-# 5. 查看vlan
+5. 查看vlan
 cat /proc/net/vlan/config
 ```
+
+## 示例2
+![](./pic/1.jpg)
+
+## 示例3
+![](./pic/2.jpg)
 
 # 在VPN拨号程序的应用
 当vpn拨号前调用 routing_init, routing_start, 设置到vpn server 的路由，关闭vpn时 routing_end 

@@ -1,5 +1,7 @@
 #!/usr/bin/lua
 
+-- lua 没有 continue
+
 local num = 10
 if num > 5 then
     print("Number is greater than 5")
@@ -86,3 +88,4 @@ if firstEven then
 else
 	print("No even number found.")
 end
+

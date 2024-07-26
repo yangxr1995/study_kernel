@@ -45,3 +45,13 @@ print("foreach end")
 -- Lua没有专门的格式化字符串的函数，但你可以使用 string.format 来格式化数字和字符串。
 person = { name = "Alice", age = 30}
 local formatted = string.format("Name: %s, Age: %d", person.name, person.age) -- "Name: Alice, Age: 30"
+
+-- 对于有多个行换符非常有效
+page = [[ 
+<html>
+<head>
+</head>
+</html>
+]]
+
+print("page : " .. page)
