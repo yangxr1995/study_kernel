@@ -1,115 +1,7 @@
 # Linux Advanced Routing & Traffic Control HOWTO
 https://lartc.org/howto/index.html
 
-## iproute2
-为什么用iproute2 ?
-古老的arp ifconfig route 命令虽然能工作，但linux2.2之后对网络子系统进行了重新设计和实现，添加了很多新功能，
-为了新功能和更好的效率，需要 iproute2
-
-### ip route 设置路由项
-```shell
-ip route { add | del | change | append | replace } ROUTE
-
-	ROUTE := NODE_SPEC [ INFO_SPEC ]
-
-	NODE_SPEC := [ TYPE ] PREFIX [ tos TOS ] [ table TABLE_ID ] [ proto
-		   RTPROTO ] [ scope SCOPE ] [ metric METRIC ] [ ttl-propagate {
-		   enabled | disabled } ]
-
-	INFO_SPEC := { NH | nhid ID } OPTIONS FLAGS [ nexthop NH ] ...
-
-    OPTIONS := FLAGS [ mtu NUMBER ] [ advmss NUMBER ] [ as [ to ] ADDRESS
-		   ] rtt TIME ] [ rttvar TIME ] [ reordering NUMBER ] [ window
-		   NUMBER ] [ cwnd NUMBER ] [ ssthresh NUMBER ] [ realms REALM ]
-		   [ rto_min TIME ] [ initcwnd NUMBER ] [ initrwnd NUMBER ] [
-		   features FEATURES ] [ quickack BOOL ] [ congctl NAME ] [ pref
-		   PREF ] [ expires TIME ] [ fastopen_no_cookie BOOL ]
-
-    NH := [ encap ENCAP ] [ via [ FAMILY ] ADDRESS ] [ dev STRING ] [
-		   weight NUMBER ] NHFLAGS
-
-# 常用
-# default: 所有数据包匹配
-# via : 下一跳为 192.168.1.1，即MAC地址，即网关
-ip route add default via 192.168.1.1
-
-# 匹配条件为目标地址为192.168.4.0/24网段，
-# via : 下一调为 192.168.166.1
-# dev : 输出设备的wlan0
-ip route add 192.168.4.0/24 via 192.168.166.1 dev wlan0
-
-# 匹配条件为目标地址为192.168.1.9
-# via : 下一跳为 192.168.166.1
-# dev : 输出设备为wlan0
-ip route add 192.168.1.9 via 192.168.166.1 dev wlan0
-
-ip route add default via 192.168.1.1 table 1
-
-ip route add 192.168.0.0/24 via 192.168.166.1 table 1
-
-# 获取到目标的单个路由，并按照内核所看到的方式打印其内容
-ip route get 169.254.0.0/16
-
-# 删除192.168.4.0网段的网关
-ip route del 192.168.4.0/24
-
-# 删除默认网关
-ip route del default
-
-# 删除特定路由
-ip route flush 10.38.0.0/16
-
-# 清空路由表
-ip route flush table main
-
-# src : 当数据包匹配此路由项时，如果数据包没有设置源地址（没有用bind）
-#       则使用 src 指定的地址作为源地址进行发送
-#       如果数据包有源地址，则不使用src指定的参数
-#       src 只作用于本机发出的数据包，且没有显示指定源地址
-ip route add 78.22.45.0/24 via 10.45.22.1 src 10.45.22.12
-
-# 修改mac
-ip link set eth0 addr 52:54:00:12:34:55
-```
-
-### 显示链路
-```shell
-# ip link show
-1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
-    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
-2: ens33: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
-    link/ether 00:0c:29:89:30:6d brd ff:ff:ff:ff:ff:ff
-    altname enp2s1
-```
-iproute 切断了 链路 和 IP地址 的直接联系。
-
-### 显示IP
-```shell
-root@u22:/# ip addr show
-1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
-    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
-    inet 127.0.0.1/8 scope host lo
-       valid_lft forever preferred_lft forever
-    inet6 ::1/128 scope host
-       valid_lft forever preferred_lft forever
-2: ens33: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000
-    link/ether 00:0c:29:89:30:6d brd ff:ff:ff:ff:ff:ff
-    altname enp2s1
-    inet 192.168.3.2/24 brd 192.168.3.255 scope global noprefixroute ens33
-       valid_lft forever preferred_lft forever
-    inet6 fe80::da3a:e4d2:87f2:80f0/64 scope link noprefixroute
-       valid_lft forever preferred_lft forever
-```
-需要注意的子网掩码，以127.0.0.1 IP地址为例
-255.0.0.0 -> 127.0.0.1/8
-255.255.0.0 -> 127.0.0.1/16
-255.255.255.0 -> 127.0.0.1/24
-255.255.255.255 -> 127.0.0.1/32
-显然 8，16，24，32表示为1的bit位数量
-
-还需注意 qdisc
-
-### 显示路由
+# ip route
 ```shell
 root@u22:/# ip route show
 default via 192.168.4.2 dev ens38 proto dhcp metric 101
@@ -118,6 +10,7 @@ default via 192.168.3.1 dev ens33 proto static metric 20100
 192.168.3.0/24 dev ens33 proto kernel scope link src 192.168.3.2 metric 100
 192.168.4.0/24 dev ens38 proto kernel scope link src 192.168.4.128 metric 101
 ```
+
 第一项用于比较目的地址
 
 带 via 192... 指网关，也就是下一跳的MAC地址为此主机的MAC
@@ -129,8 +22,104 @@ proto dhcp/static 指这条路由项怎么被设置的
 metric 表示路由的度量值（metric）。度量值用于确定路由选择的优先级，较低的度量值表示更优先的路由。
 当存在多个匹配的路由时，系统会选择度量值最低的路由进行数据包转发。
 
+## 查询路由
 
-#### 显示路由的 res.type
+
+linux在做路由时，大致分为本机入栈，出栈，和转发的情况
+
+以下皆以如以下路由表为测试环境
+```shell
+172.168.10.0/24 dev veth0 scope link
+172.168.11.0/24 via 172.168.10.1 dev veth0
+172.168.13.0/24 dev veth3- proto kernel scope link src 172.168.13.1
+172.168.200.0/24 dev tunl0 proto kernel scope link src 172.168.200.1
+```
+
+对目的地址查询路由时，使用前缀树匹配，找到最长的叶子条目
+
+用人类的方式查询路由
+
+先用目的地址和掩码做与运算，然后看和谁相等
+
+如目的地址为 172.168.200.231 和每条路由的掩码做与运算 得到 172.168.200.0 和 第4条路由匹配
+
+### 出栈路由
+对于出栈数据包，查询路由时不使用源地址，只使用目标地址（不考虑绑定输出设备的情况）
+
+当发送ICMP到 172.168.11.23 时，会找到路由条目
+```
+172.168.11.0/24 via 172.168.10.1 dev veth0
+```
+那么数据包的源IP会被设置为 veth0 的IP，oif 为 veth0，下一跳为 172.168.10.1
+
+使用ip 可以验证
+
+因为出栈数据包之确定目的IP，所以可以写为
+```shell
+root@ubuntu:~/test# ip route get from 0.0.0.0 to 172.168.13.23 oif veth3-
+172.168.13.23 dev veth3- src 172.168.13.1 uid 0
+    cache
+```
+
+也可以简写为
+```shell
+ip route get 172.168.11.23
+```
+### 入栈路由
+
+有一入栈数据包
+
+源IP 172.168.13.2 目的IP为 172.168.10.2 输入设备为 veth3-
+
+```shell
+root@ubuntu:~/test# ip route get from 172.168.13.2 to 172.168.10.2 iif veth3-
+local 172.168.10.2 from 172.168.13.2 dev lo
+    cache <local> iif veth3-
+```
+
+使用 ip 命令验证，数据包的 route 类型是 local，说明是入栈
+
+可以发现main路由表内没有这条路由，之所以能路由，是因为 local表
+
+如果数据包
+
+源IP 172.168.14.2 目的IP为 172.168.10.2 输入设备为 veth3-
+
+由于源IP不在输入设备的网段，linux会认为是攻击包，会丢弃，使用 iptables 跟踪会发现 PREROUTING有计数，route之后就被丢弃了
+
+使用 ip 验证 
+
+```shell
+root@ubuntu:~/test# ip route get from 172.168.14.2 to 172.168.10.2 iif veth3-
+RTNETLINK answers: Invalid cross-device link
+```
+
+可见 route 模块会丢弃没有路由的包，而没有路由的原因通常是 
+
+目的地址找不到同网段的设备做输出设备 或
+
+源地址和输入设备网段不匹配
+
+
+### 转发数据包
+
+数据包为
+
+源IP 172.168.13.2 目的IP为 172.168.10.5 输入设备为 veth3-
+
+源IP在veth3-网段，且能找到目的IP的网段做输出设备
+
+数据包可以进行转发
+
+使用ip验证
+
+```shell
+root@ubuntu:~/test# ip route get from 172.168.13.2 to 172.168.10.5 iif veth3-
+172.168.10.5 from 172.168.13.2 dev veth0
+    cache iif veth3-
+```
+
+### 路由的 res.type
 IP层收到数据包后，要判断数据包是发送给自己还是单播或广播或组播，通过 ip_route_input 
 ```c
 ip_route_input
@@ -234,7 +223,125 @@ root@u22:/# ip route get 192.168.3.1
     cache
 ```
 
-### ARP
+## 设置路由
+```shell
+# default: 所有数据包匹配
+# via : 下一跳为 192.168.1.1，即MAC地址，即网关
+ip route add default via 192.168.1.1
+
+# 匹配条件为目标地址为192.168.4.0/24网段，
+# via : 下一调为 192.168.166.1
+# dev : 输出设备的wlan0
+ip route add 192.168.4.0/24 via 192.168.166.1 dev wlan0
+
+# 匹配条件为目标地址为192.168.1.9
+# via : 下一跳为 192.168.166.1
+# dev : 输出设备为wlan0
+ip route add 192.168.1.9 via 192.168.166.1 dev wlan0
+
+ip route add default via 192.168.1.1 table 1
+
+ip route add 192.168.0.0/24 via 192.168.166.1 table 1
+
+# 删除192.168.4.0网段的网关
+ip route del 192.168.4.0/24
+
+# 删除默认网关
+ip route del default
+
+# 删除特定路由
+ip route flush 10.38.0.0/16
+
+# 清空路由表
+ip route flush table main
+
+# src : 当数据包匹配此路由项时，如果数据包没有设置源地址（没有用bind）
+#       则使用 src 指定的地址作为源地址进行发送
+#       如果数据包有源地址，则不使用src指定的参数
+#       src 只作用于本机发出的数据包，且没有显示指定源地址
+ip route add 78.22.45.0/24 via 10.45.22.1 src 10.45.22.12
+
+# 修改mac
+ip link set eth0 addr 52:54:00:12:34:55
+```
+
+### 在VPN拨号程序的ip route应用
+当vpn拨号前调用 routing_init, routing_start, 设置到vpn server 的路由，关闭vpn时 routing_end 
+```c
+char *route;
+
+void routing_init(char *ip) 
+{
+	char buf[256];
+	snprintf(buf, 255, "/bin/ip route get %s", ip);
+	FILE *p = popen(buf, "r");
+	fgets(buf, 255, p);
+	/* TODO: check for failure of fgets */
+	route = strdup(buf);
+	pclose(p);
+	/* TODO: check for failure of command */
+}
+
+void routing_start() {
+	char buf[256];
+	snprintf(buf, 255, "/bin/ip route replace %s", route);
+	FILE *p = popen(buf, "r");
+	pclose(p);
+}
+
+void routing_end() {
+	char buf[256];
+	snprintf(buf, 255, "/bin/ip route delete %s", route);
+	FILE *p = popen(buf, "r");
+	pclose(p);
+}
+
+```
+
+
+
+# ip link
+```shell
+# ip link show
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: ens33: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
+    link/ether 00:0c:29:89:30:6d brd ff:ff:ff:ff:ff:ff
+    altname enp2s1
+
+# ip link set eth0 up
+
+# ip link set eth0 down
+```
+
+# ip addr
+```shell
+root@u22:/# ip addr show
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host
+       valid_lft forever preferred_lft forever
+2: ens33: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000
+    link/ether 00:0c:29:89:30:6d brd ff:ff:ff:ff:ff:ff
+    altname enp2s1
+    inet 192.168.3.2/24 brd 192.168.3.255 scope global noprefixroute ens33
+       valid_lft forever preferred_lft forever
+    inet6 fe80::da3a:e4d2:87f2:80f0/64 scope link noprefixroute
+       valid_lft forever preferred_lft forever
+```
+需要注意的子网掩码，以127.0.0.1 IP地址为例
+255.0.0.0 -> 127.0.0.1/8
+255.255.0.0 -> 127.0.0.1/16
+255.255.255.0 -> 127.0.0.1/24
+255.255.255.255 -> 127.0.0.1/32
+显然 8，16，24，32表示为1的bit位数量
+
+还需注意 qdisc
+
+
+# ip neigh
 ```shell
 root@u22:/# ip neigh show
 192.168.4.254 dev ens38 lladdr 00:50:56:ef:b6:3d STALE
@@ -251,9 +358,9 @@ ip neigh delete <IP> dev <dev_name>
 ip neigh add 192.168.111.100 lladdr 00:0c:29:c0:5a:ef dev enp0s3
 ```
 
-### 策略路由
+# ip rule
 
-#### 查看策略
+## 查看策略
 ```
 root@u22:/mnt/share/study_kernel/network# ip rule list
 0:      from all lookup local
@@ -263,14 +370,14 @@ root@u22:/mnt/share/study_kernel/network# ip rule list
 其中 main 表就是 ip route 默认操作的表
 ```
 
-#### 示例 简单的源策略路由
+## 示例 简单的源策略路由
 ```
 有两个moden,希望源地址为 10.0.0.10的数据包走 ppp2
 ppp0 212.64.94.251 -  212.64.94.1
 ppp2 212.64.78.148 - 195.96.98.253
 ```
 
-# 当前main表有两个默认路由 ppp2 ppp0
+### 当前main表有两个默认路由 ppp2 ppp0
 ```
 ip route list table main
 195.96.98.253 dev ppp2 proto kernel scope link src 212.64.78.148
@@ -298,7 +405,7 @@ ip route add default via 195.96.98.253 dev ppp2 table John
 ip route flush cache
 ```
 
-#### 示例 wireguard的路由
+### 示例 wireguard的路由
 ```shell
 [#] ip link add wg0 type wireguard
 [#] wg setconf wg0 /dev/fd/63
@@ -369,49 +476,25 @@ default via 192.168.3.1 dev ens33 proto static metric 20100
 192.168.4.0/24 dev ens38 proto kernel scope link src 192.168.4.128 metric 101
 ```
 
-# 网络命名空间
-下面展示基于网络命名空间和VLAN的示例
+# ip netns
 
-1. 增加虚拟网络命名空间
 ```shell
 ip netns add net0
-```
 
-2. 显示所有的虚拟网络命名空间
-```shell
+// 列出所有netns
 ip netns list
 
-ls /var/run/netns
-```
+// 当前所处的netns
+ip netns id
 
-3. 进入虚拟机网络环境
-```shell
 ip netns exec net0 command
-```
-
-如
-打开虚拟网络环境net0的bash窗口
-```shell
 ip netns exec net0 bash
 ```
-显示所有虚拟网络环境的设备
-```shell
-ip addr 
-```
-退出该虚拟网络环境
-```shell
-exit
-```
 
-4. 增加一对veth虚拟网卡
+## veth 和 netns
 ```shell
+增加一对veth虚拟网卡
 ip link add type veth
-
-ip link show
-13: veth0@veth1: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
-    link/ether f6:d1:08:40:29:1c brd ff:ff:ff:ff:ff:ff
-14: veth1@veth0: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
-    link/ether 76:81:60:aa:2d:a2 brd ff:ff:ff:ff:ff:ff
 
 删除veth0 veth1 虚拟网卡对
 ip link del veth0
@@ -419,30 +502,13 @@ ip link del veth0
 指定名称的方式添加
 ip link add veth01 type veth peer name veth10
 
-ip link show
-15: veth10@veth01: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
-    link/ether 9e:84:f1:d1:4b:37 brd ff:ff:ff:ff:ff:ff
-16: veth01@veth10: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
-    link/ether 62:d4:29:8d:53:9b brd ff:ff:ff:ff:ff:ff
-```
-
-5. 将veth0 添加到net0虚拟网络环境
-```shell
+将veth0 添加到net0虚拟网络环境
 ip link set veth0 netns net0
-```
 
-6. 将虚拟网卡eth1改名并添加到net1虚拟网络环境中
-```shell
+将虚拟网卡eth1改名并添加到net1虚拟网络环境中
 ip link set dev  veth1 name net1-bridge netns net1
-```
 
-7. 设置虚拟网络环境net0的veth0设备处于激活状态
-```shell
-ip netns exec net0 ip link set veth0 up
-```
-
-8. 为虚拟网络环境net0的veth0设备增加IP地址
-```shell
+为虚拟网络环境net0的veth0设备增加IP地址
 ip netns exec net0 ip address add 10.0.1.1/24 dev veth0
 ```
 
@@ -497,36 +563,123 @@ cat /proc/net/vlan/config
 ## 示例3
 ![](./pic/2.jpg)
 
-# 在VPN拨号程序的应用
-当vpn拨号前调用 routing_init, routing_start, 设置到vpn server 的路由，关闭vpn时 routing_end 
-```c
-char *route;
+# 隧道
+linux支持3种隧道 
+- ipip    IP over IP              tunl0
+- sit     IPv6 over IP            sit0
+- gre     Any over GRE over IP    gre
 
-void routing_init(char *ip) 
-{
-	char buf[256];
-	snprintf(buf, 255, "/bin/ip route get %s", ip);
-	FILE *p = popen(buf, "r");
-	fgets(buf, 255, p);
-	/* TODO: check for failure of fgets */
-	route = strdup(buf);
-	pclose(p);
-	/* TODO: check for failure of command */
-}
+所有类型隧道的创建使用一种命令
+```
+ip tunnel add <NAME> mode <MODE> [ local <S> ] [ remote <D> ]
+```
 
-void routing_start() {
-	char buf[256];
-	snprintf(buf, 255, "/bin/ip route replace %s", route);
-	FILE *p = popen(buf, "r");
-	pclose(p);
-}
+NAME 是任意字符串
+mode MODE 设置隧道类型，ipip sit gre
+remote D 设置隧道对端的地址
+local S 为隧道设置固定的本地地址
 
-void routing_end() {
-	char buf[256];
-	snprintf(buf, 255, "/bin/ip route delete %s", route);
-	FILE *p = popen(buf, "r");
-	pclose(p);
-}
+远程和本地都可以省略。在这种情况下，我们说它们是零或通配符。
+
+隧道被分为两类：点对点隧道和 NBMA（即非广播多路访问）隧道。
+
+点对点隧道有一些固定的远程地址，并将所有数据包发送到该目的地。
+
+然而NBMA隧道，既没有远程地址也没有本地地址。
+
+创建隧道设备后，您应该像配置其他设备一样进行配置。
+
+点对点隧道上的协议配置与其他设备的配置没有区别。您应该使用ifconfig设置协议地址，并使用route实用程序添加路由。
+
+NBMA隧道是不同的。要通过NBMA隧道进行路由选择，您需要向驱动程序解释数据包应发送到的位置。
+
+实现它的唯一方法是创建特殊的路由，网关地址指向所需端点。
+
+例如，当数据包需要穿过特定的NBMA隧道时，您需要配置这些路由以确保它们正确地指向隧道的另一端点。这样，数据包就可以通过隧道正确地路由到其目标地址。
 
 ```
+// 创建 NBMA 隧道
+// A 是为对端地址
+// 由于 A 通常是本机不可达的，所以必须加 onlink 避免报错
+    ip route add 10.0.0.0/24 via <A> dev tunl0 onlink
+```
+
+使用onlink选项是很重要的，否则内核会拒绝通过tunl0设备无法直接访问的网关创建路由的请求。
+
+对于IPv6来说，情况要简单得多：当您启动sit0设备时，它会通过映射所有IPv4地址到IPv6空间自动配置自己，这样所有IPv4互联网实际上都可以通过sit0访问！太棒了，这个命令。
+
+```
+  ip route add 3FFE::/16 via ::193.233.7.65 dev sit0
+```
+
+将通过sit0路由转发3FFE::/16，将所有目标为此前缀的数据包发送到193.233.7.65。
+
+
+## option
+
+添加命令“ip tunnel add”有几个额外的选项：
+
+- ttl N —— 在隧道数据包上设置固定的TTL值N。N是在范围1-255之间的数字。特殊值0表示数据包继承TTL值。默认值是“继承”。
+- tos T —— 在隧道数据包上设置固定的服务质量T。默认值是“继承”。
+- dev DEV —— 将隧道绑定到设备DEV，这样隧道数据包将仅通过此设备路由，并且在端点更改路由时不会转移到其他设备。
+- nopmtudisc ——在此隧道上禁用路径MTU发现。默认情况下是启用的。请注意，固定TTL与此选项不兼容：具有固定TTL的隧道始终执行pmtu发现。
+
+IPIP和sit隧道没有其他选项了。GRE隧道则更复杂一些：
+- key K ——使用带有密钥K的GRE加密技术。K是数字或者像IP地址的四进制数形式的IP地址。
+- csum —— 对隧道数据包进行校验和计算。
+- seq ——序列化数据包。请注意，这个选项可能不工作。至少我没有测试过它，没有调试过它，甚至不知道思科打算用它来做什么目的以及如何预期其工作原理。实际上，这些GRE选项可以针对输入和输出方向分别进行设置，通过在相应的关键字前添加字母i或o来实现。例如，icsum命令要求仅接受具有正确校验和的数据包，而ocsum表示我们的主机将计算和发送校验和。
+
+## 多播
+
+可以针对GRE隧道设置远程多播地址。这样的隧道变为广播隧道（虽然在这种情况下使用“隧道”这个词并不十分恰当，更准确的说法是虚拟网络）。
+
+创建隧道：
+
+```
+// 创建一个名为Universe的隧道，本地地址为193.233.7.65，远程地址为多播地址224.66.66.66，TTL设置为16
+ip tunnel add Universe local 193.233.7.65 remote 224.66.66.66 ttl 16 
+
+// 为Universe隧道添加IP地址
+ip addr add 10.0.0.1/16 dev Universe 
+
+// 启动Universe隧道
+ip link set Universe up 
+```
+
+这个隧道是真正的广播网络，广播数据包会被发送到多播组 224.66.66.66。
+
+默认情况下，此隧道将通过ARP/NDISC解析IP和IPv6地址，因此如果周围网络支持多播路由，所有GRE节点会自动相互找到并形成虚拟以太网广播网络。
+
+如果不支持多播路由也没关系，但意味着此功能被阻碍会导致这个隧道变成非广播多址访问网络（NBMA）。
+
+可以通过以下命令禁用动态ARP请求：
+
+```
+// 将Universe隧道的动态ARP请求设置为禁用
+echo 0 > /proc/sys/net/ipv4/neigh/Universe/mcast_solicit 
+```
+
+手动添加所需的ARP表信息：
+
+```
+// 添加永久邻居条目
+ip neigh add 10.0.0.2 lladdr 128.6.190.2 dev Universe nud permanent 
+```
+
+在这种情况下，发送到 10.0.0.2 的数据包将被封装在GRE中并发送到相应的地址。
+
+可以使用其他非广播多址访问网络的典型方法简化地址解析，例如启动用户级别的arpd守护程序来维护GRE虚拟网络的主机数据库或询问专门的ARP或NHRP服务器来获取信息。
+
+实际上，这种配置对于隧道是最自然的配置方式，它具有很高的灵活性、可扩展性和可管理性，因此强烈建议在使用GRE隧道时使用它而不是使用丑陋的NBMA模式和onlink修饰符。
+
+不幸的是，由于历史原因，IPIP隧道不支持广播模式，但这可能在将来会发生变化。
+
+## 示例
+
+![](./pic/3.jpg)
+
+![](./pic/4.jpg)
+
+![](./pic/5.jpg)
+
 
