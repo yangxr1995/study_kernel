@@ -702,9 +702,30 @@ ip link add vxlan0 type vxlan id 42 group 239.1.1.1 dev eth1 dstport 4789
 
 可以使用新的桥接命令创建、销毁和显示VxLAN转发表。
 
+```shell
 bridge fdb add to 00:17:42:8a:b4:05 dst 192.19.0.2 dev vxlan0
 bridge fdb delete 00:17:42:8a:b4:05 dev vxlan0
 bridge fdb show dev vxlan0
+```
+
+## bridge fdb add
+添加一个新的fdb条目
+此命令用于创建新的fdb条目。
+LLADDR 是以太网MAC地址。
+- dev（DEV）是与该地址相关联的接口。
+ - local ：是一个本地永久fdb条目
+ - static：是一个无ARP的静态fdb条目
+ - dynamic ：是一个可到达的、可老化的动态fdb条目
+ - self ：地址与端口驱动程序的fdb相关联。通常是硬件相关。
+ - master ：地址与主设备的fdb相关联。通常是软件默认关联。
+ - router ：目标地址与路由器相关联。如果引用的设备是VXLAN类型设备并且启用了路由短路，则此选项有效。
+ - use ：地址正在使用中。用户空间可以使用此选项向内核指示fdb条目正在使用中。
+
+接下来的命令行参数仅适用于类型为VXLAN的指定设备（DEV）。
+- dst IPADDR：目标VXLAN隧道端点的IP地址，以太网MAC地址位于该处。
+- vni VNI：用于连接到远程VXLAN隧道端点的VXLAN VNI网络标识符（或VXLAN段ID）。如果省略，将使用在vxlan设备创建时指定的值。
+- port（PORT）：用于连接到远程VXLAN隧道端点的UDP目标端口号。如果省略，将使用默认值。
+- via （DEVICE）：对于VXLAN设备驱动程序到达远程VXLAN隧道端点的传出接口的设备名称。
 
 ## man手册
 
