@@ -682,4 +682,53 @@ ip neigh add 10.0.0.2 lladdr 128.6.190.2 dev Universe nud permanent
 
 ![](./pic/5.jpg)
 
+# vxlan
+
+VXLAN（Virtual eXtensible LAN）协议是一种隧道协议，旨在解决IEEE 802.1Q中有限的VLAN ID（4096个）的问题。使用VXLAN时，标识符的大小扩展到24位（16777216个），使得能够管理更多的虚拟网络。
+
+VXLAN由IETF RFC 7348描述，并已被多个厂商实现。该协议使用单个目的端口在UDP上运行。
+
+与大多数隧道不同，VXLAN是一个1对N的网络，而不仅仅是点对点的连接。VXLAN设备可以通过类似于学习桥的方式动态地学习其他端点的IP地址，或者使用静态配置的转发条目。
+
+VXLAN的管理方式与其最接近的两个邻居GRE和VLAN相似。配置VXLAN需要使用与首次上游合并VXLAN的内核版本匹配的iproute2版本。
+
+```shell
+ip link add vxlan0 type vxlan id 42 group 239.1.1.1 dev eth1 dstport 4789
+```
+
+这创建了一个名为vxlan0的新设备。该设备使用eth1上的多播组239.1.1.1来处理转发表中不存在的流量。
+
+目标端口号设置为IANA分配的4789值。VXLAN的Linux实现早于IANA选择标准目标端口号的时期，并且默认使用Linux选择的值以保持向后兼容性。
+
+可以使用新的桥接命令创建、销毁和显示VxLAN转发表。
+
+bridge fdb add to 00:17:42:8a:b4:05 dst 192.19.0.2 dev vxlan0
+bridge fdb delete 00:17:42:8a:b4:05 dev vxlan0
+bridge fdb show dev vxlan0
+
+## man手册
+
+```shell
+  ip link add DEVICE type vxlan id VNI [ dev PHYS_DEV  ] [ { group | remote } IPADDR ] [ local { IPADDR | any } ] [ ttl TTL ] [ tos TOS ] [ flowlabel
+  FLOWLABEL ] [ dstport PORT ] [ srcport MIN MAX ] [ [no]learning ] [ [no]proxy ] [ [no]rsc ] [ [no]l2miss ] [ [no]l3miss ] [ [no]udpcsum ] [
+  [no]udp6zerocsumtx ] [ [no]udp6zerocsumrx ] [ ageing SECONDS ] [ maxaddress NUMBER ] [ [no]external ] [ gbp ] [ gpe ]
+```
+- id VNI：指定使用的VXLAN网络标识符（或VXLAN段标识符）。
+- dev PHYS_DEV：指定用于隧道端点通信的物理设备。
+- group IPADDR：指定要加入的组播IP地址。此参数不能与远程参数一起指定。
+- remote IPADDR：当VXLAN设备转发数据库中未知目标链路层地址时，指定出站数据包中使用的单播目标IP地址。此参数不能与组参数一起指定。
+- local IPADDR：指定出站数据包中要使用的源IP地址。
+- ttl TTL：指定出站数据包中要使用的TTL（Time To Live）值。
+- tos TOS：指定出站数据包中要使用的服务类型（Type of Service）值。
+- flowlabel FLOWLABEL：指定出站数据包中要使用的流标签。
+- dstport PORT：指定用于与远程VXLAN隧道端点通信的UDP目标端口。
+- 源端口范围的端口号，以与远程VXLAN隧道端点进行通信。
+- [no]learning：指定是否将未知的源链路层地址和IP地址添加到VXLAN设备转发数据库。
+- [no]rsc：指定是否开启路由短路功能。
+- [no]proxy：指定是否开启ARP代理功能。
+- [no]l2miss：指定是否生成netlink链路层地址缺失通知。
+- [no]l3miss：指定是否生成netlink IP地址缺失通知。
+- [no]udpcsum：指定是否在通过IPv4传输的出站数据包上计算UDP校验和。srcport MIN MAX：指定用作UDP
+- [no]udp6zerocsumtx：跳过IPv6上出站数据包的UDP校验和计算。允许针对传入数据包的优化，提升性能效率的同时不会影响功能使用或传输的数据正确性保证与稳定性；
+
 
