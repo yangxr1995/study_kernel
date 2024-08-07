@@ -298,23 +298,7 @@ void routing_end() {
 
 ```
 
-
-
-# ip link
-```shell
-# ip link show
-1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
-    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
-2: ens33: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
-    link/ether 00:0c:29:89:30:6d brd ff:ff:ff:ff:ff:ff
-    altname enp2s1
-
-# ip link set eth0 up
-
-# ip link set eth0 down
-```
-
-# ip addr
+## ip addr
 ```shell
 root@u22:/# ip addr show
 1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
@@ -512,6 +496,85 @@ ip link set dev  veth1 name net1-bridge netns net1
 ip netns exec net0 ip address add 10.0.1.1/24 dev veth0
 ```
 
+
+# ip link set 改变设备属性
+
+```shell
+ip link add name br0 type bridge
+ip link set br0 up
+ip link set dev veth0 master br0
+```
+ 
+## bridge_slave
+
+```shell
+ip link set type bridge_slave [ fdb_flush ] [ state STATE ] [ priority PRIO ] [ cost COST ] [ guard { on | off } ] [ hairpin { on | off } ] [ fastleave {
+on | off } ] [ root_block { on | off } ] [ learning { on | off } ] [ flood { on | off } ] [ proxy_arp { on | off } ] [ proxy_arp_wifi { on | off } ] [
+mcast_router MULTICAST_ROUTER ] [ mcast_fast_leave { on | off} ] [ mcast_flood { on | off } ] [ group_fwd_mask MASK ] [ neigh_suppress { on | off } ] ] [
+vlan_tunnel { on | off } ]
+```
+
+`fdb_flush` 
+清除桥接从设备的fdb动态条目。
+
+`state STATE` 
+设置端口状态。STATE是一个数字，代表以下状态：0（禁用），1（监听），2（学习），3（转发），4（阻塞）。
+
+`priority PRIO` 
+设置端口优先级（允许的值介于0到63之间，包括两端）。
+
+`cost COST`  
+设置端口成本（允许的值介于1到65535之间，包括两端）。
+
+`guard { on | off }` 
+在此端口上阻止传入BPDU数据包。
+
+`hairpin { on | off }`
+在此端口上启用发夹模式。这将允许在此端口上接收到的数据包被反射回来。
+
+`fastleave { on | off }` 
+在此端口上启用多播快速离开。
+
+`root_block { on | off }` 
+阻止此端口成为桥的根端口。
+
+`learning { on | off }` 
+在此端口上允许MAC地址学习。
+
+`mcast_router MULTICAST_ROUTER` 
+为此端口配置具有多播路由器的情况。具有多播路由器的端口将接收所有多播流量。
+MULTICAST_ROUTER可以是0以在此端口上禁用多播路由器，也可以是1让系统自动检测路由器的存在（这是默认值），
+
+`proxy_arp { on | off }`
+在此端口上启用代理ARP（Proxy ARP）。
+
+`ip link set dev rlab-pc1- type bridge_slave proxy_arp on`
+
+`proxy_arp_wifi { on | off }`
+在满足IEEE 802.11和Hotspont 2.0规范的扩展要求的端口上启用代理ARP。
+
+`mcast_router MULTICAST_ROUTER`
+为附加的多播路由器配置此端口。具有多播路由器的端口将接收所有多播流量。
+
+MULTICAST_ROUTER可以是0（在此端口上禁用多播路由器）、1（让系统检测路由器的存在，这是默认值）、
+
+2（永久在此端口上启用多播流量转发）或3（临时在此端口上启用多播路由器，不依赖于传入查询）。
+
+`mcast_fast_leave { on | off }`
+这是上面fastleave选项的同义词。
+
+`mcast_flood { on | off }`
+控制给定端口是否会被没有MDB条目的多播流量淹没。
+
+`group_fwd_mask MASK`
+设置组转发掩码。这是应用于决定是否转发目标为链路本地地址的传入帧的位掩码，即地址形式为01:80:C2:00:00:0X（默认值为0，即桥不会转发从此端口进来的任何链路本地帧）。
+
+`neigh_suppress { on | off }`
+控制端口上是否启用邻居发现（ARP和ND）代理和抑制。默认情况下此标志为关闭状态。
+
+`vlan_tunnel { on | off }`
+控制端口上是否启用VLAN到隧道的映射。默认情况下此标志为关闭状态。
+
 # VLAN
 
 linux对vlan的实现效果和很多交换机有所不同，linux只实现了基础设施 802.1q，而交换机还在802.1q基础上实现了使用策略。
@@ -684,9 +747,52 @@ ip neigh add 10.0.0.2 lladdr 128.6.190.2 dev Universe nud permanent
 
 # vxlan
 
-VXLAN（Virtual eXtensible LAN）协议是一种隧道协议，旨在解决IEEE 802.1Q中有限的VLAN ID（4096个）的问题。使用VXLAN时，标识符的大小扩展到24位（16777216个），使得能够管理更多的虚拟网络。
+## 应用场景和特点
 
-VXLAN由IETF RFC 7348描述，并已被多个厂商实现。该协议使用单个目的端口在UDP上运行。
+![](./pic/6.jpg)
+
+L2层 overlay
+
+相比vlan有支持更多的网络隔离
+
+## vxlan报文
+
+![](./pic/7.jpg)
+
+VNI : 相当于vlanid
+目的UDP : 默认4789
+
+## vxlan的基本概念
+
+NVE 网络虚拟边缘, 是运行vxlan的设备
+
+![](./pic/8.jpg)
+
+VTEP (vxlan隧道端点)
+
+VTEP是vxlan隧道的端点IP，具体是两个NVE的WAN口IP。
+
+![](./pic/9.jpg)
+
+VNI(vxlan网络标识)
+
+不同vxlan id 的虚拟机不能通信
+
+BD(桥域)
+
+类似于vlan划分广播域，在vxlan中网络一个BD就表示一个大二层广播域
+
+VNI以1:1的方式映射到BD，同BD的终端可以进行二层通信
+
+![](./pic/10.jpg)
+
+## linux vxlan
+
+VXLAN（Virtual eXtensible LAN）协议是一种隧道协议，旨在解决IEEE 802.1Q中有限的VLAN ID（4096个）的问题。
+
+使用VXLAN时，标识符的大小扩展到24位（16777216个），使得能够管理更多的虚拟网络。
+
+该协议使用单个目的端口在UDP上运行。
 
 与大多数隧道不同，VXLAN是一个1对N的网络，而不仅仅是点对点的连接。VXLAN设备可以通过类似于学习桥的方式动态地学习其他端点的IP地址，或者使用静态配置的转发条目。
 
@@ -751,5 +857,19 @@ LLADDR 是以太网MAC地址。
 - [no]l3miss：指定是否生成netlink IP地址缺失通知。
 - [no]udpcsum：指定是否在通过IPv4传输的出站数据包上计算UDP校验和。srcport MIN MAX：指定用作UDP
 - [no]udp6zerocsumtx：跳过IPv6上出站数据包的UDP校验和计算。允许针对传入数据包的优化，提升性能效率的同时不会影响功能使用或传输的数据正确性保证与稳定性；
+
+## 示例
+
+### 点对端
+
+![](./pic/12.jpg)
+
+### 利用ARP广播设置 VTEP
+![](./pic/14.jpg)
+
+### 手动设置VTEP 过路由不同网段
+
+![](./pic/13.jpg)
+
 
 
