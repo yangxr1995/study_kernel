@@ -29,8 +29,10 @@ Bridge 维护一个转发数据库（Forwarding Data Base），包含端口号�
 
 ## STP
 
+## vlan filter
 
-# VLAN代码分析
+
+# VLAN 设备代码分析
 ## 注册
 ```c
 static int __init vlan_proto_init(void)
@@ -590,9 +592,15 @@ int netif_receive_skb(struct sk_buff *skb)
 
 当设备加入桥时，dev->rx_handler 通常被设置为为 br_handle_frame
 
-```c
+dev->rx_handler_data 为  `struct net_bridge_port *p`
+
+`dev->priv_flags | IFF_BRIDGE_PORT`
+
+``c
 int br_add_if(struct net_bridge *br, struct net_device *dev,
 	      struct netlink_ext_ack *extack)
+	struct net_bridge_port *p;
+	p = new_nbp(br, dev);
 	err = netdev_rx_handler_register(dev, br_get_rx_handler(dev), p);
 
 rx_handler_func_t *br_get_rx_handler(const struct net_device *dev)
@@ -1068,6 +1076,7 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 	// skb->data += ETH_HLEN; skb->len -= ETH_HLEN
 	skb_pull(skb, ETH_HLEN);
 
+    // bridge vlan filter
 	if (!br_allowed_ingress(br, br_vlan_group_rcu(br), skb, &vid, &state))
 		goto out;
 
@@ -1245,3 +1254,38 @@ drop:
 	return 0;
 }
 ```
+
+# vlan filter 
+## br_allowed_ingress
+
+netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+
+	struct net_bridge *br = netdev_priv(dev);
+	struct net_bridge_fdb_entry *dst;
+	struct net_bridge_mdb_entry *mdst;
+	struct pcpu_sw_netstats *brstats = this_cpu_ptr(br->stats);
+	const struct nf_br_ops *nf_ops;
+	const unsigned char *dest;
+	struct ethhdr *eth;
+	u16 vid = 0;
+
+
+	if (!br_allowed_ingress(br, br_vlan_group_rcu(br), skb, &vid))
+		goto out;
+
+### br_allowed_ingress
+
+bool br_allowed_ingress(const struct net_bridge *br,
+			struct net_bridge_vlan_group *vg, struct sk_buff *skb,
+			u16 *vid)
+{
+	/* If VLAN filtering is disabled on the bridge, all packets are
+	 * permitted.
+	 */
+	if (!br->vlan_enabled) {
+		BR_INPUT_SKB_CB(skb)->vlan_filtered = false;
+		return true;
+	}
+
+	return __allowed_ingress(br, vg, skb, vid);
+}

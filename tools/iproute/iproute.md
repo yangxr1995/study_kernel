@@ -575,57 +575,6 @@ MULTICAST_ROUTER可以是0（在此端口上禁用多播路由器）、1（让�
 `vlan_tunnel { on | off }`
 控制端口上是否启用VLAN到隧道的映射。默认情况下此标志为关闭状态。
 
-# VLAN
-
-linux对vlan的实现效果和很多交换机有所不同，linux只实现了基础设施 802.1q，而交换机还在802.1q基础上实现了使用策略。
-
-下面解释linux对vlan的实现效果
-
-当使用vlan 设备发送时，发出的数据包一定会加上vlan header
-
-当接受数据包时，一个真实设备，如eth0，可以连接多个vlan 设备，每个vlan设备的id不同，
-
-所以在接受vlan数据包时，只要数据包的vlan id在eth0相关vlan设备的vlan id号内，则能接受，
-
-如果接受vlan数据包时，vlan id不在此范围内，则视为发送给其他主机的数据包，则丢弃。
-
-所以vlan id 相当于在 L2层多了一个地址域，即以前是只比较目的地址和mac地址，现在还要比较vlan id
-
-对于接受不带vlan的数据包时，由真实设备接受，但是需要注意，若主机使用了vlan，则发送响应包时会查询路由，
-
-可能路由的结果是通过 vlan 设备发送，所以响应包会带 vlan id，但接受方的网口没有添加对应vlan id 的设备，
-
-所以无法通信, 这时要么添加合适的路由，要么让接受方也使用vlan
-
-## 示例
-主机有网卡eth0
-```shell
-1. 保证eth0没有IP
-
-2. 添加vlan
-sudo ip link add link eth0 name eth0.10 type vlan id 10
-
-sudo ip link add link eth0 name eth0.20 type vlan id 20
-
-3. 给vlan设备添加ip
-ip addr add 172.1.1.10/24 dev eth0.10
-ip addr add 172.1.1.20/24 dev eth0.20
-
-4. 启动设备
-ip link set eth0 up
-ip link set eth0.10 up
-ip link set eth0.20 up
-
-5. 查看vlan
-cat /proc/net/vlan/config
-```
-
-## 示例2
-![](./pic/1.jpg)
-
-## 示例3
-![](./pic/2.jpg)
-
 # 隧道
 linux支持3种隧道 
 - ipip    IP over IP              tunl0
@@ -636,7 +585,6 @@ linux支持3种隧道
 ```
 ip tunnel add <NAME> mode <MODE> [ local <S> ] [ remote <D> ]
 ```
-
 NAME 是任意字符串
 mode MODE 设置隧道类型，ipip sit gre
 remote D 设置隧道对端的地址
@@ -870,6 +818,438 @@ LLADDR 是以太网MAC地址。
 ### 手动设置VTEP 过路由不同网段
 
 ![](./pic/13.jpg)
+
+
+# bound
+Linux bonding 驱动提供了一种将多个网络接口聚合为一个单一逻辑“绑定”接口的方法。
+
+绑定接口的行为取决于模式；一般来说，模式提供热备或负载均衡服务。这种技术有助于提高网络冗余性和性能，因为它允许系统通过多个网络接口同时处理流量。
+
+![](./pic/1.png)
+
+当您想要提高链接速度或在服务器上进行故障切换时，请使用绑定接口。
+
+以下是创建绑定接口的方法：
+
+ip link add bond1 type bond miimon 100 mode active-backup
+ip link set eth0 master bond1
+ip link set eth1 master bond1
+
+这将创建一个名为 bond1 的绑定接口，模式为 active-backup。有关其他模式，请参阅内核文档。
+
+https://www.kernel.org/doc/Documentation/networking/bonding.txt
+
+## bound模式
+
+在使用命令 
+
+`ip link add bond0 type bond` 
+
+创建 Bond 接口时，可以指定不同的 Bond 模式。
+
+常见的 Bond 模式有以下几种： 
+
+`mode=balance-rr`
+即 Round-robin 模式，是默认的 Bond 模式。在该模式下，数据包会按照轮流分发到不同的物理接口上，从而实现负载均衡。 
+
+`mode=active-backup`
+即 Active-backup 模式，也称为 failover 模式。在该模式下，只有一个物理接口处于工作状态，其余接口处于备份状态，当工作接口发生故障时，备份接口会自动接管工作。 
+
+`mode=balance-xor`
+即 XOR 模式，会将源 MAC 地址和目标 MAC 地址的异或值作为哈希值，然后根据哈希值将数据包分发到不同的物理接口上。 
+
+`mode=802.3ad`
+即 LACP 模式，需要支持 IEEE 802.3ad 协议的交换机。该模式通过协商确定哪些物理接口可以组成 Bond 接口，从而实现负载均衡。 
+
+`mode=broadcast`
+即广播模式，数据包会广播到所有物理接口上，适用于 IPMI 等特殊场景下的通信。 
+
+`mode=balance-tlb`
+即 Transmit Load Balancing 模式，类似于 balance-rr 模式，但是会根据每个物理接口的负载情况动态调整数据包的发送顺序。 
+
+`mode=balance-alb`
+即 Active Load Balancing 模式，可以在发送数据包时动态调整每个数据包的源 MAC 地址，从而实现负载均衡。
+
+
+```shell
+ip link add bond0 type bond miimon 100 mode balance-rr xmit_hash_policy layer3+4
+ip link set bond0 up
+ip link set dev eth1 master bond0
+ip link set dev eth2 master bond0
+ip link set dev bond0 address 00:11:22:33:44:58
+ip link set dev eth1 address 00:11:22:33:44:58
+ip link set dev eth2 address 00:11:22:33:44:58
+```
+
+# bridge
+Linux 桥接的行为类似于网络交换机。它在连接的接口之间转发数据包。
+
+它通常用于路由器上的数据包转发、网关或主机上的虚拟机和网络命名空间之间的数据包转发。
+
+它还支持 STP（生成树协议）、VLAN 过滤和多播侦听。通过配置桥接，您可以控制网络流量，实现不同的网络拓扑和配置，以满足特定的需求。
+
+![](./pic/2.png)
+
+当您想在虚拟机、容器和主机之间建立通信通道时，请使用桥接。
+
+以下是创建桥接的方法：
+
+```shell
+# ip link add br0 type bridge
+# ip link set eth0 master br0
+# ip link set tap1 master br0
+# ip link set tap2 master br0
+# ip link set veth1 master br0
+```
+
+这将创建一个名为 br0 的桥接设备，并将两个 TAP 设备（tap1、tap2）、一个 VETH 设备（veth1）和一个物理设备（eth0）设置为其从属设备，如上图所示。
+
+# Team device
+
+与绑定接口类似，team设备的目的是在 L2 层提供一种机制，将多个网卡（端口）组合成一个逻辑设备（teamdev）。这有助于提高网络的冗余性和带宽利用率。
+
+![](./pic/3.png)
+
+明白了team设备的主要目标是解决相同的问题，但采用不同于绑定接口的方法，例如使用无锁（RCU）的TX/RX路径和模块化设计。
+
+然而，bound接口和team之间也存在一些功能上的差异。例如，team支持LACP负载均衡、NS/NA（IPV6）链接监控、D-Bus接口等，这些都是bound接口所没有的。
+
+关于bound和team之间的差异的更详细信息，请参阅bound与team功能对比。
+
+https://github.com/jpirko/libteam/wiki/Bonding-vs.-Team-features
+
+如果你想使用bound接口不提供的一些功能，那么应该使用team。下面是创建team的步骤：
+
+```shell
+# teamd -o -n -U -d -t team0 -c '{"runner": {"name": "activebackup"},"link_watch": {"name": "ethtool"}}'
+# ip link set eth0 down
+# ip link set eth1 down
+# teamdctl team0 port add eth0
+# teamdctl team0 port add eth1
+```
+
+这段描述创建了一个名为team0的团队接口，并设置了模式为active-backup。同时，将eth0和eth1添加为team0的子接口。
+
+最近，Linux中添加了一个新的驱动程序，名为net_failover。这是一个用于虚拟化的故障转移主网络设备，
+
+它管理一个主要（直通/虚拟功能设备）的附属网络设备和另一个备用的（原始虚拟接口）附属网络设备。
+
+简而言之，net_failover提供了一种机制来在主要的网络设备出现问题时自动切换到备用设备，从而提高网络连接的可靠性和容错能力。
+
+这种功能在虚拟化环境中尤其有用，因为它可以确保即使在主要网络设备出现故障的情况下，虚拟机仍然可以保持网络连接。
+
+![](./pic/4.png)
+
+# VLAN
+
+VLAN，也被称为虚拟局域网，它通过向网络包添加标签来分隔广播域。VLANs允许网络管理员将主机分组在同一个交换机下或不同的交换机之间。VLAN头部看起来像这样：
+
+![](./pic/5.png)
+
+使用VLAN时，您想要将虚拟机、命名空间或主机中的子网分隔开来。下面是创建VLAN的步骤：
+
+首先，通过执行以下命令来创建VLAN：
+
+```bash
+# ip link add link eth0 name eth0.2 type vlan id 2
+# ip link add link eth0 name eth0.3 type vlan id 3
+```
+
+![](./pic/6.png)
+
+注意：在配置VLAN时，需要确保连接到主机的交换机能够处理VLAN标签，例如，通过将交换机端口设置为trunk模式。
+
+## kernel实现vlan设备 
+当使用vlan 设备发送时，发出的数据包一定会加上vlan header
+
+当接受数据包时，一个真实设备，如eth0，可以连接多个vlan 设备，每个vlan设备的id不同，
+
+所以在接受vlan数据包时，只要数据包的vlan id在eth0相关vlan设备的vlan id号内，则能接受，
+
+如果接受vlan数据包时，vlan id不在此范围内，则视为发送给其他主机的数据包，则丢弃。
+
+所以vlan id 相当于在 L2层多了一个地址域，即以前是只比较目的地址和mac地址，现在还要比较vlan id
+
+对于接受不带vlan的数据包时，由真实设备接受，但是需要注意，若主机使用了vlan，则发送响应包时会查询路由，
+
+可能路由的结果是通过 vlan 设备发送，所以响应包会带 vlan id，但接受方的网口没有添加对应vlan id 的设备，
+
+所以无法通信, 这时要么添加合适的路由，要么让接受方也使用vlan
+
+## tag untag
+
+当vlan设备发送包时，会发送带tag的包
+
+当非vlan设备收到带tag的包时，会查看自己是否有相关的vlan设备，如果没有则丢弃，如果有，则去除tag并将输入设备改为对应的vlan设备
+
+## vid pvid
+
+每个vlan设备有一个vid，一个非vlan设备可以关联多个vlan设备，这些vlan设备的vid不同，相当于此非vlan设备能接受多个不同的vid包 
+
+pvid当交换机端口接受到无tag的包时，但端口是vlan口，则用pvid给包加上tag(vlan设备无法实现，bridge可以)
+
+## 示例
+
+```shell
+1. 保证eth0没有IP
+
+2. 添加vlan
+sudo ip link add link eth0 name eth0.10 type vlan id 10
+
+sudo ip link add link eth0 name eth0.20 type vlan id 20
+
+3. 给vlan设备添加ip
+ip addr add 172.1.1.10/24 dev eth0.10
+ip addr add 172.1.1.20/24 dev eth0.20
+
+4. 启动设备
+ip link set eth0 up
+ip link set eth0.10 up
+ip link set eth0.20 up
+
+5. 查看vlan
+cat /proc/net/vlan/config
+```
+## 示例2
+![](./pic/1.jpg)
+
+## 示例3
+![](./pic/2.jpg)
+
+注意在br中vlan是无法隔离的，vlan只能过滤输入的包，在br内部的包的转发不考虑tag
+
+所以拓扑图应该这样做
+
+![](./pic/15.jpg)
+
+更简单的方法应该使用 bridge 命令
+
+# VXLAN
+
+VXLAN（Virtual eXtensible Local Area Network）是一种隧道协议，旨在解决IEEE 802.1q中VLAN ID数量有限（4,096个）的问题。它被IETF RFC 7348所描述。
+
+VXLAN通过使用24位的段ID，也称为VXLAN网络标识符（VNI），允许创建多达2^24（即16,777,216）个虚拟局域网，这是VLAN容量的4,096倍。
+
+VXLAN通过将第2层的帧与一个VXLAN头封装在一个UDP-IP数据包中，其结构大致如下：
+
+![](./pic/7.png)
+
+VXLAN通常在数据中心的虚拟化主机上部署，这些主机可能分布在多个机架中。
+
+![](./pic/8.png)
+
+```bash
+# ip link add vx0 type vxlan id 100 local 1.1.1.1 remote 2.2.2.2 dev eth0 dstport 4789
+```
+
+https://www.kernel.org/doc/Documentation/networking/vxlan.txt
+https://vincent.bernat.ch/en/blog/2017-vxlan-linux
+
+# MACVLAN
+
+VLAN允许你在单个接口上创建多个接口，并根据VLAN标签过滤数据包。
+
+而MACVLAN允许你在单个接口上创建具有不同第2层（即以太网MAC）地址的多个接口。
+
+在MACVLAN之前，如果你想从虚拟机或命名空间连接到物理网络，你需要创建TAP/VETH设备，
+
+并将一侧连接到桥接器上，同时在主机上将物理接口连接到同一桥接器上，如下所示。
+
+![](./pic/9.png)
+
+通过这种方式，你可以在主机上为虚拟机提供访问物理网络的路径。
+
+但请注意，由于虚拟化环境中的限制和复杂性，这种方式可能会面临诸多挑战和问题。
+
+而随着技术的发展和演变，出现了像MACVLAN这样的技术，可以简化这种连接方式并提高其灵活性。
+
+现在，通过MACVLAN，你可以将与MACVLAN关联的物理接口直接绑定到命名空间，而无需使用桥接器。
+
+![](./pic/10.png)
+
+有五种MACVLAN类型：
+
+1. 私有（Private）：
+
+不允许同一物理接口上的MACVLAN实例之间进行通信，即使外部交换机支持发夹模式。
+
+![](./pic/11.png)
+
+2. VEPA（Virtual Ethernet Protocol Acceleration）: 
+
+它允许在同一物理接口上的多个MACVLAN实例之间进行通信。当从一个MACVLAN实例向另一个实例发送数据时，这些数据会通过物理接口进行传输。
+
+为了确保这种通信能够发生，连接的交换机需要支持发圈模式（hairpin mode），或者在物理路径上存在一个TCP/IP路由器来转发这些数据包。
+
+这样，不同的虚拟网络或租户可以共享同一物理网络基础设施，同时保持彼此之间的隔离和通信能力。这种技术常用于数据中心和虚拟化环境中，以提高资源利用率和网络性能。
+
+![](./pic/12.png)
+
+3. 桥接（Bridge）：所有端点通过物理接口直接与简单桥接器相连。
+
+![](./pic/13.png)
+
+4. 直通（Passthru）：允许单个虚拟机直接连接到物理接口。
+
+![](./pic/14.png)
+
+
+5. 源(source)模式: 
+用于根据允许的源MAC地址列表进行流量过滤，以创建基于MAC的VLAN关联。
+
+你可以根据需要选择不同的类型，但最常用的通常是桥接模式。当你希望从容器直接连接到物理网络时，可以使用MACVLAN。下面是设置MACVLAN的步骤：
+
+首先，你需要确保你的网络设备已经正确配置并连接到网络。然后，你可以按照以下步骤设置MACVLAN：
+
+```bash
+# ip link add macvlan1 link eth0 type macvlan mode bridge
+# ip link add macvlan2 link eth0 type macvlan mode bridge
+# ip netns add net1
+# ip netns add net2
+# ip link set macvlan1 netns net1
+# ip link set macvlan2 netns net2
+```
+
+这会在桥接模式下创建两个新的MACVLAN设备，并将这两个设备分配到两个不同的命名空间。
+
+# IPVLAN
+IPVLAN与MACVLAN相似，不同之处在于端点具有相同的MAC地址。
+
+![](./pic/15.png)
+
+IPVLAN支持第2层和第3层模式。IPVLAN的第2层模式类似于桥接模式下的MACVLAN。父接口看起来像一个桥接器或交换机。
+
+![](./pic/16.png)
+
+在IPVLAN的第3层模式中，父接口充当路由器，数据包在端点之间进行路由，这提供了更好的可扩展性。
+
+![](./pic/17.png)
+
+关于何时使用IPVLAN，IPVLAN内核文档指出，MACVLAN和IPVLAN在许多方面非常相似，具体的使用场景可以很好地定义选择哪种设备。
+
+如果你的使用场景符合以下情况之一，你可以选择使用IPVLAN：
+
+a. 连接到外部交换机/路由器的Linux主机有策略配置，只允许每个端口一个MAC地址。
+
+   在这种情况下，使用IPVLAN可以帮助你避免MAC地址冲突，因为它为每个虚拟接口分配一个独立的IP地址，而不是共享MAC地址。
+
+b. 在主机上创建的虚拟设备数量超过了MAC地址容量，并且网络的NIC被置于混杂模式，这会导致性能下降。
+
+   在这种情况下，使用IPVLAN可以提高网络性能，因为它避免了在主机上处理过多的MAC地址。
+
+c. 如果要将从设备放入敌对/不受信任的网络命名空间，其中从设备的L2可能会更改/滥用。
+
+   在这种情况下，使用IPVLAN可以提供更好的安全性和隔离性，因为它将虚拟网络接口与物理网络接口分离，
+   
+   只允许特定的虚拟网络接口与物理网络进行通信。这有助于保护从设备免受恶意攻击或未经授权的访问。
+
+总的来说，选择使用IPVLAN还是MACVLAN取决于你的具体需求和网络环境。了解你的使用场景和需求，并根据这些因素来选择合适的设备。
+
+```bash
+# ip netns add ns0
+# ip link add name ipvl0 link eth0 type ipvlan mode l2
+# ip link set dev ipvl0 netns ns0
+```
+
+这会创建一个名为ipvl0的IPVLAN设备，使用L2模式，并分配给命名空间ns0。
+
+# MACVTAP/IPVTAP
+
+MACVTAP/IPVTAP是一个新的设备驱动程序，旨在简化虚拟化桥接网络。
+
+当在物理接口上创建MACVTAP/IPVTAP实例时，内核还会创建一个字符设备/dev/tapX，就像TUN/TAP设备一样使用，可以直接由KVM/QEMU使用。
+
+通过MACVTAP/IPVTAP，您可以用单个模块替换TUN/TAP和桥接驱动程序组合。这意味着它可以简化和改进虚拟化的网络性能和管理。
+
+MACVTAP/IPVTAP提供了更高效和更灵活的虚拟化网络解决方案，因为它允许直接通过物理接口进行通信，而无需经过额外的桥接层。
+
+此外，它可能还提供了更好的性能，因为它能够更有效地处理数据包并减少网络延迟。总的来说，MACVTAP/IPVTAP可能是虚拟化环境中网络配置的一种改进方案。
+
+![](./pic/18.png)
+
+通常，MACVLAN/IPVLAN被用于使客人和主机直接出现在主机所连接的交换机上。MACVTAP和IPVTAP之间的区别与MACVLAN/IPVLAN相同。
+
+下面是创建MACVTAP实例的步骤：
+
+```bash
+# ip link add link eth0 name macvtap0 type macvtap
+```
+
+# VETH
+
+
+
+![](./pic/19.png)
+
+# NLMON
+
+NLMON 是netlink监控器设备
+
+使用一个NLMON 设备，你可以监控系统的netlink消息
+
+```bash
+# ip link add nlmon0 type nlmon
+# ip link set nlmon0 up
+# tcpdump -i nlmon0 -w nlmsg.pcap
+```
+
+创建一个NLMON 设备，并使用tcpdump 捕获netlink消息，使用Wireshark解析nlmsg.pcap
+
+# Dummy interface
+
+虚拟接口完全是虚拟的，比如回环接口。虚拟接口的目的是提供一个设备来路由数据包，而实际上并不传输它们。
+
+使用虚拟接口可以使一个不活动的SLIP（串行线路互联网协议）地址看起来像一个真实的地址，供本地程序使用。如今，虚拟接口主要用于测试和调试。
+
+```bash
+# ip link add dummy1 type dummy
+# ip addr add 1.1.1.1/24 dev dummy1
+# ip link set dummy1 up
+```
+
+# IFB
+IFB（中间功能模块）驱动程序提供了一个设备，它允许从多个来源集中流量，并形成进入的流量而不是丢弃它。
+
+当您想要排队和形成进入的流量时，请使用IFB接口。
+
+```bash
+# ip link add ifb0 type ifb
+# ip link set ifb0 up
+# tc qdisc add dev ifb0 root sfq
+# tc qdisc add dev eth0 handle ffff: ingress
+# tc filter add dev eth0 parent ffff: u32 match u32 0 0 action mirred egress redirect dev ifb0
+```
+
+这创建了一个名为ifb0的IFB设备，并将根队列调度器替换为SFQ（随机公平队列），这是一种无类的队列调度器。
+
+然后它在eth0上添加了一个入口队列调度器，并将所有入口流量重定向到ifb0。
+
+有关更多IFB队列调度器的使用案例，请参考Linux Foundation关于IFB的wiki。
+
+https://wiki.linuxfoundation.org/networking/ifb
+
+# netdevsim
+netdevsim是一个模拟的网络设备，用于测试各种网络API。目前，它特别专注于测试硬件卸载、tc/XDP BPF和SR-IOV。
+
+```bash
+# ip link add dev sim0 type netdevsim
+# ip link set dev sim0 up
+
+To enable tc offload:
+
+# ethtool -K sim0 hw-tc-offload on
+To load XDP BPF or tc BPF programs:
+
+# ip link set dev sim0 xdpoffload obj prog.o
+To add VFs for SR-IOV testing:
+
+# echo 3 > /sys/class/net/sim0/device/sriov_numvfs
+# ip link set sim0 vf 0 mac 
+To change the vf numbers, you need to disable them completely first:
+
+# echo 0 > /sys/class/net/sim0/device/sriov_numvfs
+# echo 5 > /sys/class/net/sim0/device/sriov_numvfs
+```
 
 
 
