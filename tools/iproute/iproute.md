@@ -813,9 +813,13 @@ LLADDR 是以太网MAC地址。
 ![](./pic/12.jpg)
 
 ### 利用ARP广播设置 VTEP
+
+当每个router的LAN在同个网段，可以利用ARP实现组网
+
 ![](./pic/14.jpg)
 
 ### 手动设置VTEP 过路由不同网段
+当每个router的LAN在不同网段，让对端路由做路由中转
 
 ![](./pic/13.jpg)
 
