@@ -279,5 +279,12 @@ rlab-pc1会收到正常的响应
 3. rlab-pc3 ping rlab-pc1
 进入端口rlab-pc3-的包是untagged frame，会加上pvid 20的tag，由于没有rlab-pc1-端口的vlan group中有vid 20导致包被丢弃
 
+## 示例2 vxlan 和 vlan
+
+![](./pic/2.jpg)
+
+使用vxlan结合bridge可以实现支持vlan的虚拟交换机。
+
+原理是用vxlan设备做bridge的端口，并分配vlan，将vxlan 的VNI和vlan id对应
 
 
