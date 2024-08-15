@@ -84,7 +84,7 @@ struct net_device
 
 	// 设备的唯一索引号
 	int			ifindex;
-	// iflink 用于虚拟网络设备
+	// iflink 主要用于虚拟网络设备，可用于标识抵达隧道另一端的真实设备
 	int			iflink;
 
 	// 工作状态的统计信息：

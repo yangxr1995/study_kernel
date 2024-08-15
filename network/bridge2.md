@@ -1,18 +1,210 @@
-# data struct
+# 数据结构
 
-## br
+bridge_id
+网桥ID
+
+net_bridge_fdb_entry
+
+net_bridge_port
+
+net_bridge
+
+# 核心函数
+## 网桥初始化 br_init
+
+主要完成创建需要的slab池，并注册各种回调。
+
+static const struct stp_proto br_stp_proto = {
+	.rcv	= br_stp_rcv,
+};
+
+struct rtnl_link_ops br_link_ops __read_mostly = {
+    ...
+};
+
+static int __init br_init(void)
+	err = stp_proto_register(&br_stp_proto);
+
+	err = br_fdb_init();
+        br_fdb_cache = kmem_cache_create("bridge_fdb_cache",
+                         sizeof(struct net_bridge_fdb_entry),
+                         0,
+                         SLAB_HWCACHE_ALIGN, NULL);
+
+    // 注册初始化或销毁网络命令空间的 br 的回调函数
+	err = register_pernet_subsys(&br_net_ops);
+
+	err = br_nf_core_init();
+	err = register_netdevice_notifier(&br_device_notifier);
+    // switchdev是为了利用支持硬件转发的交换机，以提高转发性能
+	err = register_switchdev_notifier(&br_switchdev_notifier);
+	err = br_netlink_init();
+    // 初始化 ioctl 各个 cmd 的回调
+	brioctl_set(br_ioctl_deviceless_stub);
+    
+
+## 创建网桥 br_add_bridge
+
+int br_add_bridge(struct net *net, const char *name)
+	struct net_device *dev;
+    // 构造dev
+	dev = alloc_netdev(sizeof(struct net_bridge), name, NET_NAME_UNKNOWN,
+			   br_dev_setup);
+            // br 作为 net_device 的派生类，使用 br_dev_setup进行进一步构造
+            br_dev_setup(struct net_device *dev)
+                dev->netdev_ops = &br_netdev_ops;
+                dev->ethtool_ops = &br_ethtool_ops;
+                br->dev = dev;
+                br_netfilter_rtable_init(br);
+                br_stp_timer_init(br);
+                br_multicast_init(br);
+                ...
+
+	dev_net_set(dev, net);
+	dev->rtnl_link_ops = &br_link_ops;
+    // 把br注册到kernel
+	res = register_netdev(dev);
+		ret = dev->netdev_ops->ndo_init(dev);
+            br_dev_init(struct net_device *dev)
+                br->stats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
+                err = br_fdb_hash_init(br);
+                err = br_vlan_init(br);
+                err = br_multicast_init_stats(br);
+
+## 添加端口
+
+static const struct net_device_ops br_netdev_ops = {
+	.ndo_add_slave		 = br_add_slave,
+    ...
+	.ndo_do_ioctl		 = br_dev_ioctl,
+};
+
+
+// netlink 方式
+static int br_add_slave(struct net_device *dev, struct net_device *slave_dev,
+			struct netlink_ext_ack *extack)
+	struct net_bridge *br = netdev_priv(dev);
+	return br_add_if(br, slave_dev, extack);
+
+// ioctl方式
+int br_dev_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
+	struct net_bridge *br = netdev_priv(dev);
+	switch (cmd) {
+	case SIOCBRADDIF:
+	case SIOCBRDELIF:
+		return add_del_if(br, rq->ifr_ifindex, cmd == SIOCBRADDIF);
+            struct net_device *dev;
+            dev = __dev_get_by_index(net, ifindex);
+            if (isadd)
+                ret = br_add_if(br, dev, NULL);
+            else
+                ret = br_del_if(br, dev);
+
+### br_add_if
+
+int br_add_if(struct net_bridge *br, struct net_device *dev,
+	      struct netlink_ext_ack *extack)
+	struct net_bridge_port *p;
+
+    // 回环设备和非以太设备不能加入桥
+	if ((dev->flags & IFF_LOOPBACK) ||
+	    dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN ||
+	    !is_valid_ether_addr(dev->dev_addr) ||
+	    netdev_uses_dsa(dev))
+		return -EINVAL;
+
+    // 桥设备不能再加入桥
+	if (dev->netdev_ops->ndo_start_xmit == br_dev_xmit) {
+		return -ELOOP;
+
+    // 设备已经加入了另一个桥
+	if (netdev_master_upper_dev_get(dev))
+		return -EBUSY;
+
+    // 构造端口
+	p = new_nbp(br, dev);
+
+	call_netdevice_notifiers(NETDEV_JOIN, dev);
+
+    // 将端口加入kobj sysfs
+	err = kobject_init_and_add(&p->kobj, &brport_ktype, &(dev->dev.kobj),
+				   SYSFS_BRIDGE_PORT_ATTR);
+	err = br_sysfs_addif(p);
+
+    // 设置桥端口设备的特征回调
+	err = netdev_rx_handler_register(dev, br_handle_frame, p);
+        rcu_assign_pointer(dev->rx_handler_data, rx_handler_data);
+        rcu_assign_pointer(dev->rx_handler, rx_handler);
+
+	dev->priv_flags |= IFF_BRIDGE_PORT;
+
+    // 将主设备和从设备建立关联
+	err = netdev_master_upper_dev_link(dev, br->dev, NULL, NULL, extack);
+
+    // 端口加入桥
+	list_add_rcu(&p->list, &br->port_list);
+
+    // 将接口本地地址条目添加到转发表
+	br_fdb_insert(br, p, dev->dev_addr, 0);
+        ret = fdb_insert(br, source, addr, vid);
+
+    // 初始化接口的 vlan group，并添加pvid 为 br->default_pvid 的 vlan entry 到 vlan group
+	err = nbp_vlan_init(p);
+        struct net_bridge_vlan_group *vg;
+        vg = kzalloc(sizeof(struct net_bridge_vlan_group), GFP_KERNEL);
+        ret = rhashtable_init(&vg->vlan_hash, &br_vlan_rht_params);
+        ret = vlan_tunnel_init(vg);
+        rcu_assign_pointer(p->vlgrp, vg);
+        if (p->br->default_pvid) {
+            ret = nbp_vlan_add(p, p->br->default_pvid,
+                       BRIDGE_VLAN_INFO_PVID |
+                       BRIDGE_VLAN_INFO_UNTAGGED,
+                       &changed);
+
+	changed_addr = br_stp_recalculate_bridge_id(br);
+
+## 处理流量
+
+# bridge fdb
+每个bridge有自己的转发表，转发表以hash表的结构嵌入bridge，
+
+网桥每学习到一个MAC地址，会在该数据库中插入一个net_bridge_fdb_entry
+
+## fdb_find
+以给定的MAC简单搜索net_bridge_fdb_entry，不能用于转发流量
+
+## br_fdb_get
+和fdb_find类似，由桥程序调用，用于转发流量，他不考虑过期的数据项
+
+
+## 转发表的增删改
+桥加入新端口时，调用 br_fdb_insert 将端口设备的MAC地址加入fdb
+
+入栈帧学习的MAC地址会由 br_fdb_update 添加到fdb，当该条目已经存在，
+则需要更新对入口端口dst的引用，并且更新最近时间戳(ageing_timer)
+
+fdb允许MAC地址重复，但端口不同条目
+
+## 老化
+对于每个桥，都有一个定时垃圾回收器(gc_timer)，定期扫描fdb把过期的条目删除，
+定时器周期调用 br_fdb_cleanup 扫描fdb，并用fdb_delete删除过期条目
+
+# bridge vlan filter
+## data struct
+
+### br
 struct net_bridge
 
-## port
+### port
 struct net_bridge_port
 
-## vg 
+### vg 
 struct net_bridge_vlan_group
 
-## entry
+### entry
 struct net_bridge_vlan
 
-## flags
+### flags
 #define BRIDGE_VLAN_INFO_MASTER	(1<<0)	/* Operate on Bridge device as well */
 #define BRIDGE_VLAN_INFO_PVID	(1<<1)	/* VLAN is PVID, ingress untagged */
 #define BRIDGE_VLAN_INFO_UNTAGGED	(1<<2)	/* VLAN egresses untagged */
@@ -20,15 +212,15 @@ struct net_bridge_vlan
 #define BRIDGE_VLAN_INFO_RANGE_END	(1<<4) /* VLAN is end of vlan range */
 #define BRIDGE_VLAN_INFO_BRENTRY	(1<<5) /* Global bridge VLAN entry */
 
-## 对象之间的关系 
+### 对象之间的关系 
 ![](./pic/67.jpg)
 
-# 原理
+## 原理
 ![](./pic/65.jpg)
 
-# init
+## init
 
-## brctrl add br0
+### brctrl add br0
 
 完成br->vg的初始化，
 br->vg 是主VLAN
@@ -319,11 +511,11 @@ static int __vlan_add(struct net_bridge_vlan *v, u16 flags)
 	__vlan_add_list(v);
 	__vlan_add_flags(v, flags);
 
-# 入栈和转发
+## 入栈和转发
 
 ![](./pic/64.jpg)
 
-## netif_receive_skb_core
+### netif_receive_skb_core
 
 static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 				    struct packet_type **ppt_prev)
@@ -366,7 +558,7 @@ another_round:
 	if (rx_handler) {
 		switch (rx_handler(&skb)) {
 
-## br_handle_frame
+### br_handle_frame
 rx_handler_result_t br_handle_frame(struct sk_buff **pskb)
 	struct net_bridge_port *p;
 	struct sk_buff *skb = *pskb;
@@ -421,9 +613,9 @@ drop:
 
 
 
-## br_forward
+### br_forward
 
-## br_pass_frame_up
+### br_pass_frame_up
 static int br_pass_frame_up(struct sk_buff *skb)
 	struct net_device *indev, *brdev = BR_INPUT_SKB_CB(skb)->brdev;
 	struct net_bridge *br = netdev_priv(brdev); // 从real_dev 到 br
@@ -459,10 +651,10 @@ static int br_pass_frame_up(struct sk_buff *skb)
 		       dev_net(indev), NULL, skb, indev, NULL,
 		       br_netif_receive_skb);
 
-# 出栈
+## 出栈
 ![](./pic/65.jpg)
 
-## br_dev_xmit
+### br_dev_xmit
 netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	brstats->tx_packets++;
@@ -497,7 +689,7 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 	} else {
 		br_flood(br, skb, BR_PKT_UNICAST, false, true);
 
-## __br_forward
+### __br_forward
 static void __br_forward(const struct net_bridge_port *to,
 			 struct sk_buff *skb, bool local_orig)
 	struct net_bridge_vlan_group *vg;
@@ -522,8 +714,8 @@ static void __br_forward(const struct net_bridge_port *to,
 		br_forward_finish);
 
 
-# vlan filter 对数据包的处理
-## br_allowed_ingress
+## vlan filter 对数据包的处理
+### br_allowed_ingress
 bool br_allowed_ingress(const struct net_bridge *br,
 			struct net_bridge_vlan_group *vg, struct sk_buff *skb,
 			u16 *vid)
@@ -597,7 +789,7 @@ static bool __allowed_ingress(const struct net_bridge *br,
 
 	return true;
 
-## br_allowed_egress
+### br_allowed_egress
 bool br_allowed_egress(struct net_bridge_vlan_group *vg,
 		       const struct sk_buff *skb)
 	const struct net_bridge_vlan *v;

@@ -151,7 +151,7 @@ sk_buff->sk 表示最终应该传输给哪个应用程序，或是哪个程序�
 
 3. len
 
-sk_buff->len 指 socket buffer 中数据包的总长度，
+sk_buff->len 指 socket buffer 中有效数据区块的大小
 
 包括：
 
@@ -159,11 +159,11 @@ sk_buff->len 指 socket buffer 中数据包的总长度，
 
 各个分片数据的长度（当数据包长度大于网络适配器一次能传输的最大传输单元MTU时，数据包会被分成更小的断）
 
-协议头数据的长度(可见socket buffer穿越TCP/IP时会修改 len)
+由于数据区块包括协议头数据，所以skb穿越TCP/IP时会修改 len
 
 4. data_len
 
-分片的数据块长度
+单个分片的数据块长度
 
 5. mac_len
 
@@ -185,7 +185,7 @@ hdr_len 用于克隆数据包，表明克隆数据包的头长度。
 
 8. truesize
 
-整个socket buffer的大小，即sk_buff和数据包的长度和。
+整个socket buffer的大小，即sk_buff和数据包的长度和, 当skb->len增加时，这个值得到更新
 
 ```c
 truesize = data_len + sizeof(struct sk_buff)
@@ -209,6 +209,8 @@ tail end 协议包尾部
 10. destructor
 
 指向Socket buffer的析构函数，当sk_buff不属于任何套接字时，析构函数通常不需要初始化。
+
+当socket buffer属于某个sock时，通常被初始化为 sock_wfree 或 sock_rfree，这两个函数用于更新sock队列中所持有的内存
 
 ## 常规数据域
 ```c
@@ -362,6 +364,22 @@ VLAN Tag 控制信息
 指向协议栈中各层协议头在网络数据包的位置
 
 ![](./pic/6.jpg)
+
+12. pkt_type
+根据L2的目的地址对帧进行类型划分，主要值如下：
+
+```c
+#define PACKET_HOST		0		/* To us		*/
+#define PACKET_BROADCAST	1		/* To all		*/
+#define PACKET_MULTICAST	2		/* To group		*/
+#define PACKET_OTHERHOST	3		/* To someone else 转发或丢弃 	*/
+#define PACKET_OUTGOING		4		/* Outgoing of any type */
+#define PACKET_LOOPBACK		5		/* 包发到回环设备，当处理回环设备时，内核可以跳过一些真实设备需要的操作 */
+#define PACKET_USER		6		/* To user space	*/
+#define PACKET_KERNEL		7		/* To kernel space	*/
+/* Unused, PACKET_FASTROUTE and PACKET_LOOPBACK are invisible to user space */
+#define PACKET_FASTROUTE	6		/* Fastrouted frame	*/
+```
 
 ## 网络功能配置域
 Linux网络子系统实现了大量功能，这些功能是模块化的。
@@ -630,6 +648,9 @@ void kfree_skb(struct sk_buff *skb)
 ```
 
 ## 数据空间对齐
+
+![](./pic/68.jpg)
+
 ```c
 // 增加预留空间headroom
 // headroom 就是 skb->head 到 skb->data 之间的空间
@@ -732,6 +753,8 @@ void skb_trim(struct sk_buff *skb, unsigned int len)
 当修改只涉及 sk_buff 时，为了提高效率，只复制sk_buff,
 并将dataref计数加一。
 保证每个进程有独立的sk_buff，sk_buff 指向相同的数据缓冲区。
+
+![](./pic/69.jpg)
 
 ```txt
 +----------+     +----------+     +------------+
