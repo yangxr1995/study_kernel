@@ -661,3 +661,25 @@ client(订阅方)
 
 
 
+# mqtt Broker 的使用
+## mosquitto
+
+mosquitto [-c config file] [-d | --daemon] [-p port number] [-v]
+
+mosquitto is a broker for the MQTT protocol version 5.0/3.1.1/3.1.
+
+
+OPTIONS
+       -c, --config-file
+           Load configuration from a file. If not given, then the broker will listen on port 1883 bound to the loopback interface, and the default values as described
+           in mosquitto.conf(5) are used.
+
+               Important
+               See the -p option for a description of changes in behaviour from 1.6.x to 2.0.
+
+       -d, --daemon
+           Run mosquitto in the background as a daemon. All other behaviour remains the same.
+
+       -p, --port
+            监听指定的端口。可以指定多达10次，以打开多个监听不同端口的套接字。
+
