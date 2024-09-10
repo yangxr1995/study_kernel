@@ -172,7 +172,7 @@ cpu1
     smp_rmb(); 
     assert(a == 1);
 
-# 多线程和编译器优化导致的bug
+# volatile和多线程
 
 编译器的视角是局部单线程的，所以对于栈上的数据，编译器能较好的理解语义，并优化代码，
 
@@ -364,9 +364,437 @@ func2:
 volatile 虽然使用一般指令，但是由于原子指令会导致cpu性能下降，所以当对数据的更新值获取不严格时，可以使用volatile
 
 
-# 工具
-## gcc 对thread的支持
-### per thread
+# CAS
+
+CAS(obj, expected, desired)
+
+其逻辑为
+
+bool CAS(_Atomic long *obj, long *expected, long desired) {
+    bool ret = false;
+    if (*obj == *expected) {
+        *obj = desired;
+        ret = true;
+    }
+    *expected = obj;
+    return ret;
+}
+
+## CAS_strong 和 CAS_weak
+
+要理解为什么会有两种CAS实现，需要知道CAS导致的致命ABA问题
+
+### ABA问题
+
+在多线程计算中，ABA问题发生在同步过程中，当一个位置被读取两次，两次读取的值相同，并且读取值相同被用来得出结论认为中间没有发生任何事情；
+
+然而，另一个线程可以在两次读取之间执行，改变值，做其他工作，然后将值改回，从而欺骗第一个线程认为没有发生变化，尽管第二个线程做了违反该假设的工作。
+
+#### ABA问题的示例
+
+// 用 CAS 实现无锁stack
+class Stack {
+  std::atomic<Obj*> top_ptr;
+
+  Obj* Pop() {
+    while (1) {
+      Obj* ret_ptr = top_ptr;
+
+      if (ret_ptr == nullptr) return nullptr;
+
+      Obj* next_ptr = ret_ptr->next;
+
+      // 如果 top_ptr == ret_ptr, 就说明stack没有改变过，则将 top_ptr指向下一个节点(top_ptr = next_ptr)，并返回出栈元素(ret_ptr)
+      // 此处没有考虑ABA问题，所以有bug
+      if (top_ptr.compare_exchange_weak(ret_ptr, next_ptr)) {
+        return ret_ptr;
+      }
+      // 如果 top_ptr != ret_ptr，就说明stack被其他线程移动了，需要重新获得next_ptr和ret_ptr
+    }
+  }
+
+  void Push(Obj* obj_ptr) {
+    while (1) {
+      Obj* next_ptr = top_ptr;
+      obj_ptr->next = next_ptr;
+
+      // 如果 top_ptr == next_ptr 说明stack没有改变过，top_ptr = obj_ptr，实现入栈，并结束push
+      // 此处没有考虑ABA问题，所以有bug
+      if (top_ptr.compare_exchange_weak(next_ptr, obj_ptr)) {
+        return;
+      }
+
+      // 如果 top_ptr != ret_ptr，就说明stack被其他线程移动了，需要重新获得next_ptr和ret_ptr
+    }
+  }
+};
+
+
+上面代码可以防止并发执行问题，但存在ABA问题，考虑一下序列 ：
+
+栈的内容为 top -> A -> B -> C
+
+线程1 : pop
+top = A
+ret = A
+next = B
+线程1在调用compare_exchange_weak前被调度，
+
+线程2 : pop
+top = A
+ret = A
+next = B
+compare_exchange_weak(top, ret, next_ptr) // true
+return A
+
+栈的内容为 top -> B -> C
+
+线程2 : pop
+top = B
+ret = B
+next = C
+compare_exchange_weak(top, ret, next_ptr) // true
+return B
+
+栈的内容为 top -> C
+
+线程2 : push A
+obj = A
+top = C
+next_ptr = C
+compare_exchange_weak(top, next_ptr, obj) // true
+return
+
+栈的内容为 top -> A -> C
+
+线程1被调度,进行pop
+top = A
+ret = A
+next = B
+compare_exchange_weak(top, ret, next_ptr) // true
+
+栈的内容为 top -> B
+
+泄漏的节点 A -> C
+
+#### ABA问题的解决方法
+
+1. 避免内存的重复使用，比如pop A后，push A必须使用不同的内存地址
+
+2. 给容器增加版本号，每次修改容器还需要修改版本号，CAS时除了比较指针，还要比较版本号
+
+#### 从根本上解决ABA
+
+ABA的原因是内存地址虽然没有变，但内存的内容变了，所以若能检查到内容是否改变，就能完美解决ABA问题
+
+对于内容变更检查，有 LL/SC 指令，语义为
+
+word LL( word * pAddr )
+    return *pAddr ;
+
+bool SC( word * pAddr, word New ) {
+if ( data in pAddr has not been changed since the LL call) {
+    *pAddr = New ;
+    return true ;
+else
+    return false ;
+
+使用LL/SC指令实现的CAS，称为CAS_weak
+
+bool CAS_weak( word * pAddr, word nExpected, word nNew ) {
+    if ( LL( pAddr ) == nExpected ) // 比较指针是否改变
+        return SC( pAddr, nNew ) ;  // 若指针没有改变，检查内容是否改变
+    return false ;
+}
+
+可见CAS_weak是非原子的，当内核调度时，CAS_weak会被打断，当CAS_weak恢复后 SC会恒返回false
+
+所以CAS_weak即使指针没有修改，也可能返回false
+
+所以使用CAS_weak需要增加while循环
+
+而CAS_strong是严格按照CAS实现的原子操作，不会被打断，但无法避免ABA问题
+
+### CAS_weak 和 cache line
+#### false sharing
+cache以 cache line为单位, 一个cache line长度L为64-128字节,
+
+主存储和cache数据交换在 L 字节大小的 L 块中进行，
+
+即使缓存行中的一个字节发生变化，所有行都被视为无效，主存储和cache数据交换在 L 字节大小的 L 块中，
+
+若有两个变量a和b在同个cache line，但是a被CPU0操作，b被CPU1操作，
+
+当CPU0改变a时，b虽然没有被改变，也会导致CPU1中的b被视为无效。
+
+这被称为伪共享 false sharing
+
+#### CAS_weak 和 false sharing
+
+由于当cache line 中一个字节被修改，导致整个cache line无效，
+
+若存在false sharing，CPU0每次对变量 a检查CAS时，
+
+其他CPU修改了某变量导致 a 无效，将导致CPU0出现活锁，即CAS一直返回false，导致CPU0被占满。
+
+#### 避免false sharing
+
+为了杜绝这样的False sharing情况，我们应该使得不同的共享变量处于不同cache line中，
+
+一般情况下，如果变量的内存地址相差住够远，那么就会处于不同的cache line，
+
+于是我们可以采用填充（padding）来隔离不同共享变量，如下：
+
+```c
+struct Foo {
+int volatile nShared1;
+char _padding1[64]; // padding for cache line=64 byte
+int volatile nShared2;
+char _padding2[64]; // padding for cache line=64 byte
+};
+```
+
+上面，nShared1和nShared2就会处于不同的cache line，
+
+cpu core1对nShared1的CAS操作就不会被其他core对nShared2的修改所影响了。
+
+
+# RCU
+RCU是一种同步机制；其次RCU实现了读写的并行；
+
+RCU利用一种Publish-Subscribe的机制，在Writer端增加一定负担，使得Reader端几乎可以Zero-overhead。
+
+RCU适合用于同步基于指针实现的数据结构（例如链表，哈希表等），同时由于他的Reader 0 overhead的特性，特别适用用读操作远远大与写操作的场景。
+
+RCU是读者无锁，写者有锁，所以RCU并不是完全的无锁化
+
+## 发布订阅机制
+
+![](./pic/6.jpg)
+
+发布订阅机制指，写端更新数据时，新分配一个对象，基于新对象更新数据。
+
+语义如下
+
+发布者
+struct foo *gp = NULL;
+struct foo *p;
+p = malloc(sizeof(*p));
+p->a = 1;
+p->b = 1;
+gp = p; 
+
+订阅者
+p = gp;
+if (p != NULL) {
+    do_something(p->a, p->b); 
+}
+
+### rcu_assign_pointer 和 rcu_dereference
+
+由于CPU和编译器优化可能导致指令乱序执行，导致bug
+
+发布者
+struct foo *gp = NULL;
+struct foo *p;
+// 可能 gp = p 最先执行
+p = malloc(sizeof(*p));
+p->a = 1;
+p->b = 1;
+gp = p; 
+
+订阅者
+// 在某些CPU环境下， 读取 p->a,p->b  可能比 p = gp先执行
+p = gp;
+if (p != NULL) {
+    do_something(p->a, p->b); 
+}
+
+要解决这些问题需要 volatile 和内存屏障，但二者并不便于使用，常见操作是将其封装成宏
+
+#define rcu_assign_pointer(p, v)                                          \
+    ({                                                                    \
+        (__typeof__(*p) __force *) atomic_xchg_release((rcu_uncheck(&p)), \
+                                                       rcu_check(v));     \
+    })
+
+// 包含原子写和写内存屏障
+#define atomic_xchg_release(x, v)                                            \
+    ({                                                                       \
+        __typeof__(*x) ___x;                                                 \
+        atomic_exchange_explicit((volatile _Atomic __typeof__(___x) *) x, v, \
+                                 memory_order_release);                      \
+    })
+
+
+#define rcu_dereference(p)                                              \
+    ({                                                                  \
+        __typeof__(*p) *___p = (__typeof__(*p) __force *) READ_ONCE(p); \
+        rcu_check_sparse(p, __rcu);                                     \
+        ___p;                                                           \
+    })
+
+// 包含原子读和读写内存屏障
+#define READ_ONCE(x)                                                      \
+    ({                                                                    \
+        barrier();                                                        \
+        __typeof__(x) ___x = atomic_load_explicit(                        \
+            (volatile _Atomic __typeof__(x) *) &x, memory_order_consume); \
+        barrier();                                                        \
+        ___x;                                                             \
+    })
+
+
+使用rcu原语实现
+
+struct foo *gp = NULL;
+struct foo *p;
+p = malloc(sizeof(*p));
+p->a = 1;
+p->b = 1;
+// 确保p已经完成了赋值
+rcu_assign_pointer(gp, p);
+
+订阅者
+p = rcu_dereference(gp);
+// 确保gp已经完成了读取
+if (p != NULL) {
+    do_something(p->a, p->b); 
+}
+
+### synchronize_rcu 对副本旧对象的释放
+
+![](./pic/7.jpg)
+
+要释放旧对象前，必须确保相关的读者已经不使用该对象了，如果还在使用则自旋等待，
+
+相关原语是 synchronize_rcu
+
+而读者需要一个机制宣告自己读完成了.
+
+相关原语是 rcu_read_lock, rcu_read_unlock
+
+发布者
+struct foo *gp = NULL;
+struct foo *p, *tmp;
+// 可能 gp = p 最先执行
+p = malloc(sizeof(*p));
+p->a = 1;
+p->b = 1;
+rcu_assign_pointer(tmp, gp);
+rcu_assign_pointer(gp, p);
+synchronize_rcu(); // 等待所有读者都完成了读操作
+free(tmp);
+
+订阅者
+// 在某些CPU环境下， 读取 p->a,p->b  可能比 p = gp先执行
+rcu_read_lock();
+p = rcu_dereference(gp);
+if (p != NULL) {
+    do_something(p->a, p->b); 
+}
+rcu_read_unlock();
+// 保证之后不会再访问 p 指向的对象
+
+### RCU原语的实现
+
+
+
+### 应用
+
+使用 rcu_assign_pointer 和 rcu_dereference 实现 RCU容器，主要是链表结构的容器
+
+需要注意
+1. 对于会修改链表结构的的操作视为写端，否则视为读端
+2. 对于写端，遍历操作需要带锁，并用非RCU遍历
+3. 对于读端，编译操作不需要锁，并用RCU遍历
+4. 读写指针都用RCU方式，确保cache的一致性和指令顺序执行
+
+#### RCU链表
+
+##### list_add_rcu list_del_rcu
+
+static inline void __list_add_rcu(struct list_head *new,
+                                  struct list_head *prev,
+                                  struct list_head *next)
+{
+    next->prev = new;
+    new->next = next;
+    new->prev = prev;
+    barrier();
+    rcu_assign_pointer(list_next_rcu(prev), new);
+}
+
+static inline void list_add_rcu(struct list_head *new, struct list_head *head)
+{
+    __list_add_rcu(new, head, head->next);
+}
+
+static inline void __list_del_rcu(struct list_head *prev,
+                                  struct list_head *next)
+{
+    next->prev = prev;
+    barrier();
+    rcu_assign_pointer(list_next_rcu(prev), next);
+}
+
+static inline void list_del_rcu(struct list_head *node)
+{
+    __list_del_rcu(node->prev, node->next);
+    list_init_rcu(node);
+}
+
+
+##### for each
+
+/*
+ * 仅供写端使用（写端必须持有锁）
+ */
+#define list_for_each(n, head) for (n = (head)->next; n != (head); n = n->next)
+
+#define list_for_each_from(pos, head) for (; pos != (head); pos = pos->next)
+
+#define list_for_each_safe(pos, n, head)                   \
+    for (pos = (head)->next, n = pos->next; pos != (head); \
+         pos = n, n = pos->next)
+
+/* 仅供读端使用 */
+#define list_for_each_entry_rcu(pos, head, member)                     \
+    for (pos = list_entry_rcu((head)->next, __typeof__(*pos), member); \
+         &pos->member != (head);                                       \
+         pos = list_entry_rcu(pos->member.next, __typeof__(*pos), member))
+
+##### 使用示例
+
+static void *reader_side(void *argv)
+{
+    struct test __allow_unused *tmp;
+    rcu_init();
+    rcu_read_lock();
+    list_for_each_entry_rcu(tmp, &head, node) {}
+    rcu_read_unlock();
+    pthread_exit(NULL);
+}
+
+static void *updater_side(void *argv)
+{
+    struct test *newval = test_alloc(current_tid());
+    list_add_tail_rcu(&newval->node, &head);
+    synchronize_rcu();
+    pthread_exit(NULL);
+}
+
+##### 分析遍历链表同时进行插入删除操作
+
+![](./pic/8.jpg)
+
+由于对指针的读写操作都是原子，且使用了内存屏障，所以可以保证执行顺序和cache一致性，
+
+所以在修改链表的同时是可以并发读
+
+
+# 数据私有化
+## gcc per thread
 
 使用 __thread 修饰的符号会被编译为per thread
 
