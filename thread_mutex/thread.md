@@ -2,6 +2,22 @@
 
 ## 什么是原子操作
 
+原子操作是指在执行过程中不会被中断的操作，要么全部执行成功，要么全部不执行，不会出现部分执行的情况。
+
+原子操作可以看作是不可分割的单元， 运行期间不会有任何的上下文切换。
+
+1. 单核处理器上，原子操作可以通过禁止中断的方式来保证不被中断。当一个线程或进程执行原子操作时，可以通过禁用中断来确保原子性。
+在禁用中断期间，其他线程或进程无法打断当前线程或进程的执行，从而保证原子操作的完整性。
+
+2. 多核处理器上，原子操作的实现需要使用一些特殊的硬件机制或同步原语来保证原子性。以下是两种常见的方法：
+使用硬件原子指令：现代多核处理器通常支持硬件原子指令，例如CAS（Compare-And-Swap）指令。这样的指令允许对共享内存进行原子读取和写入操作。
+CAS指令会比较内存中的值与期望值，如果相等则执行写入操作，否则不执行。通过使用这样的原子指令，可以在多核处理器上实现原子操作。
+
+使用锁和同步原语：多核处理器上的原子操作可以通过锁来实现互斥访问。以往0x86，是直接锁总线，避免所有内存的访问。
+现在是只需要锁住相关的内存，比较其他核心对这块内存的访问。
+
+### 非原子操作的问题
+
 源代码中一条语句，即使是汇编代码，经过cpu解码后，实际执行的是多条代码，当多个cpu并发执行时，语义就可能异常，
 
 比如 ++i，一条语句，cpu会分为三个步骤完成。
@@ -22,6 +38,15 @@ CPU1开始执行时，会让其他CPU对i的操作暂停
 
 可见原子操作本质上是最小粒度的自旋锁
 
+## 常用的原子函数
+原子操作类常用成员函数有
+- fetch：先获取值再计算，即返回的是修改之前的值；
+- store：写入数据；
+- load：加载并返回数据；
+- exchange：直接设置一个新值；
+- compare_exchange_weak：先比较第一个参数的值和要修改的内存值（第二个参数）是否相等，如果相等才会修改，该函数有可能在except == value时也会返回false所以一般用在while中，直到为true才退出；
+- compare_exchange_strong：功能和*_weak一样，不过except == value时该函数保证不会返回false，但该函数性能不如*_weak；
+
 # 缓存一致性
 
 CPU直接操作内存的是自己的缓存，在SMP场景下，内存中的变量i，会在每个CPU缓存中有一个副本。
@@ -31,6 +56,87 @@ CPU直接操作内存的是自己的缓存，在SMP场景下，内存中的变�
 这是由硬件实现的，当进行同步时，其他CPU的工作也会被暂停。
 
 为了避免缓存一致性导致的性能损耗，高性能程序会使用per cpu解决
+
+# 内存模型
+
+内存一致性模型描述的是程序在执行过程中内存操作正确性的问题。
+
+内存操作包括读操作和写操作，
+
+每一操作又可以用两个时间点界定：发出（Invoke）和响应（Response）。
+
+## 内存序
+
+内存序问题：内存序（memory order）问题是由于多线程的并行执行可能导致的对共享变量的读写操作无法按照程序员预期的顺序进行。
+
+因此需要内存序来限制CPU对指令执行顺序的重排程度。
+
+### happens-before和synchronizes-with语义
+
+这是两种常见的业务场景
+
+- happens-before:
+如果两个操作之间存在依赖关系，并且一个操作一定比另一个操作先发生，那么者两个操作就存在happens-before关系；
+
+- synchronizes-with:
+synchronizes-with关系指原子类型之间的操作，如果原子操作A在像变量X写入一个之后，
+接着在同一线程或其它线程原子操作B又读取该值或重新写入一个值那么A和B之间就存在synchronizes-with关系；
+
+注意这两中语义只是一种关系，并不是一种同步约束，也就是需要我们编程去保证，而不是它本身就存在
+
+### 内存序模型
+
+为了方便编程员实现上面的语义，设计了如下内存序模型
+
+#### Sequential consistency模型
+Sequential consistency模型又称为顺序一致性模型，是控制粒度最严格的内存模型。
+
+在顺序一致性模型下，程序的执行顺序与代码顺序严格一致，也就是说，在顺序一致性模型中，不存在指令乱序。
+
+每个线程的执行顺序与代码顺序严格一致
+
+线程的执行顺序可能会交替进行，但是从单个线程的角度来看，仍然是顺序执行
+
+标准库atomic的操作都使用memory_order_seq_cst作为默认值。如果不确定使用何种内存访问模型，用 memory_order_seq_cst能确保不出错。
+
+顺序一致性的所有操作都按照代码指定的顺序进行，符合开发人员的思维逻辑，但这种严格的排序也限制了现代CPU利用硬件进行并行处理的能力，会严重拖累系统的性能。
+
+#### Relax模型
+Relax模型对应的是memory_order中的memory_order_relaxed。
+
+其对于内存的限制最小，也就是说这种方式只能「保证当前的数据访问是原子操作（不会被其他线程的操作打断）」，
+
+但是对内存访问顺序没有任何约束，也就是说对不同的数据的读写可能会被重新排序。
+
+#### Acquire-Release模型
+Acquire-Release模型的控制力度介于Relax模型和Sequential consistency模型之间。其定义如下：
+
+Acquire：如果一个操作X带有acquire语义，那么在操作X后的所有读写指令都不会被重排序到操作X之前
+
+Relase：如果一个操作X带有release语义，那么在操作X前的所有读写指令操作都不会被重排序到操作X之后
+
+Acquire-Release模型对应六种约束关系中的memory_order_consume、memory_order_acquire、memory_order_release和memory_order_acq_rel。
+
+这些约束关系，有的只能用于读操作(memory_order_consume、memory_order_acquire)，有的适用于写操作(memory_order_release)，有的既能用于读操作也能用于写操作(memory_order_acq_rel)。
+
+这些约束符互相配合，可以实现相对严格一点的内存访问顺序控制。
+
+### memory_order
+
+c/c++中引入了六种内存约束符用以解决多线程下的内存一致性问题(在头文件中)，其定义如下：
+
+memory_order_relaxed
+memory_order_consume
+memory_order_acquire
+memory_order_release
+memory_order_acq_rel
+memory_order_seq_cst
+
+- memory_order_relaxed：松散内存序，只用来保证对原子对象的操作是原子的，在不需要保证顺序时使用。（保证原子性，不保证顺序性和同步性）。
+- memory_order_release：释放操作，在写入某原子对象时，当前线程的任何前面的读写操作都不允许重排到这个操作的后面去，并且当前线程的所有内存写入都在对同一个原子对象进行获取的其他线程可见。（保证原子性和同步性，顺序是当前线程的前面不能写到后面；但当前线程的后面可以写到前面）。
+- memory_order_acquire：获得操作，在读取某原子对象时，当前线程的任何后面的读写操作都不允许重排到这个操作的前面去，并且其他线程在对同一个原子对象释放之前的所有内存写入都在当前线程可见。（保证原子性和同步性，顺序是当前线程的后面不能写到前面；但当前线程的前面可以写到后面）。
+- memory_order_acq_rel：获得释放操作，一个读‐修改‐写操作同时具有获得语义和释放语义，即它前后的任何读写操作都不允许重排，并且其他线程在对同一个原子对象释放之前的所有内存写入都在当前线程可见，当前线程的所有内存写入都在对同一个原子对象进行获取的其他线程可见。
+- memory_order_seq_cst：顺序一致性语义，对于读操作相当于获得，对于写操作相当于释放，对于读‐修改‐写操作相当于获得释放，是所有原子操作的默认内存序，并且会对所有使用此模型的原子操作建立一个全局顺序，保证了多个原子变量的操作在所有线程里观察到的操作顺序相同，当然它是最慢的同步模型。
 
 # 内存屏障
 
@@ -66,9 +172,26 @@ cache未命中是软件开发者要关注
 
 ## 为什么需要内存屏障
 
-在SMP多线程环境下，很容易出现cache中变量未及时同步的问题，所以需要内存屏障
+由于如下原因
 
-### 为什么会有cache变量未及时同步
+- 编译器编译时的优化；
+- 处理器执行时的多发射和乱序优化；
+- 读取和存储指令的优化；
+- 缓存同步顺序（导致可见性问题）。
+
+在SMP多线程环境下，很容易出现指令乱序执行或cache中变量不一致，所以需要内存屏障
+
+### 内存屏障的工作原理
+
+下面使用内存屏障解决cache变量不一致的问题
+
+### 为什么会有cache变量不一致
+
+由于指令的执行并非原子的，指令的执行从发出到响应需要一段时间，特别是在SMP下涉及cache同步.
+
+由于CPU可能不会立即处理cache同步消息，导致cache变量不一致
+
+如下
 
 cpu0
     a = 1;
@@ -100,7 +223,7 @@ cpu1
 
 简单说就是 使无效队列 或 写操作缓冲区 没有及时处理
 
-## smp_mb
+## 使用内存屏障解决cache一致性
 
 cpu0
     a = 1;
@@ -140,7 +263,6 @@ cpu1
 
 14. cpu1 : 程序正常
 
-
 ## 更小粒度的内存屏障
 
 很多CPU体系结构提供更弱的内存屏障指令，这些指令仅仅做其中一项或者几项工作。
@@ -161,7 +283,6 @@ cpu1
 
 完整的内存屏障同时保证写和读之间的顺序，这也仅仅针对执行该内存屏障的CPU来说的。
 
-
 cpu0
     a = 1;
     smp_wmb(); 
@@ -171,6 +292,48 @@ cpu1
     while (b == 0) continue;
     smp_rmb(); 
     assert(a == 1);
+
+## c/c++标准化的内存屏障
+
+标准库提供了两个函数用于实现内存屏障 atomic_thread_fence, atomic_signal_fence
+
+### atomic_thread_fence 和 atomic_signal_fence 的区别
+
+atomic_thread_fence 和 atomic_signal_fence 都是用于建立内存同步顺序的原子操作，但它们之间存在一些差异：
+
+1. atomic_thread_fence 用于在线程之间建立内存同步顺序。它可以防止在它之前的读写操作越过它之后的操作。
+
+例如，一个带有 memory_order_release 语义的 atomic_thread_fence 可以阻止所有之前的读写操作越过它之后的所有存储操作。
+
+它确保了在不同线程之间的操作顺序可见性。
+
+2. atomic_signal_fence 主要用于在同一个线程内，线程和信号处理函数之间建立内存同步顺序。
+
+它不会在 CPU 级别产生内存屏障指令，而是仅防止编译器重排序指令。这意味着它主要用于控制编译器的优化行为，
+
+而不是在多线程环境中同步内存状态。
+
+3. 简而言之，atomic_thread_fence 用于线程间的内存同步，
+
+而 atomic_signal_fence 用于线程内部以及线程与信号处理函数之间的内存同步。
+
+atomic_thread_fence 会产生实际的 CPU 内存屏障指令，而 atomic_signal_fence 则不会。
+
+### 内存屏障和内存序
+
+创建一个内存屏障（memory barrier），用于限制内存访问的重新排序和优化。
+
+它可以保证在屏障之前的所有内存操作都在屏障完成之前完成。、
+
+void atomic_thread_fence(std::memory_order order);
+
+常见的 memory_order 参数包括：
+
+- memory_order_relaxed：最轻量级的内存顺序，允许重排和优化。
+- memory_order_acquire：在屏障之前的内存读操作必须在屏障完成之前完成。
+- memory_order_release：在屏障之前的内存写操作必须在屏障完成之前完成。
+- memory_order_acq_rel：同时具有 acquire 和 release 语义，适用于同时进行读写操作的屏障。
+- memory_order_seq_cst：对于读操作相当于获得，对于写操作相当于释放。
 
 # volatile和多线程
 
@@ -483,7 +646,7 @@ compare_exchange_weak(top, ret, next_ptr) // true
 
 2. 给容器增加版本号，每次修改容器还需要修改版本号，CAS时除了比较指针，还要比较版本号
 
-#### 从根本上解决ABA
+#### 从根本上避免ABA
 
 ABA的原因是内存地址虽然没有变，但内存的内容变了，所以若能检查到内容是否改变，就能完美解决ABA问题
 
@@ -557,6 +720,136 @@ char _padding2[64]; // padding for cache line=64 byte
 上面，nShared1和nShared2就会处于不同的cache line，
 
 cpu core1对nShared1的CAS操作就不会被其他core对nShared2的修改所影响了。
+
+# C标准库提供的原子相关操作
+
+C11标准中引入原子操作，实现了一整套完整的原子操作接口，定义在头文件`<stdatomic.h>`，
+
+## 定义原子变量
+
+可以使用预定义的类型
+
+```c
+typedef _Atomic(bool) atomic_bool;
+typedef _Atomic(char) atomic_char;
+typedef _Atomic(signed char) atomic_schar;
+typedef _Atomic(unsigned char) atomic_uchar;
+typedef _Atomic(short) atomic_short;
+typedef _Atomic(unsigned short) atomic_ushort;
+typedef _Atomic(int) atomic_int;
+typedef _Atomic(unsigned int) atomic_uint;
+typedef _Atomic(long) atomic_long;
+typedef _Atomic(unsigned long) atomic_ulong;
+typedef _Atomic(long long) atomic_llong;
+typedef _Atomic(unsigned long long) atomic_ullong;
+```
+
+或者使用_Atomic 修饰变量定义，但变量不应该超过 long long 大小
+
+```c
+_Atomic int a;
+```
+
+## 原子变量的初始化
+
+```c
+/*
+ * obj : 原子变量地址
+ * val : 数值
+ * 如 atomic_init(&lock, 1);
+ */
+void atomic_init(obj, val);
+```
+
+## 原子加载和存储
+
+```c
+/*
+ * object : 原子变量地址
+ * order : 内存顺序
+ */
+void atomic_store(object, desired);
+void atomic_store_explicit(object, desired, memory_order order);
+T atomic_load(object);
+T atomic_load_explicit(object, memory_order order);
+```
+
+## 原子交换
+```c
+/*
+ * 设置原子变量的值，并返回原子变量旧值。
+ * tmp = object
+ * object = desired
+ * return tmp;
+ */
+T atomic_exchange(object, desired);
+T atomic_exchange_explicit(object, desired, memory_order order);
+```
+
+## 原子比较交换（CAS）
+
+```c
+/*
+ * 如果原子变量object和expected值相等，把原子变量设置成desired，返回true。
+ * 如果原子变量object和expected值不相等，返回false。
+ * 无论是否相等，都把expected设置成object，
+ *
+ * weak : 使用LL/SC原语实现的伪CAS，可能即使object == expected 也返回false，通常需要while循环再次判断
+ * strong : 严格按照CAS实现，用于实现无锁容器时，可能存在ABA问题
+ *
+ * object：原子变量地址。
+ * expected：预期值，需填变量内存地址。
+ * desired：数值。
+ * suc：成功时的内存顺序。
+ * fail：失败时的内存顺序。
+ */
+bool atomic_compare_exchange_strong(object, expected, desired);
+bool atomic_compare_exchange_strong_explicit(object, expected, desired，memory_order suc, memory_order fail);
+bool atomic_compare_exchange_weak(object, expected, desired);
+bool atomic_compare_exchange_weak_explicit(object, expected, desired);
+```
+
+## 原子运算
+
+```c
+/*
+ * 执行原子变量加，减，或，异或，与操作，返回原子变量之前旧值。
+ *
+ * operand：数值
+ */
+T atomic_fetch_add(object, operand);
+T atomic_fetch_add_explicit(object, operand);
+T atomic_fetch_sub(object, operand);
+T atomic_fetch_sub_explicit(object, operand);
+T atomic_fetch_or(object, operand);
+T atomic_fetch_or_explicit(object, operand);
+T atomic_fetch_xor(object, operand);
+T atomic_fetch_xor_explicit(object, operand);
+T atomic_fetch_and(object, operand);
+T atomic_fetch_and_explicit(object, operand);
+```
+## 内存顺序（Memory Order）
+```c
+/*
+ * memory_order_relaxed：最宽松的顺序，不保证操作的顺序，可能会导致数据竞争（data races）。
+ * memory_order_consume：主要用于无须保持历史状态的读操作，可以优化某些场景下的性能。
+ * memory_order_acquire：确保之前的写操作已经对其他线程可见，但可能重排序。
+ * memory_order_release：写内存屏障，确保当前写操作对其他线程立即可见，但之前的读操作可以重排序。
+ * memory_order_acq_rel：同时满足 acquire 和 release，适合于读-修改-写的情况。
+ * memory_order_seq_cst：最严格的顺序，保证操作的顺序与单线程程序一致，包括内存顺序和程序顺序。
+ */
+typedef enum memory_order {
+  memory_order_relaxed = __ATOMIC_RELAXED,
+  memory_order_consume = __ATOMIC_CONSUME,
+  memory_order_acquire = __ATOMIC_ACQUIRE,
+  memory_order_release = __ATOMIC_RELEASE,
+  memory_order_seq_cst = __ATOMIC_SEQ_CST
+  memory_order_acq_rel = __ATOMIC_ACQ_REL,
+} memory_order;
+```
+
+
+
 
 
 # RCU
