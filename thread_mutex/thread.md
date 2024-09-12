@@ -1,3 +1,172 @@
+# 锁
+## 锁的危害
+
+### 死锁
+
+#### 避免死锁
+
+##### 锁层次
+
+锁的层次是指为锁逐个编号，禁止不按顺序获取锁
+
+比如一下情况触发了死锁
+
+thread1 持有 lock1，要获取 lock2
+thread2 持有 lock2，要获取 lock3
+thread3 持有 lock3，要获取 lock3
+
+使用锁层次，给锁定义序号，必须由小到大获取锁
+
+thread1 2 3 都会争取 lock1，则不会出现死锁
+
+###### 条件锁
+
+某个场景设计不出合理的层次锁。
+
+比如，在分层网络协议栈里，报文流是双向的。当报文从一个层传往另一个层时，有可能需要在两层中同时获取锁。
+
+因为报文可以从协议栈上层传往下层，也可能相反。
+
+当报文在协议栈中从上往下发送时，必须逆序获取下一层的锁。而报文在协议栈中从下往上发送时，是按顺序获取锁，图中第4行的获取锁操作将导致死锁
+
+spin_lock(&lock2);
+l2_process(pkt);
+next_layer = layer_l1(pkt);
+spin_lock(next_layer->lock1);
+l1_process(pkt);
+spin_unlock(&lock2);
+spin_unlock(&next_layer->lock1);
+
+使用条件锁可以强行制造锁层次
+
+retry:
+spin_lock(&lock2);
+l2_process(pkt);
+
+next_layer = layer_l1(pkt);
+if (!spin_try_lock(&next_layer->lock1)) {
+    spin_unlock(&lock2);
+    spin_lock(&next_layer->lock1);
+    spin_lock(&lock2);
+    if (layer_l1(pkt) != next_layer) {
+        spin_unlock(&next_layer->lock1);
+        spin_unlock(&lock2);
+        goto retry;
+    }
+}
+l1_process(pkt);
+spin_unlock(&next_layer->lock1);
+spin_unlock(&lock2);
+
+##### 一次只用一把锁
+
+可以避免嵌套加锁，从而避免死锁。比如，如果有一个可以完美分割的问题，每个分片拥有一把锁。
+
+然后处理任何特定分片的线程只需获得对应这个分片的锁。因为没有任何线程在同一时刻持有一把以上的锁，死锁就不可能发生。
+
+##### 信号/中断处理函数
+
+信号/中断处理函数里持有的锁仅能在信号处理函数中获取，应用程序代码和信号处理函数之间的通信通常使用无锁同步机制。
+
+尝试去获取任何可能在信号/中断处理函数之外被持有的锁，这种操作都是非法操作。
+
+### 活锁和饥饿
+
+条件锁是一种有效避免死锁机制，但可能带来活锁
+
+void thread1(void)
+{
+retry:
+	spin_lock(&lock1);
+	do_one_thing();
+	if (!spin_trylock(&lock2)) {
+		spin_unlock(&lock1);  
+		goto retry;
+	}
+	do_another_thing();
+	spin_unlock(&lock2);
+	spin_unlock(&lock1);
+}
+
+void thread2(void)
+{
+retry:					
+	spin_lock(&lock2);		
+	do_a_third_thing();
+	if (!spin_trylock(&lock1)) {	
+		spin_unlock(&lock2);	
+		goto retry;
+	}
+	do_a_fourth_thing();
+	spin_unlock(&lock1);
+	spin_unlock(&lock2);
+}
+
+活锁和饥饿都属于事务内存软件实现中的严重问题，所以现在引入了竞争管理器这样的概念来封装这些问题。
+
+以锁为例，通常简单的指数级后退就能解决活锁和饥饿。指数级后退是指在每次重试之前增加按指数级增长的延迟
+
+void thread1(void)
+{
+	unsigned int wait = 1;
+retry:
+	spin_lock(&lock1);
+	do_one_thing();
+	if (!spin_trylock(&lock2)) {
+		spin_unlock(&lock1);
+		sleep(wait);
+		wait = wait << 1;
+		goto retry;
+	}
+	do_another_thing();
+	spin_unlock(&lock2);
+	spin_unlock(&lock1);
+}
+
+void thread2(void)
+{
+	unsigned int wait = 1;
+retry:
+	spin_lock(&lock2);
+	do_a_third_thing();
+	if (!spin_trylock(&lock1)) {
+		spin_unlock(&lock2);
+		sleep(wait);
+		wait = wait << 1;
+		goto retry;
+	}
+	do_a_fourth_thing();
+	spin_unlock(&lock1);
+	spin_unlock(&lock2);
+}
+
+当然，最好的方法还是通过良好的并行设计使锁竞争程度变低。
+
+### 低效率的锁
+
+锁是由原子操作和内存屏障实现，并且常常带来高速缓存未命中。
+
+这些指令代价都比较昂贵，粗略地说开销比简单指令高两个数量级。
+
+这可能是锁的一个严重问题，如果用锁来保护一条指令，你很可能在以百倍的速度带来开销。
+
+粒度太粗会限制扩展性，粒度太细会导致巨大的同步开销。
+
+不过一旦持有了锁，持有者可以不受干扰地访问被锁保护的代码。
+
+获取锁可能代价高昂，但是一旦持有，特别是对较大的临界区来说，CPU的高速缓存反而是高效的性能加速器。
+
+## 各类锁
+
+### 互斥锁
+
+### 读写锁
+
+### 自旋锁
+
+### 顺序锁
+
+
 # 原子操作 
 
 ## 什么是原子操作
@@ -828,6 +997,13 @@ T atomic_fetch_xor_explicit(object, operand);
 T atomic_fetch_and(object, operand);
 T atomic_fetch_and_explicit(object, operand);
 ```
+
+## 内存屏障
+
+atomic_thread_fence
+
+atomic_signal_fence
+
 ## 内存顺序（Memory Order）
 ```c
 /*
