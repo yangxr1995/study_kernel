@@ -1,11 +1,692 @@
 # 锁
-## 锁的危害
 
-### 死锁
+## 高效的使用锁
+### 数据的分割
 
-#### 避免死锁
+#### 串行程序
 
-##### 锁层次
+如果程序在单处理器上运行足够快，并且不与其他进程、线程或者中断处理程序发生交互，
+
+那么你可以将代码中所有的同步原语删掉，远离它们所带来的开销和复杂性。
+
+随着2003年以来Intel CPU的CPU MIPS和时钟频率增长速度的停止，此后要增加性能，就必须提高程序的并行化程度,
+
+请注意，这并不意味着你应该在每个程序中使用多线程方式编程。我再一次说明，如果一个程序在单处理器上运行得很好，
+
+那么你就从SMP同步原语的开销和复杂性中解脱出来吧。
+
+如哈希表查找代码的简单之美强调了这一点。
+
+这里的关键点是并行化所能带来的加速仅限于CPU个数的提升。
+
+相反，优化串行代码带来的加速，比如精心选择的数据结构，可远不止如此。
+
+struct hash_table
+{
+	long nbuckets;
+	struct node **buckets;
+};
+
+typedef struct node {
+	unsigned long key;
+	struct node *next;
+} node_t;
+
+int hash_search(struct hash_table *h, long key)
+{
+	struct node *cur;
+
+	cur = h->buckets[key % h->nbuckets];
+	while (cur != NULL) {
+		if (cur->key >= key) {
+			return (cur->key == key);
+		}
+		cur = cur->next;
+	}
+	return 0;
+}
+
+#### 代码锁
+
+代码锁是最简单的设计，只使用全局锁。
+
+在已有的程序上使用代码锁，可以很容易的让程序在多处理器上运行。
+
+如果程序只有一个共享资源，那么代码锁的性能是最优的。
+
+但是，许多较大且复杂的程序会在临界区上执行许多次，这就让代码锁的扩展性大大受限。
+
+因此，你最好在这样的程序上使用代码锁，只有一小段执行时间在临界区程序，或者对扩展性要求不高。
+
+这种情况下，代码锁可以让程序相对简单，和单线程版本类似，
+
+
+spinlock_t hash_lock;
+
+struct hash_table
+{
+	long nbuckets;
+	struct node **buckets;
+};
+
+typedef struct node {
+	unsigned long key;
+	struct node *next;
+} node_t;
+
+int hash_search(struct hash_table *h, long key)
+{
+	struct node *cur;
+	int retval;
+
+	spin_lock(&hash_lock);				
+	cur = h->buckets[key % h->nbuckets];
+	while (cur != NULL) {
+		if (cur->key >= key) {
+			retval = (cur->key == key);
+			spin_unlock(&hash_lock);	
+			return retval;
+		}
+		cur = cur->next;
+	}
+	spin_unlock(&hash_lock);			
+	return 0;
+}
+
+代码锁尤其容易引起“锁竞争”, 该问题的一种解决办法是“数据锁”。
+
+#### 数据锁
+
+许多数据结构都可以分割，数据结构的每个部分带有一把自己的锁。
+
+这样虽然每个部分一次只能执行一个临界区，但是数据结构的各个部分形成的临界区就可以并行执行了。
+
+数据锁通过将一块过大的临界区分散到各个小的临界区来减少锁竞争，比如，维护哈希表中的per-hash-bucket临界区。
+
+不过这种扩展性的增强带来的是复杂性的少量提高，增加了额外的数据结构struct bucket。
+
+struct hash_table
+{
+	long nbuckets;
+	struct bucket **buckets;
+};
+
+struct bucket {
+	spinlock_t bucket_lock;
+	node_t *list_head;
+};
+
+typedef struct node {
+	unsigned long key;
+	struct node *next;
+} node_t;
+
+int hash_search(struct hash_table *h, long key)
+{
+	struct bucket *bp;
+	struct node *cur;
+	int retval;
+
+	bp = h->buckets[key % h->nbuckets];
+	spin_lock(&bp->bucket_lock);
+	cur = bp->list_head;
+	while (cur != NULL) {
+		if (cur->key >= key) {
+			retval = (cur->key == key);
+			spin_unlock(&bp->bucket_lock);
+			return retval;
+		}
+		cur = cur->next;
+	}
+	spin_unlock(&bp->bucket_lock);
+	return 0;
+}
+
+数据锁的关键挑战是对动态分配数据结构加锁，如何保证在获取锁时结构本身还存在。
+
+上面的代码通过将锁放入静态分配并且永不释放的哈希桶，解决了上述挑战。
+
+但是，这种手法不适用于哈希表大小可变的情况，所以锁也需要动态分配。
+
+在这种情况，还需要一些手段来阻止哈希桶在锁被获取后这段时间内释放。
+
+### 数据所有权
+
+数据所有权方法按照线程或者CPU的个数分割数据结构，在不需任何同步开销的情况下，每个线程或者CPU都可以访问属于它的子集。
+
+但是如果线程A希望访问另一个线程B的数据，那么线程A是无法直接做到这一点的。
+
+取而代之的是，线程A需要先与线程B通信，这样线程B以线程A的名义执行操作，或者，另一种方法，将数据迁移到线程A上来。
+
+### 非对称锁
+
+常见的是读写锁 ,
+
+如果同步开销可以忽略不计（比如程序使用了粗粒度的并行化），并且只有一小段临界区修改数据，
+
+那么让多个读者并行处理可以显著地提升扩展性。写者与读者互斥，写者和另一写者也互斥.
+
+### 并行快速路径
+
+常用于资源分配，
+
+让每个CPU拥有一块规模适中的内存块缓存，以此作为快速路径，同时提供一块较大的共享内存池分配额外的内存块，
+
+该内存池用代码锁保护。为了防止任何CPU独占内存块，我们给每个CPU的缓存可以容纳的内存块大小做一限制。
+
+当某个CPU的缓存池已满时，该CPU释放的内存块被传送到全局缓存池中，
+
+类似地，当CPU缓存池为空时，该CPU所要分配的内存块也是从全局缓存池中取出来。
+
+![](./pic/9.jpg)
+
+### 延后处理
+
+通用的并行编程延后工作方法包括引用计数、顺序锁和RCU。
+
+#### 引用计数
+
+##### 非原子计数
+
+struct sref {
+	int refcount;
+};
+
+void sref_init(struct sref *sref)
+{
+	sref->refcount = 1;
+}
+
+void sref_get(struct sref *sref)
+{
+	sref->refcount++;
+}
+
+int sref_put(struct sref *sref,
+             void (*release)(struct sref *sref))
+{
+	WARN_ON(release == NULL);
+	WARN_ON(release == (void (*)(struct sref *))kfree);
+
+	if (--sref->refcount == 0) {
+		release(sref);
+		return 1;
+	}
+	return 0;
+}
+
+使用者必须在引用计数外套一层锁，当使用了锁就不需要考虑原子，CPU乱序，编译器乱序
+
+##### 原子计数 
+struct kref {
+	atomic_t refcount;
+};			
+
+void kref_init(struct kref *kref)			
+{
+	atomic_set(&kref->refcount, 1);
+}							
+
+void kref_get(struct kref *kref)			
+{
+	WARN_ON(!atomic_read(&kref->refcount));
+	atomic_inc(&kref->refcount);
+}							
+
+// 因为用的是内联，所以需要考虑原子屏障
+static inline int		
+kref_sub(struct kref *kref, unsigned int count,
+         void (*release)(struct kref *kref))
+{
+	WARN_ON(release == NULL);
+
+	if (atomic_sub_and_test((int) count,		
+	                        &kref->refcount)) {
+		release(kref);				
+		return 1;				
+	}
+	return 0;
+}
+
+这种情况不需要加锁，通常原子是会禁止编译器优化，并保证内存顺序
+
+##### 带内存屏障的原子计数
+
+static inline
+struct dst_entry * dst_clone(struct dst_entry * dst)
+{
+	if (dst)
+		atomic_inc(&dst->__refcnt);
+	return dst;
+}
+
+static inline
+void dst_release(struct dst_entry * dst)
+{
+	if (dst) {
+		WARN_ON(atomic_read(&dst->__refcnt) < 1);
+		smp_mb__before_atomic_dec(); // 若atomic_dec没有原子屏障，则主动加一条
+		atomic_dec(&dst->__refcnt); 
+	}
+}
+
+##### 带检查和释放的原子计数
+
+struct file *fget(unsigned int fd)
+{
+	struct file *file;
+	struct files_struct *files = current->files;
+
+	rcu_read_lock();				
+	file = fcheck_files(files, fd);			
+	if (file) {
+		if (!atomic_inc_not_zero(&file->f_count)) { 
+			rcu_read_unlock();		
+			return NULL;		
+		}
+	}
+	rcu_read_unlock();				
+	return file;				
+}
+
+struct file *
+fcheck_files(struct files_struct *files, unsigned int fd)
+{
+	struct file * file = NULL;
+	struct fdtable *fdt = rcu_dereference((files)->fdt);  
+
+	if (fd < fdt->max_fds)				
+		file = rcu_dereference(fdt->fd[fd]);	
+	return file;					
+}
+
+void fput(struct file *file)
+{
+	if (atomic_dec_and_test(&file->f_count))	
+		call_rcu(&file->f_u.fu_rcuhead, file_free_rcu);  // rcu 异步释放
+}
+
+static void file_free_rcu(struct rcu_head *head)
+{
+	struct file *f;
+
+	f = container_of(head, struct file, f_u.fu_rcuhead); 
+	kmem_cache_free(filp_cachep, f);		
+}
+
+### 顺序锁
+
+Linux内核中使用的顺序锁主要用于保护以读取为主的数据，多个读者观察到的状态必须一致。
+
+不像读/写锁，顺序锁的读者不能阻塞写者。如果检测到有并发的写者，顺序锁强迫读者重试。
+
+顺序锁的关键组成部分是序列号，没有写者的情况下其序列号为偶数值，如果有一个更新正在进行中，其序列号为奇数值。
+
+读者在每次访问之前和之后可以对值进行快照。如果快照是奇数值，又或者如果两个快照的值不同，则存在并发更新，
+
+此时读者必须丢弃访问的结果，然后重试。
+
+读者使用read_seqbegin（）和read_seqretry（）函数访问由顺序锁保护的数据，
+
+写者必须在每次更新前后增加该值，并且在任意时间只允许一个写者。
+
+写者使用write_seqlock（）和write_sequnlock（）函数更新由顺序锁保护的数据
+
+do {
+    seq = read_seqbegin(&test_seqlock);
+
+    // 读端获得数据
+
+} while (read_seqretry(&test_seqlock, seq)); // 若获取数据期间，数据被修改，则需要重新操作
+
+write_seqlock(&test_seqlock); // seq++
+// 写端更新数据
+write_sequnlock(&test_seqlock); // seq++
+
+顺序锁保护的数据可以拥有任意数量的并发读者，但一次只有一个写者。
+
+在Linux内核中顺序锁用于保护计时的校准值。它也用在遍历路径名时检测并发的重命名操作。
+
+##### 顺序锁的实现
+
+typedef struct {				
+	unsigned long seq;		
+	spinlock_t lock;
+} seqlock_t;			
+
+#ifndef FCV_SNIPPET
+#define DEFINE_SEQ_LOCK(name) seqlock_t name = { \
+	.seq = 0,                                \
+	.lock = __SPIN_LOCK_UNLOCKED(name.lock), \
+};
+#endif /* FCV_SNIPPET */
+
+static inline void seqlock_init(seqlock_t *slp)		
+{
+	slp->seq = 0;
+	spin_lock_init(&slp->lock);
+}							
+
+static inline unsigned long read_seqbegin(seqlock_t *slp) 
+{
+	unsigned long s;
+
+	s = READ_ONCE(slp->seq);			
+	smp_mb();					
+	return s & ~0x1UL;				
+}							
+
+static inline int read_seqretry(seqlock_t *slp,		
+                                unsigned long oldseq)
+{
+	unsigned long s;
+
+	smp_mb();					
+	s = READ_ONCE(slp->seq);			
+	return s != oldseq;				
+}							
+
+static inline void write_seqlock(seqlock_t *slp)	
+{
+	spin_lock(&slp->lock);
+	++slp->seq;
+	smp_mb();
+}							
+
+static inline void write_sequnlock(seqlock_t *slp)	
+{
+	smp_mb();					
+	++slp->seq;					
+	spin_unlock(&slp->lock);
+}
+
+##### 顺序锁的优劣
+
+顺序锁不是公平的，对写者更友好，适用于大量读，少量写的场景。
+
+顺序锁允许写者延迟读者，但反之并不亦然。
+
+在存在大量写的工作环境中，这可能导致对读者的不公平和甚至饥饿。
+
+在没有写者时，顺序锁的读者运行相当快速并且可以线性扩展。
+
+
+### RCU
+RCU是一种同步机制；其次RCU实现了读写的并行；
+
+RCU利用一种Publish-Subscribe的机制，在Writer端增加一定负担，使得Reader端几乎可以Zero-overhead。
+
+RCU适合用于同步基于指针实现的数据结构（例如链表，哈希表等），同时由于他的Reader 0 overhead的特性，
+
+特别适用用读操作远远大与写操作的场景。
+
+RCU是读者无锁，写者有锁，所以RCU并不是完全的无锁化
+
+#### 发布订阅机制
+
+![](./pic/6.jpg)
+
+发布订阅机制指，写端更新数据时，新分配一个对象，基于新对象更新数据。
+
+语义如下
+
+发布者
+struct foo *gp = NULL;
+struct foo *p;
+p = malloc(sizeof(*p));
+p->a = 1;
+p->b = 1;
+gp = p; 
+
+订阅者
+p = gp;
+if (p != NULL) {
+    do_something(p->a, p->b); 
+}
+
+#### rcu_assign_pointer 和 rcu_dereference
+
+由于CPU和编译器优化可能导致指令乱序执行，导致bug
+
+发布者
+struct foo *gp = NULL;
+struct foo *p;
+// 可能 gp = p 最先执行
+p = malloc(sizeof(*p));
+p->a = 1;
+p->b = 1;
+gp = p; 
+
+订阅者
+// 在某些CPU环境下， 读取 p->a,p->b  可能比 p = gp先执行
+p = gp;
+if (p != NULL) {
+    do_something(p->a, p->b); 
+}
+
+要解决这些问题需要 volatile 和内存屏障，但二者并不便于使用，常见操作是将其封装成宏
+
+#define rcu_assign_pointer(p, v)                                          \
+    ({                                                                    \
+        (__typeof__(*p) __force *) atomic_xchg_release((rcu_uncheck(&p)), \
+                                                       rcu_check(v));     \
+    })
+
+// 包含原子写和写内存屏障
+#define atomic_xchg_release(x, v)                                            \
+    ({                                                                       \
+        __typeof__(*x) ___x;                                                 \
+        atomic_exchange_explicit((volatile _Atomic __typeof__(___x) *) x, v, \
+                                 memory_order_release);                      \
+    })
+
+
+#define rcu_dereference(p)                                              \
+    ({                                                                  \
+        __typeof__(*p) *___p = (__typeof__(*p) __force *) READ_ONCE(p); \
+        rcu_check_sparse(p, __rcu);                                     \
+        ___p;                                                           \
+    })
+
+// 包含原子读和读写内存屏障
+#define READ_ONCE(x)                                                      \
+    ({                                                                    \
+        barrier();                                                        \
+        __typeof__(x) ___x = atomic_load_explicit(                        \
+            (volatile _Atomic __typeof__(x) *) &x, memory_order_consume); \
+        barrier();                                                        \
+        ___x;                                                             \
+    })
+
+
+使用rcu原语实现
+
+struct foo *gp = NULL;
+struct foo *p;
+p = malloc(sizeof(*p));
+p->a = 1;
+p->b = 1;
+// 确保p已经完成了赋值
+rcu_assign_pointer(gp, p);
+
+订阅者
+p = rcu_dereference(gp);
+// 确保gp已经完成了读取
+if (p != NULL) {
+    do_something(p->a, p->b); 
+}
+
+#### synchronize_rcu 对副本旧对象的释放
+
+![](./pic/7.jpg)
+
+要释放旧对象前，必须确保相关的读者已经不使用该对象了，如果还在使用则自旋等待，
+
+相关原语是 synchronize_rcu
+
+而读者需要一个机制宣告自己读完成了.
+
+相关原语是 rcu_read_lock, rcu_read_unlock
+
+发布者
+struct foo *gp = NULL;
+struct foo *p, *tmp;
+// 可能 gp = p 最先执行
+p = malloc(sizeof(*p));
+p->a = 1;
+p->b = 1;
+rcu_assign_pointer(tmp, gp);
+rcu_assign_pointer(gp, p);
+synchronize_rcu(); // 等待所有读者都完成了读操作
+free(tmp);
+
+订阅者
+// 在某些CPU环境下， 读取 p->a,p->b  可能比 p = gp先执行
+rcu_read_lock();
+p = rcu_dereference(gp);
+if (p != NULL) {
+    do_something(p->a, p->b); 
+}
+rcu_read_unlock();
+// 保证之后不会再访问 p 指向的对象
+
+#### RCU原语的实现
+
+##### 用户态
+
+一种玩具实现
+
+atomic_t rcu_refcnt;			
+
+static void rcu_init(void)
+{
+	atomic_set(&rcu_refcnt, 0);
+}
+
+static void rcu_read_lock(void)
+{
+	atomic_inc(&rcu_refcnt);
+	smp_mb();
+}
+
+static void rcu_read_unlock(void)
+{
+	smp_mb();
+	atomic_dec(&rcu_refcnt);
+}
+
+void synchronize_rcu(void)
+{
+	unsigned long was_online;
+
+	smp_mb();
+    while (atomic_read(&rcu_refcnt) != 0) {
+        poll(NULL, 0, 10);
+    }
+	smp_mb();
+}
+
+
+#### 应用
+
+使用 rcu_assign_pointer 和 rcu_dereference 实现 RCU容器，主要是链表结构的容器
+
+需要注意
+1. 对于会修改链表结构的的操作视为写端，否则视为读端
+2. 对于写端，遍历操作需要带锁，并用非RCU遍历
+3. 对于读端，编译操作不需要锁，并用RCU遍历
+4. 读写指针都用RCU方式，确保cache的一致性和指令顺序执行
+
+#### RCU链表
+
+##### list_add_rcu list_del_rcu
+
+static inline void __list_add_rcu(struct list_head *new,
+                                  struct list_head *prev,
+                                  struct list_head *next)
+{
+    next->prev = new;
+    new->next = next;
+    new->prev = prev;
+    barrier();
+    rcu_assign_pointer(list_next_rcu(prev), new);
+}
+
+static inline void list_add_rcu(struct list_head *new, struct list_head *head)
+{
+    __list_add_rcu(new, head, head->next);
+}
+
+static inline void __list_del_rcu(struct list_head *prev,
+                                  struct list_head *next)
+{
+    next->prev = prev;
+    barrier();
+    rcu_assign_pointer(list_next_rcu(prev), next);
+}
+
+static inline void list_del_rcu(struct list_head *node)
+{
+    __list_del_rcu(node->prev, node->next);
+    list_init_rcu(node);
+}
+
+
+##### for each
+
+/*
+ * 仅供写端使用（写端必须持有锁）
+ */
+#define list_for_each(n, head) for (n = (head)->next; n != (head); n = n->next)
+
+#define list_for_each_from(pos, head) for (; pos != (head); pos = pos->next)
+
+#define list_for_each_safe(pos, n, head)                   \
+    for (pos = (head)->next, n = pos->next; pos != (head); \
+         pos = n, n = pos->next)
+
+/* 仅供读端使用 */
+#define list_for_each_entry_rcu(pos, head, member)                     \
+    for (pos = list_entry_rcu((head)->next, __typeof__(*pos), member); \
+         &pos->member != (head);                                       \
+         pos = list_entry_rcu(pos->member.next, __typeof__(*pos), member))
+
+##### 使用示例
+
+static void *reader_side(void *argv)
+{
+    struct test __allow_unused *tmp;
+    rcu_init();
+    rcu_read_lock();
+    list_for_each_entry_rcu(tmp, &head, node) {}
+    rcu_read_unlock();
+    pthread_exit(NULL);
+}
+
+static void *updater_side(void *argv)
+{
+    struct test *newval = test_alloc(current_tid());
+    list_add_tail_rcu(&newval->node, &head);
+    synchronize_rcu();
+    pthread_exit(NULL);
+}
+
+##### 分析遍历链表同时进行插入删除操作
+
+![](./pic/8.jpg)
+
+由于对指针的读写操作都是原子，且使用了内存屏障，所以可以保证执行顺序和cache一致性，
+
+所以在修改链表的同时是可以并发读
+
+
+
+## 避免锁的危害
+
+
+### 避免死锁
+
+#### 锁层次
 
 锁的层次是指为锁逐个编号，禁止不按顺序获取锁
 
@@ -19,7 +700,7 @@ thread3 持有 lock3，要获取 lock3
 
 thread1 2 3 都会争取 lock1，则不会出现死锁
 
-###### 条件锁
+#### 条件锁
 
 某个场景设计不出合理的层次锁。
 
@@ -58,13 +739,13 @@ l1_process(pkt);
 spin_unlock(&next_layer->lock1);
 spin_unlock(&lock2);
 
-##### 一次只用一把锁
+#### 一次只用一把锁
 
 可以避免嵌套加锁，从而避免死锁。比如，如果有一个可以完美分割的问题，每个分片拥有一把锁。
 
 然后处理任何特定分片的线程只需获得对应这个分片的锁。因为没有任何线程在同一时刻持有一把以上的锁，死锁就不可能发生。
 
-##### 信号/中断处理函数
+#### 信号/中断处理函数
 
 信号/中断处理函数里持有的锁仅能在信号处理函数中获取，应用程序代码和信号处理函数之间的通信通常使用无锁同步机制。
 
@@ -712,6 +1393,11 @@ bool CAS(_Atomic long *obj, long *expected, long desired) {
     return ret;
 }
 
+即给某个值拍快照，在要修改值时，比较当前值和快照，是否修改，如果有被修改则说明被其他线程占用，需要重新获得快照并尝试，
+如果没有修改则修改值。
+
+可见CAS操作只能修改一个值。
+
 ## CAS_strong 和 CAS_weak
 
 要理解为什么会有两种CAS实现，需要知道CAS导致的致命ABA问题
@@ -890,6 +1576,19 @@ char _padding2[64]; // padding for cache line=64 byte
 
 cpu core1对nShared1的CAS操作就不会被其他core对nShared2的修改所影响了。
 
+
+# 数据私有化
+## gcc per thread
+
+使用 __thread 修饰的符号会被编译为per thread
+
+int __thread a;
+void *do_work()
+{
+    ++a; // a 全部是1
+    return NULL;
+}
+
 # C标准库提供的原子相关操作
 
 C11标准中引入原子操作，实现了一整套完整的原子操作接口，定义在头文件`<stdatomic.h>`，
@@ -1024,256 +1723,286 @@ typedef enum memory_order {
 } memory_order;
 ```
 
+# gcc内置 内存模型感知的原子操作
+
+以下内置函数大致符合 C++11 内存模型的要求。它们都以 '__atomic' 为前缀，并且大多数是重载的，因此可以与多种类型一起使用。
+
+这些函数旨在取代传统的 '__sync' 内置函数。主要区别在于，内存顺序作为参数传递给函数。新代码应始终使用 '__atomic' 内置函数，而不是 '__sync' 内置函数。
+
+'__atomic' 内置函数可以与长度为 1、2、4 或 8 字节的任何整型标量或指针类型一起使用。如果架构支持 ' __int128' 类型（参见 128 位整数），则也允许使用 16 字节的整型。
+
+四个非算术函数（加载、存储、交换和比较交换）也都有泛型版本。这个泛型版本适用于任何数据类型。如果特定数据类型的大小使其可能使用无锁内置函数，则使用无锁内置函数；
+
+否则，会在运行时解析外部调用。这种外部调用的格式与泛型版本相同，只不过在第一个参数位置插入了一个 'size_t' 参数，表示指向对象的大小。所有对象必须具有相同的大小。
+
+可以指定 6 种不同的内存顺序。这些映射到具有相同名称的 C++11 内存顺序
+
+原子操作既可以限制代码的移动，也可以映射到硬件指令以实现线程之间的同步（例如，栅栏）。
+
+这些操作在多大程度上受内存顺序控制，内存顺序大致按强度升序列出。每种内存顺序的描述仅用于粗略说明其效果，并不是规范；具体语义请参见 C++11 内存模型。
+
+这些是在C++或类似语言中使用的内存模型参数，通常用于描述原子操作的内存顺序约束。在原子操作中，不同线程访问共享数据时可能会涉及一些顺序要求或约束以确保数据的正确性和一致性。这些参数描述了不同的行为特点：
+
+# 内存模型
+
+__ATOMIC_RELAXED:
+这个设置没有明确约束线程间的操作顺序，提供的是一种“无同步语义”的操作，这是最弱的同步顺序。
+
+__ATOMIC_CONSUME:
+此选项主要用于某些涉及到内存的消费者模型的操作，但它通常在C++实现中有其特殊性。因为C++的 memory_order_consume 存在某些缺陷，当前它实现时可能会使用更强的 __ATOMIC_ACQUIRE 内存顺序来保证操作的正确性。消费模型要求先读数据后再发生后续的操作。因此它实际上对代码布局产生了约束，可以防止将某些代码提升到操作之前执行。
+
+__ATOMIC_ACQUIRE:
+这个设置表示一种获取操作，它在多线程环境中建立了一个先行发生（happens-before）关系。该操作通常表示某种“获取动作”，通常伴随着某个值的加载。这个值会影响后续的后续代码生成（阻止某些优化措施把代码提升到获取操作之前）。它能够保证当进行读操作时的时序要求：在某个点前（在此原子操作前）的数据必须完成对其他线程的可见性，使得该操作可以在不依赖于更早的数据的情况下开始或执行下一任务或子操作等，这可能可以防止执行沉没至之后的发生优化修改之后发生的事情如已经接收到对象控制内容并使用某个依赖此类数据作为输入的分支路径或某些相关任务执行等情况的发生或变化等情况的合并（从语言表述的角度通俗一点解释就是该原子操作前的数据必须被其他线程看到并处理完毕）。简而言之，它确保了在读取之前没有其他线程可以修改数据。
+
+__ATOMIC_RELEASE:
+这个设置表示一种释放操作，它创建了一个先行发生关系到后续的操作（即其他线程的获取操作）。这确保了在当前线程释放数据后，其他线程可以安全地读取这些数据。它可以防止代码下沉到原子操作之后执行。简而言之，它确保了在写入数据后没有其他线程可以修改数据直到另一个线程已经读取了它。
+
+__ATOMIC_ACQ_REL:
+结合了 __ATOMIC_ACQUIRE 和 __ATOMIC_RELEASE 的效果。
+
+__ATOMIC_SEQ_CST:
+强制与所有其他 __ATOMIC_SEQ_CST 操作进行全序排列。
+
+请注意，在 C++11 内存模型中，栅栏（例如 __atomic_thread_fence）与特定内存位置上的其他原子操作（例如原子加载）相结合生效；对特定内存位置的操作不一定以相同方式影响其他操作。
+
+鼓励目标架构为每个原子内建函数提供其自身模式。如果没有提供目标，则使用原始的非内存模型集合 __sync 原子内建函数，并辅以任何所需的同步栅栏，以实现正确行为。在这种情况下的执行受与这些内建函数相同的限制。
+
+如果没有提供锁定自由的指令序列模式或机制，则会调用一个外部例程以相同参数在运行时解决。
+
+在为这些内建函数实现模式时，只要模式实现了限制最严格的 __ATOMIC_SEQ_CST 内存顺序参数，就可以忽略内存顺序参数。任何其他的内存顺序都能在这种内存顺序下正确执行，但它们可能没有在更适当的放松要求下实现时执行得那么高效。
+
+请注意，C++11标准允许在运行时而非编译时确定内存顺序参数。这些内建函数将任何运行时值映射为 __ATOMIC_SEQ_CST，而不是调用一个运行时库或内联一个 switch 语句。这是标准兼容的、安全的，并且是目前最简单的方法。
+
+内存顺序参数是一个有符号整数，但只有低16位保留用于内存顺序。其余的有符号整数保留用于目标使用，且应为0。使用预定义的原子值可确保正确使用。
+
+## 内建函数
+type __atomic_load_n (type *ptr, int memorder)
+该内建函数实现了一个原子加载操作。它返回 *ptr 的内容。
+
+有效的内存顺序变体有：__ATOMIC_RELAXED, __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE 和 __ATOMIC_CONSUME。
+
+void __atomic_load (type *ptr, type *ret, int memorder)
+这是一个通用版本的原子加载操作。它将 *ptr 的内容返回到 *ret 中。
+
+void __atomic_store_n (type *ptr, type val, int memorder)
+该内建函数实现了一个原子存储操作。它将 val 写入 *ptr。
+
+有效的内存顺序变体有：__ATOMIC_RELAXED, __ATOMIC_SEQ_CST 和 __ATOMIC_RELEASE。
+
+void __atomic_store (type *ptr, type *val, int memorder)
+这是一个通用版本的原子存储操作。它将 *val 的值存储到 *ptr 中。
+
+type __atomic_exchange_n (type *ptr, type val, int memorder)
+该内建函数实现了一个原子交换操作。它将 val 写入 *ptr，并返回 *ptr 的先前内容。
+
+所有内存顺序变体都是有效的。
+void __atomic_exchange (type *ptr, type *val, type *ret, int memorder)
+这是一个通用版本的原子交换操作。它将 *val 的内容存储到 *ptr 中。*ptr 的原始值复制到 *ret 中。
+
+bool __atomic_compare_exchange_n (type *ptr, type *expected, type desired, bool weak, int success_memorder, int failure_memorder)
+该内建函数实现了一个原子比较并交换操作。它将 *ptr 的内容与 *expected 的内容进行比较。如果相等，该操作是一个读-修改-写操作，将 desired 写入 *ptr。
+如果不相等，该操作是一个读取操作，将 *ptr 的当前内容写入 *expected。
+weak 为 true 表示弱 compare_exchange，它可能会假失败；
+为 false 表示强变体，它绝不会假失败。许多目标只提供强变体，并忽略该参数。如果有疑问，请使用强变体。
+如果 desired 被写入 *ptr，则返回 true，并且内存在 success_memorder 指定的内存顺序下受到影响。这里对使用何种内存顺序没有限制。
+否则，返回 false，并且内存在 failure_memorder 指定的内存顺序下受到影响。
+此内存顺序不能是 __ATOMIC_RELEASE 或 __ATOMIC_ACQ_REL，也不能比 success_memorder 指定的顺序更强。
+
+bool __atomic_compare_exchange(type *ptr, type *expected, type *desired, bool weak, int success_memorder, int failure_memorder)
+此内置函数实现了通用版本的 __atomic_compare_exchange。该函数几乎与__atomic_compare_exchange_n相同，只是期望值也是一个指针。
+
+type __atomic_add_fetch(type *ptr, type val, int memorder)
+type __atomic_sub_fetch(type *ptr, type val, int memorder)
+type __atomic_and_fetch(type *ptr, type val, int memorder)
+type __atomic_xor_fetch(type *ptr, type val, int memorder)
+type __atomic_or_fetch(type *ptr, type val, int memorder)
+type __atomic_nand_fetch(type *ptr, type val, int memorder)
+
+这些内置函数执行函数名所描述的操作，并返回操作的结果。对指针参数的操作，如同操作uintptr_t类型的操作数一样进行。即，它们不会根据指针所指类型的大小进行缩放。
+
+{ *ptr op= val; return *ptr; }
+{ *ptr = ~(*ptr & val); return *ptr; } // nand
+
+这些内置函数是进行原子操作的函数，它们在多线程环境下提供了线程安全的访问共享数据的能力。这些函数保证了在执行这些操作的过程中不会被其他线程打断，从而避免了数据竞争和不一致的状态。每个函数的具体描述如下：
+
+type __atomic_fetch_add (type *ptr, type val, int memorder)：
+对指针 ptr 指向的地址执行加法操作，并将结果存储回原地址。函数返回操作前的值。操作数是基于指针的原始类型进行解释的，
+不是基于指针指向的数据类型的大小进行缩放。内存顺序 memorder 用于确定操作的原子性保证级别。
+
+type __atomic_fetch_sub (type *ptr, type val, int memorder)：
+与 __atomic_fetch_add 类似，但是执行减法操作。
+
+type __atomic_fetch_and (type *ptr, type val, int memorder)：
+对指针 ptr 指向的地址执行位与操作，并将结果存储回原地址。函数返回操作前的值。
+
+type __atomic_fetch_xor (type *ptr, type val, int memorder)：
+对指针 ptr 指向的地址执行位异或操作。
+
+type __atomic_fetch_or (type *ptr, type val, int memorder)：
+对指针 ptr 指向的地址执行位或操作。
+
+type __atomic_fetch_nand (type *ptr, type val, int memorder)：
+对指针 ptr 指向的地址执行位非和（逻辑否定后跟逻辑与）操作。注意，这个函数不像其他常见的位操作那样先对非后的结果进行再与运算。
+这个函数内部实现的可能是位非操作和接下来的AND操作的组合行为，但并没有进行优先级绑定或者说额外的语法含义。
+该函数返回操作前的值。所有这些操作的内存顺序参数用于确保操作的原子性和一致性。
+它们遵循指定的内存顺序以确保在多线程环境中的正确行为。
+对于所有这些函数，内存顺序参数必须有效（即它们必须是原子操作支持的内存顺序之一）。这些函数适用于各种类型的指针和整数类型，但不能用于布尔类型。
+
+{ tmp = *ptr; *ptr op= val; return tmp; }
+{ tmp = *ptr; *ptr = ~(*ptr & val); return tmp; } // nand
+
+这些内置函数是用于原子操作的，在多线程编程中非常有用。它们提供了对内存的原子访问，确保对共享数据的操作不会被其他线程干扰。下面是每个函数的简要说明：
+
+bool __atomic_test_and_set (void *ptr, int memorder)
+这个内置函数对指针 ptr 指向的字节执行原子测试和设置操作。如果之前的内容是“设置”（即某个实现定义的非零值），
+则将字节设置为该非零值并返回 true，否则返回 false。此函数仅适用于 bool 或 char 类型的数据。对于其他类型的数据，可能只能部分地设置值。所有内存顺序都是有效的。
+
+void __atomic_clear (bool *ptr, int memorder)
+这个内置函数对指针 ptr 指向的值执行原子清除操作。操作后，ptr 包含的值变为 0。此函数仅适用于 bool 或 char 类型的数据，
+并且通常与 __atomic_test_and_set 结合使用。对于其他类型的数据，可能只能部分地清除值。
+如果类型不是 bool，建议使用 __atomic_store 函数。有效的内存顺序是 __ATOMIC_RELAXED、__ATOMIC_SEQ_CST 和 __ATOMIC_RELEASE。
+
+void __atomic_thread_fence (int memorder)
+这个内置函数基于指定的内存顺序在线程之间创建一个同步栅栏。这意味着在栅栏之后的内存操作将对所有其他线程可见，保证了内存操作的顺序性。所有内存顺序都是有效的。
+
+void __atomic_signal_fence (int memorder)
+这个内置函数在同一线程的线程和信号处理程序之间创建一个同步栅栏。这意味着在栅栏之后的内存操作对于信号处理程序来说是可见的，保证了信号处理程序能够正确地处理内存操作的结果。所有内存顺序都是有效的。
+
+bool __atomic_always_lock_free (size_t size, void *ptr)
+这个内置函数返回一个布尔值，表示对于目标架构，大小为 size 的对象是否总是生成无锁原子指令。
+size 必须解析为编译时常量，并且结果也必须是编译时常量。ptr 是一个可选的指向对象的指针，可用于确定对齐方式。值为 0 表示应使用典型对齐方式。编译器也可能忽略此参数。
+这些函数允许开发者在多线程环境中安全地操作共享数据，避免了数据竞争和不一致的状态等问题。
+
+bool __atomic_is_lock_free (size_t size, void *ptr)
+这个内建函数，用于判断给定大小的对象在目标架构上是否总是能够通过无锁原子指令进行访问和操作。
+如果这个函数确定某个对象大小的访问是无锁的，那么它会返回 true；否则，它会调用一个名为 __atomic_is_lock_free 的运行时例行程序来进一步确定。
+参数 ptr 是一个可选的指针，指向要确定对齐方式的对象。如果该指针为 0，则表示应使用典型对齐方式。编译器也可以选择忽略这个参数。
 
 
+# 自旋锁
+## 传统的自旋锁
+### CAS实现
 
+spinlock用一个整形变量表示，其初始值为1，表示available的状态。
 
-# RCU
-RCU是一种同步机制；其次RCU实现了读写的并行；
+当一个CPU（设为CPU A）获得spinlock后，会将该变量的值设为0，之后其他CPU试图获取这个spinlock时，
 
-RCU利用一种Publish-Subscribe的机制，在Writer端增加一定负担，使得Reader端几乎可以Zero-overhead。
+会一直等待，直到CPU A释放spinlock，并将该变量的值设为1。
 
-RCU适合用于同步基于指针实现的数据结构（例如链表，哈希表等），同时由于他的Reader 0 overhead的特性，特别适用用读操作远远大与写操作的场景。
+基于CAS的实现速度很快，尤其是在没有真正竞态的情况下（事实上大部分时候就是这种情况）， 
 
-RCU是读者无锁，写者有锁，所以RCU并不是完全的无锁化
+但这种方法存在一个缺点：它是「不公平」的。 一旦spinlock被释放，第一个能够成功执行CAS操作的CPU将成为新的owner，
 
-## 发布订阅机制
+没有办法确保在该spinlock上等待时间最长的那个CPU优先获得锁，这将带来延迟不能确定的问题。
 
-![](./pic/6.jpg)
+### ticket spinlock
 
-发布订阅机制指，写端更新数据时，新分配一个对象，基于新对象更新数据。
-
-语义如下
-
-发布者
-struct foo *gp = NULL;
-struct foo *p;
-p = malloc(sizeof(*p));
-p->a = 1;
-p->b = 1;
-gp = p; 
-
-订阅者
-p = gp;
-if (p != NULL) {
-    do_something(p->a, p->b); 
-}
-
-### rcu_assign_pointer 和 rcu_dereference
-
-由于CPU和编译器优化可能导致指令乱序执行，导致bug
-
-发布者
-struct foo *gp = NULL;
-struct foo *p;
-// 可能 gp = p 最先执行
-p = malloc(sizeof(*p));
-p->a = 1;
-p->b = 1;
-gp = p; 
-
-订阅者
-// 在某些CPU环境下， 读取 p->a,p->b  可能比 p = gp先执行
-p = gp;
-if (p != NULL) {
-    do_something(p->a, p->b); 
-}
-
-要解决这些问题需要 volatile 和内存屏障，但二者并不便于使用，常见操作是将其封装成宏
-
-#define rcu_assign_pointer(p, v)                                          \
-    ({                                                                    \
-        (__typeof__(*p) __force *) atomic_xchg_release((rcu_uncheck(&p)), \
-                                                       rcu_check(v));     \
-    })
-
-// 包含原子写和写内存屏障
-#define atomic_xchg_release(x, v)                                            \
-    ({                                                                       \
-        __typeof__(*x) ___x;                                                 \
-        atomic_exchange_explicit((volatile _Atomic __typeof__(___x) *) x, v, \
-                                 memory_order_release);                      \
-    })
-
-
-#define rcu_dereference(p)                                              \
-    ({                                                                  \
-        __typeof__(*p) *___p = (__typeof__(*p) __force *) READ_ONCE(p); \
-        rcu_check_sparse(p, __rcu);                                     \
-        ___p;                                                           \
-    })
-
-// 包含原子读和读写内存屏障
-#define READ_ONCE(x)                                                      \
-    ({                                                                    \
-        barrier();                                                        \
-        __typeof__(x) ___x = atomic_load_explicit(                        \
-            (volatile _Atomic __typeof__(x) *) &x, memory_order_consume); \
-        barrier();                                                        \
-        ___x;                                                             \
-    })
-
-
-使用rcu原语实现
-
-struct foo *gp = NULL;
-struct foo *p;
-p = malloc(sizeof(*p));
-p->a = 1;
-p->b = 1;
-// 确保p已经完成了赋值
-rcu_assign_pointer(gp, p);
-
-订阅者
-p = rcu_dereference(gp);
-// 确保gp已经完成了读取
-if (p != NULL) {
-    do_something(p->a, p->b); 
-}
-
-### synchronize_rcu 对副本旧对象的释放
-
-![](./pic/7.jpg)
-
-要释放旧对象前，必须确保相关的读者已经不使用该对象了，如果还在使用则自旋等待，
-
-相关原语是 synchronize_rcu
-
-而读者需要一个机制宣告自己读完成了.
-
-相关原语是 rcu_read_lock, rcu_read_unlock
-
-发布者
-struct foo *gp = NULL;
-struct foo *p, *tmp;
-// 可能 gp = p 最先执行
-p = malloc(sizeof(*p));
-p->a = 1;
-p->b = 1;
-rcu_assign_pointer(tmp, gp);
-rcu_assign_pointer(gp, p);
-synchronize_rcu(); // 等待所有读者都完成了读操作
-free(tmp);
-
-订阅者
-// 在某些CPU环境下， 读取 p->a,p->b  可能比 p = gp先执行
-rcu_read_lock();
-p = rcu_dereference(gp);
-if (p != NULL) {
-    do_something(p->a, p->b); 
-}
-rcu_read_unlock();
-// 保证之后不会再访问 p 指向的对象
-
-### RCU原语的实现
-
-
-
-### 应用
-
-使用 rcu_assign_pointer 和 rcu_dereference 实现 RCU容器，主要是链表结构的容器
-
-需要注意
-1. 对于会修改链表结构的的操作视为写端，否则视为读端
-2. 对于写端，遍历操作需要带锁，并用非RCU遍历
-3. 对于读端，编译操作不需要锁，并用RCU遍历
-4. 读写指针都用RCU方式，确保cache的一致性和指令顺序执行
-
-#### RCU链表
-
-##### list_add_rcu list_del_rcu
-
-static inline void __list_add_rcu(struct list_head *new,
-                                  struct list_head *prev,
-                                  struct list_head *next)
+```
+static inline void arch_spin_unlock(arch_spinlock_t *lock)
 {
-    next->prev = new;
-    new->next = next;
-    new->prev = prev;
-    barrier();
-    rcu_assign_pointer(list_next_rcu(prev), new);
+    // 叫下一个号
+    lock->tickets.owner++;
 }
 
-static inline void list_add_rcu(struct list_head *new, struct list_head *head)
+static inline void arch_spin_lock(arch_spinlock_t *lock)
 {
-    __list_add_rcu(new, head, head->next);
-}
+    // 用CAS获得自己的票号
+    [LL/SC]
 
-static inline void __list_del_rcu(struct list_head *prev,
-                                  struct list_head *next)
+    // 等待叫号
+    while (lockval.tickets.next != lockval.tickets.owner) {
+        wfe();
+        lockval.tickets.owner = READ_ONCE(lock->tickets.owner);
+    }
+}
+```
+
+缺点:
+
+当spinlock的值被更改时，所有试图获取spinlock的CPU对应的cache line都会被invalidate，
+
+因为这些CPU会不停地读取这个spinlock的值，所以"invalidate"状态意味着此时，
+
+它们必须重新从内存读取新的spinlock的值到自己的cache line中。
+
+而事实上，其中只会有一个CPU，也就是队列中最先达到的那个CPU，接下来可以获得spinlock，
+
+也只有它的cache line被invalidate才是有意义的，对于其他的CPU来说，这就是做无用功。内存比cache慢那么多，开销可不小。
+
+## MCS lock
+
+![](./pic/11.jpg)
+
+让每个CPU不再是等待同一个spinlock变量，而是基于各自不同的per-CPU的变量进行等待，
+
+那么每个CPU平时只需要查询自己对应的这个变量所在的本地cache line，
+
+仅在这个变量发生变化的时候，才需要读取内存和刷新这条cache line
+
+struct mcs_spinlock {
+	struct mcs_spinlock *next;
+	int locked; 
+};
+
+每当一个CPU试图获取一个spinlock，它就会将自己的MCS lock加到这个spinlock的等待队列，
+
+新的node会被加到队尾，lock永远指向队尾节点或者NULL。
+
+"locked"的值为1表示该CPU是spinlock当前的持有者，为0则表示没有持有。
+
+如果节点获得了锁，那么他一定是队头节点。
+
+void mcs_spin_lock(struct mcs_spinlock **lock, struct mcs_spinlock *node)
 {
-    next->prev = prev;
-    barrier();
-    rcu_assign_pointer(list_next_rcu(prev), next);
+	// 初始化node
+	node->locked = 0;
+	node->next   = NULL;
+
+    // 将node作为尾部节点加入链表
+    // 获得上一轮的尾部节点prev
+	struct mcs_spinlock *prev = xchg(lock, node);
+	// 队列为空，立即获得锁
+	if (likely(prev == NULL)) {
+		return;
+	}
+
+    // 队列不为空，则说明有其他线程获得了锁
+
+    // 本线程加入等待
+    // 将老链表和新链表连接
+	WRITE_ONCE(prev->next, node);
+
+    // 本线程在 &node->locked上自旋
+	arch_mcs_spin_lock_contended(&node->locked);
+        while (atomic_load_explicit(loc, mm) != val)
+            spin_wait();
 }
 
-static inline void list_del_rcu(struct list_head *node)
+
+void mcs_spin_unlock(struct mcs_spinlock **lock, struct mcs_spinlock *node)
 {
-    __list_del_rcu(node->prev, node->next);
-    list_init_rcu(node);
+    // node一定是队列的头节点
+
+    // 获取最近一个等待节点
+	struct mcs_spinlock *next = READ_ONCE(node->next);
+
+	if (likely(!next)) {
+        // next是 node->next 的快照
+        // 对比快照确保有无其他线程在插入
+        // 若没有其他线程，则退出
+		if (likely(cmpxchg_release(lock, node, NULL) == node))
+			return;
+
+        // 若有其他线程正在加入，则等待他加入完成，并获得下一个节点
+		while (!(next = READ_ONCE(node->next)))
+			cpu_relax();
+	}
+
+    // 若有其他节点
+
+    // 将下一个节点的locked复位,让他访问临界区
+	arch_mcs_spin_unlock_contended(&next->locked);
 }
 
 
-##### for each
-
-/*
- * 仅供写端使用（写端必须持有锁）
- */
-#define list_for_each(n, head) for (n = (head)->next; n != (head); n = n->next)
-
-#define list_for_each_from(pos, head) for (; pos != (head); pos = pos->next)
-
-#define list_for_each_safe(pos, n, head)                   \
-    for (pos = (head)->next, n = pos->next; pos != (head); \
-         pos = n, n = pos->next)
-
-/* 仅供读端使用 */
-#define list_for_each_entry_rcu(pos, head, member)                     \
-    for (pos = list_entry_rcu((head)->next, __typeof__(*pos), member); \
-         &pos->member != (head);                                       \
-         pos = list_entry_rcu(pos->member.next, __typeof__(*pos), member))
-
-##### 使用示例
-
-static void *reader_side(void *argv)
-{
-    struct test __allow_unused *tmp;
-    rcu_init();
-    rcu_read_lock();
-    list_for_each_entry_rcu(tmp, &head, node) {}
-    rcu_read_unlock();
-    pthread_exit(NULL);
-}
-
-static void *updater_side(void *argv)
-{
-    struct test *newval = test_alloc(current_tid());
-    list_add_tail_rcu(&newval->node, &head);
-    synchronize_rcu();
-    pthread_exit(NULL);
-}
-
-##### 分析遍历链表同时进行插入删除操作
-
-![](./pic/8.jpg)
-
-由于对指针的读写操作都是原子，且使用了内存屏障，所以可以保证执行顺序和cache一致性，
-
-所以在修改链表的同时是可以并发读
-
-
-# 数据私有化
-## gcc per thread
-
-使用 __thread 修饰的符号会被编译为per thread
-
-int __thread a;
-void *do_work()
-{
-    ++a; // a 全部是1
-    return NULL;
-}
-
-
-
-
+可以发现msc锁不仅有序而且没有cache line问题，但缺点是多用了一个指针的内存.
