@@ -2094,4 +2094,30 @@ ping -c 1 host.on.the.internet
 使用此模块 netfilter 可以过滤网桥的数据包
 使用 /proc/sys/net/bridge/bridge-nf-call-iptables 控制释放开启过滤
 
+# iptables-extensions
+
+## string
+
+这个模块使用某种模式匹配策略来匹配给定的字符串。
+* --algo: 选择模式匹配策略。有两种可选策略：Boyer-Moore（bm）和Knuth-Pratt-Morris（kmp）。
+Boyer-Moore从右向左搜索匹配项，而Knuth-Pratt-Morris则使用不同的方法。根据使用情况选择合适的算法。
+
+* --from offset 和 --to offset：设置搜索匹配的起始和结束偏移量。如果不传递这些参数，默认分别为0和包大小。
+
+* --string pattern：匹配给定的字符串模式。
+
+* --hex-string pattern：匹配以十六进制表示的模式。这对于非打印字符（如\x0D\x0A）特别有用。
+
+* --icase：在搜索时忽略大小写。
+
+例如，可以使用该模块来监视HTTP请求或检测特定UDP端口上的数据包。
+
+由于Boyer-Moore算法的特性，如果匹配项跨越多个块（例如数据包片段），则可能无法找到匹配项。
+
+因此，对于安全相关的用途（如过滤或NIDS），建议选择Knuth-Pratt-Morris算法。
+
+对于关注性能的应用（如QoS策略），可以选择Boyer-Moore算法，但要注意可能错过某些匹配项。
+
+
+
 
