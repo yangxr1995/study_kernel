@@ -174,19 +174,19 @@ recvmsg
 # 原始套接字
 
 ```c
-    socket(AF_INET, SOCK_RAW, 0)
+socket(AF_INET, SOCK_RAW, 0)
 ```
 
 ## socket
 
 socket 最终会调用 inet_create
 
+```c
 static const struct net_proto_family inet_family_ops = {
 	.family = PF_INET,
 	.create = inet_create,
 	.owner	= THIS_MODULE,
 };
-
 
 int inet_create(struct net *net, struct socket *sock, int protocol, int kern)
 	struct sock *sk;
@@ -237,7 +237,6 @@ lookup_protocol:
 			goto out;
 		}
 	}
-
 	
     // inet的proto定义在 inetsw_array
 static struct inet_protosw inetsw_array[] =
@@ -276,9 +275,6 @@ static struct inet_protosw inetsw_array[] =
        }
 };
 
-
-
-
 struct proto raw_prot = {
 	.name		   = "RAW",
 	.owner		   = THIS_MODULE,
@@ -309,7 +305,6 @@ struct proto raw_prot = {
 	.diag_destroy	   = raw_abort,
 };
 
-
 static int raw_init(struct sock *sk)
 {
 	struct raw_sock *rp = raw_sk(sk);
@@ -318,11 +313,13 @@ static int raw_init(struct sock *sk)
 		memset(&rp->filter, 0, sizeof(rp->filter));
 	return 0;
 }
+```
 
 ## recvfrom
 
-recvfrom 最终调用 ops->recvmsg
+recvfrom 最终调用 `ops->recvmsg`
 
+```c
 static const struct proto_ops inet_sockraw_ops = {
 	.family		   = PF_INET,
 	.owner		   = THIS_MODULE,
@@ -366,7 +363,6 @@ int inet_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 	return err;
 }
 
-
 static int raw_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 		       int noblock, int flags, int *addr_len)
 
@@ -399,7 +395,7 @@ struct sk_buff *skb_recv_datagram(struct sock *sk, unsigned int flags,
             skb = __skb_try_recv_from_queue(sk, queue, flags, destructor,
                             peeked, off, &error, last);
 }
-
+```
 
 ## 入栈skb到 sk->sk_receive_queue
 
